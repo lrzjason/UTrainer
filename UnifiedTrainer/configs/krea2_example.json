@@ -1,0 +1,126 @@
+{
+    "model": "krea2",
+    "model_path": "/path/to/Krea-2-Raw",
+    "transformer_path": "/path/to/Krea-2-Raw/transformer",
+
+    "vae_path": "/path/to/Krea-2-Raw/vae",
+    "text_encoder_path": "/path/to/Krea-2-Raw/text_encoder",
+    "tokenizer_path": "/path/to/Krea-2-Raw/tokenizer",
+    "scheduler_path": "/path/to/Krea-2-Raw/scheduler",
+
+    "reference_conditioning": false,
+    "multimodal_reference": false,
+
+    "data": {
+        "cache_dir": "cache/krea2_example_cache",
+        "rebuild_index": true,
+        "dataset_configs": [
+            {
+                "train_data_dir": "/path/to/training_images",
+                "resolution": 1024,
+                "repeats": 6,
+                "recreate_cache": false,
+                "recreate_latents": false,
+                "recreate_embeddings": false,
+                "image_configs": {
+                    "T": {"suffix": "_t"}
+                },
+                "target_configs": {
+                    "T": [
+                        {"image": "T"}
+                    ]
+                },
+                "reference_configs": {
+                    "none": []
+                },
+                "caption_configs": {
+                    "train_T": {
+                        "ext": ".txt",
+                        "image": "T"
+                    }
+                },
+                "batch_configs": [
+                    {
+                        "target_config": "T",
+                        "caption_config": "train_T",
+                        "caption_dropout": 0.1
+                    }
+                ]
+            }
+        ],
+        "num_workers": 4,
+        "val_split_ratio": 0.05
+    },
+
+    "losses": [
+        {"type": "flow_matching", "weight": 1.0, "params": {"use_weighting": false}}
+    ],
+
+    "training": {
+        "network_type": "lokr",
+        "lora_rank": 64,
+        "lokr_alpha": 1.0,
+        "lokr_factor": 4,
+        "lokr_model_type": "krea2",
+        "lokr_target_modules": null,
+        "include_suffix": true,
+        "batch_size": 1,
+        "learning_rate": 1e-4,
+        "max_steps": -1,
+        "num_epochs": 20,
+        "optimizer": "adamw8bit",
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "gradient_checkpointing": true,
+        "gradient_accumulation_steps": 1,
+        "max_grad_norm": 1.0,
+        "weight_dtype": "bf16",
+        "mixed_precision": "bf16",
+        "quantize": "torchao_float8",
+        "block_swap": 0,
+        "offload_vae": true,
+        "offload_text_encoder": true,
+        "compile": false,
+        "noise_selector": {
+            "type": "explorative",
+            "K_cond": 2,
+            "K_uncond": 5,
+            "warmup_steps": 0,
+            "schedule": "constant",
+            "log_stats": true
+        }
+    },
+
+    "validation": {
+        "val_loss": true,
+        "val_every_epoch": 1,
+        "val_seed": 42,
+        "generate_images": true,
+        "num_val_images": 3,
+        "resolution": 1024,
+        "num_inference_steps": 20,
+        "guidance_scale": 3.0
+    },
+
+    "output": {
+        "dir": "output/krea2_example",
+        "save_name": "krea2_example",
+        "save_every_epoch": 1,
+        "save_start_epoch": 0
+    },
+
+    "reporter": {
+        "type": "wandb",
+        "log_every": 1
+    },
+
+    "helios": {
+        "enabled": false
+    },
+
+    "wandb": {
+        "enabled": false,
+        "project": "UnifiedTrainer",
+        "run_name": "krea2_example"
+    }
+}

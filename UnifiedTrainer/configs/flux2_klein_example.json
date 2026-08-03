@@ -1,0 +1,111 @@
+{
+    "model": "flux2_klein",
+    "model_path": "/path/to/flux2-klein4b",
+
+    "data": {
+        "cache_dir": "cache/t2itrainer_cache_flux2_klein",
+        "dataset_configs": [
+            {
+                "train_data_dir": "/path/to/training_images",
+                "resolution": 1024,
+                "repeats": 1,
+                "recreate_cache": false,
+                "image_configs": {
+                    "DT_GEN": {"suffix": "_DT_gen"},
+                    "DT": {"suffix": "_DT"},
+                    "T": {"suffix": "_T"}
+                },
+                "target_configs": {
+                    "DT_GEN": [
+                        {"image": "DT_GEN"}
+                    ],
+                    "T": [
+                        {"image": "T", "from_image": "DT"}
+                    ]
+                },
+                "reference_configs": {
+                    "train_DT": [
+                        {"image": "DT", "sample_type": "from_same_name"}
+                    ]
+                },
+                "caption_configs": {
+                    "train_DT_GEN": {
+                        "ext": ".txt",
+                        "image": "DT_GEN",
+                        "reference_list": {
+                            "reference_config": "train_DT",
+                            "resize": "384",
+                            "dropout": 0,
+                            "min_length": 1
+                        }
+                    },
+                    "train_T": {
+                        "ext": ".txt",
+                        "image": "T",
+                        "reference_list": {
+                            "reference_config": "train_DT",
+                            "resize": "384",
+                            "dropout": 0,
+                            "min_length": 1
+                        }
+                    }
+                },
+                "batch_configs": [
+                    {
+                        "target_config": "DT_GEN",
+                        "caption_config": "train_DT_GEN",
+                        "reference_config": "train_DT",
+                        "caption_dropout": 0.1,
+                        "reference_dropout": 0.0
+                    },
+                    {
+                        "target_config": "T",
+                        "caption_config": "train_T",
+                        "reference_config": "train_DT",
+                        "caption_dropout": 0.1,
+                        "reference_dropout": 0.0
+                    }
+                ]
+            }
+        ],
+        "num_workers": 0
+    },
+
+    "losses": [
+        {"type": "flow_matching", "weight": 1.0}
+    ],
+
+    "training": {
+        "batch_size": 1,
+        "learning_rate": 1e-4,
+        "max_steps": -1,
+        "num_epochs": 10,
+        "lora_rank": 4,
+        "lora_alpha": 4,
+        "optimizer": "adamw",
+        "lr_scheduler": "constant",
+        "gradient_checkpointing": true,
+        "gradient_accumulation_steps": 1,
+        "weight_dtype": "bf16",
+        "quantize": "torchao_float8"
+    },
+
+    "regeneration": {
+        "every_n_epochs": 1,
+        "transformer_path": "/path/to/flux2-klein4b-turbo/transformer",
+        "steps": 4,
+        "seed": 42
+    },
+
+    "output": {
+        "dir": "output/experiment_name",
+        "save_name": "flux2_klein_lora",
+        "checkpoint_every": 500
+    },
+
+    "wandb": {
+        "enabled": false,
+        "project": "UnifiedTrainer",
+        "run_name": null
+    }
+}

@@ -1,0 +1,86 @@
+# =============================================================================
+# ScheduledTrainer — Project Dependencies
+# =============================================================================
+# Covers the whole project:
+#   - orchestrator/  : task scheduler + GPU guard + HTTP API (mostly stdlib)
+#   - UnifiedTrainer/: diffusion-model training framework
+#                      (see UnifiedTrainer/requirements.txt for the subset)
+#
+# Install:  pip install -r requirements.txt
+# =============================================================================
+
+# ── PyTorch ecosystem ────────────────────────────────────────────────────
+torch>=2.0.0
+numpy>=1.24.0
+
+# ── HuggingFace stack ────────────────────────────────────────────────────
+accelerate>=0.26.1
+# diffusers 0.39 dev lineage is required: the project imports
+# ZImageTransformer2DModel, attention_dispatch.dispatch_attention_fn and
+# AutoencoderKLQwenImage. The cloud's 0.36.0.dev0 is broken (torchao_quantizer
+# undefined-logger crash + missing modules). Proven locally: 0.39.0.dev0
+# (editable install from the project's diffusers checkout).
+diffusers>=0.39.0.dev0
+# transformers >=4.46.0 is required for Qwen3-VL (Qwen3VLProcessor,
+# Qwen3VLForConditionalGeneration, qwen3_vl.video_processing) — the Krea2 text
+# encoder. An older transformers cannot import Qwen3VLProcessor, so
+# load_processor returns None and every caption encode fails (missing
+# encoder_hidden_states at training). Proven locally: 5.2.0.
+transformers>=5.2.0
+safetensors>=0.4.0
+# peft>=0.14 needs transformers>=4.45 (HybridCache); installed diffusers (0.39)
+# requires peft>=0.17.0. Cap <0.19 avoids the peft-0.19.x/torchao API break.
+# Proven-working on cloud: peft==0.18.1.
+peft>=0.17.0,<0.19.0
+tokenizers>=0.19.0
+
+# ── Quantization ─────────────────────────────────────────────────────────
+bitsandbytes>=0.43.0
+# torchao — per-block quantization (float8, NF4, int8, int4).
+# Conditional import; training works without it, but quantized models
+# require torchao for AffineQuantizedTensor support.
+# >=0.10.0 provides torchao.dtypes.floatx.float8_layout.Float8AQTTensorImpl,
+# which diffusers 0.39 imports at module load; older torchao lacks it and
+# crashes diffusers import (undefined-logger bug in torchao_quantizer.py).
+# <0.17.0 avoids the torchao API removal that breaks PEFT. Proven: 0.10.0.
+torchao>=0.10.0,<0.17.0
+
+# ── Utilities ────────────────────────────────────────────────────────────
+tqdm>=4.66.1
+Pillow>=10.0.0
+# protobuf>=4 required by modern tensorboard/transformers (cloud runs 5.29.6);
+# the old ==3.20 hard pin would downgrade and break them.
+protobuf>=3.20
+sentencepiece>=0.1.99
+
+# ── Data / ML utilities ──────────────────────────────────────────────────
+scikit-learn>=1.3.0
+
+# ── Experiment tracking ──────────────────────────────────────────────────
+tensorboard>=2.14.0
+wandb>=0.16.0
+
+# ── Image processing ─────────────────────────────────────────────────────
+opencv-python>=4.9.0
+
+# ── Quantization utilities ───────────────────────────────────────────────
+# optimum.quanto QBytesTensor support (stochastic_rounding.py)
+optimum>=1.20.0
+
+# ── Orchestrator ─────────────────────────────────────────────────────────
+# NVIDIA Management Library bindings — used by orchestrator/gpu_guard.py
+# for VRAM-based job admission. Degrades gracefully if unavailable, but
+# required for GPU scheduling to function.
+pynvml>=11.5.0
+
+# =============================================================================
+# Optional Dependencies
+# =============================================================================
+# Uncomment to enable additional features.
+
+# Faster attention kernels (UnifiedTrainer/utils/sage_attn.py — conditional)
+# sageattention>=2.0.0
+
+# fp8 mixed_precision backends (train.py — conditional; bf16 fallback if absent)
+# transformer-engine>=1.0.0
+# msamp>=1.0.0

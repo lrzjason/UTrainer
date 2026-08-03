@@ -219,3 +219,8 @@ __marimo__/
 .tmp
 workspace
 start.sh
+
+# Real training configs stay local/private (not committed)
+configs/*
+# But track example configs for documentation
+!configs/*_example.json
