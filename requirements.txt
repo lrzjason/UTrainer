@@ -20,6 +20,11 @@ accelerate>=0.26.1
 # AutoencoderKLQwenImage. The cloud's 0.36.0.dev0 is broken (torchao_quantizer
 # undefined-logger crash + missing modules). Proven locally: 0.39.0.dev0
 # (editable install from the project's diffusers checkout).
+# MiniMax-H3 训练还需 diffusers PR #14355 分支（训练与推理共用同一份源码；
+# 本地 E:\diffusers 保持 pr-14355，随时用 git fetch origin
+# refs/pull/14355/head:pr-14355 更新——PR 可能 force-push）。
+# MiniMaxH3Transformer3DModel / AutoencoderKLMiniMaxH3 / MiniMaxH3Scheduler
+# 与 modular_pipelines.minimax_h3（packing/build_packed_sequence）仅存在于该分支。
 diffusers>=0.39.0.dev0
 # transformers >=4.46.0 is required for Qwen3-VL (Qwen3VLProcessor,
 # Qwen3VLForConditionalGeneration, qwen3_vl.video_processing) — the Krea2 text
@@ -63,6 +68,10 @@ wandb>=0.16.0
 # ── Image processing ─────────────────────────────────────────────────────
 opencv-python>=4.9.0
 
+# ── Video processing ────────────────────────────
+# PyAV — MiniMax-H3 视频解码（data/video_utils.py load_video_frames）与
+# 验证循环静音 mp4 输出（decode_validation_video）。已装 16.1.0（P0 核实）。
+av>=16.1.0
 # ── Quantization utilities ───────────────────────────────────────────────
 # optimum.quanto QBytesTensor support (stochastic_rounding.py)
 optimum>=1.20.0

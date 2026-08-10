@@ -139,6 +139,23 @@ class UnifiedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.datarows) * self.repeats
 
+    def _runtime_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """Adapt a unified ``(C, T, H, W)`` cached latent to the adapter's runtime shape.
+
+        The unified media pipeline (D3) stores every latent as ``(C, T, H, W)`` —
+        an image is simply ``(C, 1, H, W)``.  Video-capable adapters
+        (``supports_video=True``, MiniMax-H3) keep the full 5D path: per-sample
+        ``(C, T, H, W)`` stacks to ``(B, C, T, H, W)`` in ``collate_fn``.  Legacy
+        image adapters (krea2, ...) keep their 4D ``(B, C, H, W)`` runtime
+        contract, so the singleton temporal dim is squeezed here — before
+        collate.  P2 video samples only change T; this layer is untouched.
+        """
+        if getattr(self.adapter, "supports_video", False):
+            return latent
+        if latent.ndim == 4 and latent.shape[1] == 1:
+            return latent.squeeze(1)
+        return latent
+
     def __getitem__(self, idx: int) -> dict:
         base_len = len(self.datarows)
         base_idx = idx % base_len
@@ -177,13 +194,13 @@ class UnifiedDataset(Dataset):
             entry = targets[target_key]
             latent_path = entry.get("latent_path")
             if latent_path:
-                latents[target_key] = self.cache.load_latent(latent_path)
+                latents[target_key] = self._runtime_latent(self.cache.load_latent(latent_path))
         else:
             for role, entry in targets.items():
                 if isinstance(entry, dict):
                     latent_path = entry.get("latent_path")
                     if latent_path:
-                        latents[role] = self.cache.load_latent(latent_path)
+                        latents[role] = self._runtime_latent(self.cache.load_latent(latent_path))
 
         # Load reference latents
         references = sample.get("references", {})
@@ -191,13 +208,13 @@ class UnifiedDataset(Dataset):
             entry = references[reference_key]
             latent_path = entry.get("latent_path") if isinstance(entry, dict) else None
             if latent_path:
-                latents[reference_key] = self.cache.load_latent(latent_path)
+                latents[reference_key] = self._runtime_latent(self.cache.load_latent(latent_path))
         else:
             for role, entry in references.items():
                 if isinstance(entry, dict):
                     latent_path = entry.get("latent_path")
                     if latent_path:
-                        latents[role] = self.cache.load_latent(latent_path)
+                        latents[role] = self._runtime_latent(self.cache.load_latent(latent_path))
 
 
         # Load caption embedding
@@ -240,6 +257,12 @@ def collate_fn(batch: list) -> dict:
     """Default collate function for UnifiedDataset batches.
 
     Stacks latents by role, keeps embeddings as list (variable length).
+
+    The stacking is shape-agnostic: legacy adapters get per-sample
+    ``(C, H, W)`` (temporal dim already squeezed in ``__getitem__``) and stack
+    to ``(B, C, H, W)``; video-capable adapters (``supports_video=True``,
+    MiniMax-H3) keep per-sample ``(C, T, H, W)`` and stack to
+    ``(B, C, T, H, W)``.
     """
     result = {
         "group_ids": [b["group_id"] for b in batch],

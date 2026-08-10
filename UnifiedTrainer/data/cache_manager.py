@@ -9,13 +9,18 @@ Cache directory structure:
     ├── empty_embedding.{suffix}.npz    # Empty-string embedding
     ├── {subdir_name}/                  # Mirrors dataset subdir structure
     │   ├── {basename}.json             # Per-sample metadata (targets, refs, captions)
-    │   ├── {basename}_{res}.pt         # Latent tensor
-    │   ├── {basename}_{res}.webp       # Resized image
+    │   ├── {basename}_{res}.npz        # Unified 5D latent (C, T, H, W) — image = (C, 1, H, W)
+    │   ├── {basename}_{res}.webp       # Resized image (image media only)
     │   └── {basename}_{cap_key}.npz    # Caption embedding
-    └── {basename}_{res}.pt             # Root-level (when image is in dataset root)
+    └── {basename}_{res}.npz            # Root-level (when image is in dataset root)
 
 Datarow format (in index files):
     {"json_path": "...", "bucket": "...", "dataset": "..."}
+
+Latent storage (unified media pipeline, D3):
+    Every media latent is saved as a single-array .npz of shape (C, T, H, W);
+    an image is (C, 1, H, W) — the temporal dim is unified, there is no 2D/3D
+    dual track.  Legacy .pt caches (pre-unified, (C,H,W)) remain loadable.
 """
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
 
 
@@ -80,14 +86,38 @@ class CacheManager:
     # ── Latents ─────────────────────────────────────────────────────
 
     def load_latent(self, path: str | Path) -> torch.Tensor:
-        """Load a cached latent tensor."""
+        """Load a cached latent tensor.
+
+        Supports both the unified single-array .npz format (``latent`` key,
+        shape (C, T, H, W)) and legacy .pt files (torch.save).  npz arrays are
+        stored float32 and loaded back as float32.
+        """
+        path = Path(path)
+        if path.suffix.lower() == ".npz":
+            with np.load(str(path)) as data:
+                arr = data["latent"]
+            return torch.from_numpy(arr).float()
         return torch.load(path, map_location="cpu")
 
     def save_latent(self, path: str | Path, tensor: torch.Tensor) -> Path:
-        """Save a latent tensor to cache."""
+        """Save a latent tensor to cache (legacy .pt format)."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(tensor.cpu(), path)
+        return path
+
+    def save_latent_npz(self, path: str | Path, tensor: torch.Tensor) -> Path:
+        """Save a latent tensor in the unified (C, T, H, W) .npz format.
+
+        The B dimension is folded into the per-sample dimension — each per-sample
+        npz holds one sample's latent (image = (C, 1, H, W), video = (C, T, H, W)).
+        Cast to float32 (matches the values the legacy .pt path stored for
+        training); the trainer re-casts to the compute dtype on load.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        arr = tensor.detach().cpu().float().numpy()
+        np.savez(str(path), latent=arr)
         return path
 
     # ── Index files (T2ITrainer pattern) ────────────────────────────

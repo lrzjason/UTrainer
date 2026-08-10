@@ -87,8 +87,8 @@ your model/data paths, and run.
 }
 ```
 
-**Supported models**: `flux2_klein`, `qwen_image`, `qwen_image_edit`, `z_image`,
-`sd3`, `sd35`, `krea2`, `hidream`.
+**Supported models**: `flux2_klein`, `qwen_image`, `qwen_image_edit`,
+`krea2`.
 **Supported losses**: `flow_matching`, `lcs`, `lcs_saturation`, `mlp_lab`, `l2_reg`.
 
 ## Using the Orchestrator

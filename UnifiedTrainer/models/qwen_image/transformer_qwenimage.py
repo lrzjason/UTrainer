@@ -36,7 +36,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
 
-import utils.custom_offloading_utils as custom_offloading_utils
+from UnifiedTrainer.utils import block_swap as custom_offloading_utils
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 

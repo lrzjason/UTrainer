@@ -13,6 +13,7 @@
 | `04-scheduler-gpu.md` | cron 调度 + GPU Guard 3/4 VRAM 准入 | P3 | 设计完成 |
 | `05-api-frontend.md` | FastAPI + Vue 3 前端 | P3/P4 | 设计完成 |
 | `06-cli-scheduler-multigpu.md` | CLI 全量 CRUD（task/schedule/project/prompt）+ 多卡任务（gpus/gpu_ids）准入与 DDP 执行 | P5 | 已实施（P5a–P5f，见 progress/011） |
+| `07-minimaxh3-training.md` | MiniMax-H3 训练接入：图像对 → 视频，音频延后 | P0–P4 | as-built |
 
 ## 关键全局决定
 

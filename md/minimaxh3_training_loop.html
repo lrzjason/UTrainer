@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMax-H3 — Training Architecture &amp; Training Loop</title>
+<style>
+:root {
+  --bg: #0f1420; --panel: #171e2e; --panel2: #1d2537; --border: #2a3350;
+  --text: #dbe2f0; --muted: #93a0bd; --accent: #6ea8fe; --accent2: #8b7cf6;
+  --code-bg: #0b0f1a; --code-text: #c9d7f5; --kbd: #232d45;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  line-height: 1.65; font-size: 15px;
+}
+.wrap { max-width: 900px; margin: 0 auto; padding: 40px 28px 80px; }
+h1, h2, h3, h4 { color: #fff; line-height: 1.3; }
+h1 {
+  font-size: 28px; padding-bottom: 14px; margin-bottom: 6px;
+  border-bottom: 2px solid var(--accent);
+}
+h2 {
+  font-size: 21px; margin-top: 44px; padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+h2::before { content: "▍"; color: var(--accent); margin-right: 8px; }
+h3 { font-size: 17px; margin-top: 28px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+p, li { color: var(--text); }
+code {
+  background: var(--code-bg); color: var(--code-text);
+  padding: 2px 6px; border-radius: 4px;
+  font-family: "Cascadia Code", Consolas, monospace; font-size: 13px;
+}
+pre {
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 14px 16px; overflow-x: auto;
+}
+pre code { background: none; padding: 0; font-size: 13px; line-height: 1.5; }
+table {
+  border-collapse: collapse; width: 100%; margin: 14px 0;
+  font-size: 14px; background: var(--panel); border-radius: 8px; overflow: hidden;
+}
+th, td { text-align: left; padding: 8px 12px; border: 1px solid var(--border); }
+th { background: var(--panel2); color: #fff; font-weight: 600; }
+tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+blockquote {
+  margin: 14px 0; padding: 10px 16px; border-left: 3px solid var(--accent2);
+  background: var(--panel); border-radius: 0 8px 8px 0; color: var(--muted);
+}
+hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+.toc { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 20px; }
+.toc ul { margin: 6px 0; padding-left: 22px; }
+.toc > ul { padding-left: 4px; list-style: none; }
+.toc a { color: var(--text); }
+.footer { margin-top: 60px; color: var(--muted); font-size: 12.5px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1 id="minimax-h3-training-architecture-training-loop">MiniMax-H3 — Training Architecture &amp; Training Loop</h1>
+<p>Companion to <a href="./minimaxh3_diff.md">minimaxh3_diff.md</a> (implementation review vs.
+diffusers PR-14355 / ComfyUI). This document summarizes <strong>what is trained</strong> and
+<strong>how the training loop runs</strong>, as implemented in <code>UnifiedTrainer</code> (adapter
+<code>models/minimax_h3/__init__.py</code>, engine <code>engine/trainer.py</code>, loss
+<code>losses/flow_matching.py</code>).</p>
+<hr>
+<h2 id="1-what-is-being-trained">1. What is being trained</h2>
+<p>MiniMax-H3 is a <strong>33B joint video+audio diffusion transformer</strong> (50 DiT blocks,
+hidden size 5376). UTrainer trains a <strong>LoRA or LoKR</strong> on the frozen transformer,
+using the <strong>image-pair path</strong> (milestone 1: reference image R → target image T)
+and the <strong>video path</strong> (milestone 2: short video clips). Audio is <strong>excluded</strong>
+this phase (D6): the packed sequence carries zero audio rows.</p>
+<p>The forward pass runs over a <strong>single packed 1-D sequence</strong>:</p>
+<pre><code>[ text (L) | keyframe condition rows (C) | target audio (A=0) | target video rows (V) ]
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Role</th>
+<th>Loaded from</th>
+<th>Used in training?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MiniMaxH3Transformer3DModel</code> (33B)</td>
+<td>the LoRA base</td>
+<td><code>&lt;model_path&gt;/transformer</code></td>
+<td>✅ forward/backward</td>
+</tr>
+<tr>
+<td><code>AutoencoderKLMiniMaxH3</code></td>
+<td>pixels ↔ 24-ch latents</td>
+<td><code>&lt;model_path&gt;/vae</code></td>
+<td>cache build only (offloaded after)</td>
+</tr>
+<tr>
+<td>Qwen3-VL text encoder</td>
+<td>caption → embeddings</td>
+<td><code>&lt;model_path&gt;/text_encoder</code></td>
+<td>cache build only (offloaded after)</td>
+</tr>
+<tr>
+<td>tokenizer / processor</td>
+<td>text tokenization</td>
+<td><code>&lt;model_path&gt;/tokenizer</code>, <code>processor</code></td>
+<td>cache build only</td>
+</tr>
+<tr>
+<td><code>MiniMaxH3Scheduler(shift=12)</code></td>
+<td>σ schedule (train + val)</td>
+<td>constructed directly</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>audio VAE / audio scheduler</td>
+<td>—</td>
+<td>not downloaded (D6)</td>
+<td>❌ excluded</td>
+</tr>
+</tbody>
+</table>
+<p>Key semantics (all PR-exact):</p>
+<ul>
+<li><strong>Data-ward velocity</strong>: the model predicts <code>v = x0 - x_t</code>
+  (<code>adapter.velocity_sign == "data_ward"</code>; <code>compute_target</code> returns
+  <code>learning_target - noise</code>).</li>
+<li><strong>Timestep convention</strong>: the engine samples sigma (<code>t = 1 - σ</code> in PR terms);
+  interpolation <code>(1-σ)·x0 + σ·noise</code> is <strong>bit-identical</strong> to the PR's
+  <code>t·x0 + (1-t)·noise</code>.</li>
+<li><strong>Spatial-only patch</strong>: patch <code>(1, 2, 2)</code> — no temporal patch.</li>
+<li><strong>Modality tags</strong>: video = 0, text = 1 (audio = 2 unused); position IDs are a
+  float64 3-D grid shared across the batch.</li>
+<li><strong>Batch-uniform contract</strong>: one packed layout per forward — one sigma per
+  batch, same text length/tag pattern across samples.</li>
+</ul>
+<h2 id="2-keyframe-conditioning-the-c-rows">2. Keyframe conditioning (the C rows)</h2>
+<ul>
+<li>The source image S is the <strong>keyframe condition</strong>; its clean latent is
+  <strong>noise-augmented</strong>, not fed in clean:
+  <code>scale_noise(clean, 0.999) = 0.999·x0 + 0.001·noise</code>
+  (<code>MINIMAX_H3_KEYFRAME_NOISE_AUG = 0.999</code>, packing.py L82-84).</li>
+<li>The mix happens in <strong>float32</strong> — in bf16 the 0.001 term would be swallowed by
+  the ulp (~0.0078).</li>
+<li>Condition rows are <strong>pinned at timestep <code>t_cond = max(t_target, 0.999)</code></strong> for
+  every denoising step (<code>before_denoise.py</code> L417 parity).</li>
+<li><strong>RNG policy</strong> (this is the notable design point, fixed in the review):</li>
+<li><em>Training / eval-loss</em>: condition noise is drawn <strong>per forward</strong> with a
+    sigma-derived seed (<code>base_seed + round(σ·1e6)</code>) — CFG-consistent at a given
+    σ, fresh noise at every distinct training σ.</li>
+<li><em>Validation generation</em>: condition rows are built <strong>once per request</strong>
+    (<code>build_condition_rows</code>, fixed seed) and reused across all 20 denoising
+    steps — PR parity (<code>PrepareLatentsStep</code> freezes the condition for the whole
+    trajectory). One tensor serves both CFG forwards (the uncond batch shares
+    the same latents).</li>
+</ul>
+<h2 id="3-data-cache-pipeline">3. Data &amp; cache pipeline</h2>
+<p>Config-driven (<code>minimax_h3_train.json</code>):</p>
+<pre><code class="language-json">&quot;image_configs&quot;:    { &quot;T&quot;: {&quot;suffix&quot;: &quot;_t&quot;, &quot;media&quot;: &quot;image&quot;},
+                      &quot;R&quot;: {&quot;suffix&quot;: &quot;_r&quot;, &quot;media&quot;: &quot;image&quot;} },
+&quot;target_configs&quot;:   { &quot;T&quot;: [{&quot;image&quot;: &quot;T&quot;}] },
+&quot;reference_configs&quot;: { &quot;R&quot;: [{&quot;image&quot;: &quot;R&quot;, &quot;sample_type&quot;: &quot;from_same_name&quot;}] },
+&quot;caption_configs&quot;:  { &quot;C&quot;: {&quot;ext&quot;: &quot;.txt&quot;, &quot;image&quot;: &quot;R&quot;} }
+</code></pre>
+<ul>
+<li><strong>Image pair</strong>: <code>T</code> (target, <code>_t</code>) and <code>R</code> (reference/keyframe, <code>_r</code>) from
+  the same base name; the caption <code>.txt</code> is paired with <strong>R</strong> (vision-block
+  presentation: <code>encode_text_accepts_image == True</code>).</li>
+<li><strong>Video</strong> (milestone 2): <code>V</code> = <code>.mp4</code>, <code>video_frames: 124</code>, caption paired
+  with the video.</li>
+<li><strong>Cache build</strong> (one-time, per <code>cache_dir</code>): VAE encodes every image/video
+  frame-group to 5-D latents <code>(B, 24, T, H, W)</code> (<code>vae_scale=8</code>, spatial-only
+  <code>_encode_clip</code> for images — never the 17-frame-clip <code>_encode</code>); the text
+  encoder produces prompt embeddings from <code>hidden_states[50]</code>
+  (<code>MINIMAX_H3_TEXT_ENCODER_LAYER</code>), stored as <code>.npz</code>. Empty-embedding and
+  suffix-embedding files are created alongside.</li>
+<li><strong>Buckets</strong>: three <code>RESOLUTION_CONFIG</code> tiers — 768 (19 buckets, short edge
+  768, area ≤ 768×1344), 1024 (9 buckets), 1280 (9 buckets); every axis a
+  multiple of 16 (<code>vae_scale 8 × patch 2</code>); aspect-preserving cover-crop. One
+  bucket per batch. Image training can go beyond 768p by setting the dataset
+  (and validation) <code>resolution</code> to the tier's short edge, e.g. 1024.</li>
+<li>After cache build the VAE and text encoder are <strong>offloaded</strong> (default
+  <code>offload_vae: true</code>, <code>offload_text_encoder: true</code>); training touches only the
+  transformer.</li>
+</ul>
+<h2 id="4-training-loop-per-micro-batch">4. Training loop — per micro-batch</h2>
+<p>The loop is the unified <code>trainer.train_epoch</code> (generic engine) + H3-specific
+behaviors injected by the adapter. Per batch:</p>
+<ol>
+<li><strong>Move &amp; cast</strong>: latents → CUDA, compute dtype = bf16 (forced bf16 when the
+   base is quantized nf4/int8 — parameter storage dtype is never used as the
+   compute dtype).</li>
+<li><strong>Resolve targets</strong>: <code>T</code> target latents (multi-target supported; H3 uses one).</li>
+<li><strong>Optional perturbations</strong> (off by default): Helios frame-aware corrupt on
+   reference latents; dynamic caption dropout.</li>
+<li><strong>Noise/timestep selection</strong> (<code>noise_selector.select</code>): default is one σ per
+   batch from a <strong>logit-normal</strong> with configurable <code>timestep_mu</code> (default 0.0):
+   <code>u ~ N(mu, 1)</code>, <code>σ = sigmoid(u)</code>, clamped <code>[1e-5, 1-1e-5]</code>; broadcast over the
+   batch. Alternatively <code>{"type": "explorative", "K_cond": 2, "K_uncond": 5,
+   ...}</code> selects the <strong>Explorative Noise Selector</strong> (engine/noise_selector.py)
+   — it re-samples σ around the current optimum per step (CFG-aware, K_cond
+   candidates for the conditional forward, K_uncond for the unconditional), and
+   works for H3 because it only relies on <code>adapter.velocity_sign</code>
+   (<code>"data_ward"</code>) and the batch's <code>_caption_dropped</code> flag. Noise
+   <code>ε ~ randn_like(target)</code>.</li>
+<li><strong>Flow-matching interpolation</strong>:
+   <code>noisy = (1-σ)·x0 + σ·ε</code> (one noisy latent per target).</li>
+<li><strong><code>prepare_model_input(batch, noisy, sigmas)</code></strong> — the H3 core:
+   - condition rows: noise-aug <code>0.999·x0 + 0.001·ε</code> (float32), seed derived
+     from <code>base + round(σ·1e6)</code>;
+   - patchify all latents <code>(1,2,2)</code>, build the packed sequence
+     <code>[text | cond | target]</code>, per-row timesteps <code>t = 1-σ</code>,
+     <code>t_cond = max(t, 0.999)</code>, <code>keyframe_anchors=("first",)</code>;
+   - emit <code>hidden_states</code>, empty <code>audio_hidden_states (B, 0, 32)</code>, prompt
+     embeds, <code>timestep</code>/<code>timestep_indices</code>, <code>token_tags</code>, float64
+     <code>position_ids</code>, <code>video/audio/text_indices</code>.</li>
+<li><strong>Forward</strong>: <code>transformer(**model_input)</code> under <code>accumulate()</code> (gradient
+   accumulation; autocast only for non-bf16). Output <code>(video, audio)</code> tuple.</li>
+<li><strong>Unpack</strong>: slice the target rows (<code>video[:, C:C+V]</code>), unpatchify back to
+   5-D <code>(B, 24, 1, H, W)</code> per target.</li>
+<li><strong>Loss</strong> (<code>flow_matching</code>, weight 1.0):
+   <code>target = learning_target - noise</code> (data-ward flip), MSE
+   <code>((pred - target)²).mean()</code>; optional SD3-style weighting
+   <code>1/(σ²+1)</code> (<code>use_weighting</code>); summed across targets then <strong>normalised by
+   target count</strong> so the scale is independent of target count.</li>
+<li><strong>Backward → clip → step</strong>: <code>accelerator.backward</code>, grad-norm clip
+    (<code>max_grad_norm &gt; 0</code>), <code>optimizer.step()</code>, <code>lr_scheduler.step()</code>,
+    <code>zero_grad(set_to_none=True)</code>, EMA update (if configured).</li>
+<li><strong>Aggressive cleanup</strong>: delete intermediate tensors, <code>batch.clear()</code>,
+    <code>gc.collect()</code> + <code>torch.cuda.empty_cache()</code> every 50 steps or on batch
+    shape change (CUDA caching-allocator fragmentation control).</li>
+<li><strong>Bookkeeping</strong>: step counter advances only on sync (accumulation-aware);
+    progress bar with per-loss breakdown; slow-step timing log
+    (data/swap/fwd/bwd/optim/cleanup, VRAM); callbacks (<code>on_step_end</code> → WandB);
+    optional ScheduledTrainer hook manager.</li>
+</ol>
+<h2 id="5-optimizer-lora-lokr-specifics">5. Optimizer / LoRA-LoKR specifics</h2>
+<p>From <code>minimax_h3_train.json</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Value</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>network_type</code></td>
+<td><code>lokr</code></td>
+<td>LoKR on the frozen base (fall back to PEFT LoRA by removing this key)</td>
+</tr>
+<tr>
+<td><code>lokr_model_type</code> / <code>lokr_target_modules</code></td>
+<td><code>minimax_h3</code> / <code>null</code></td>
+<td><code>_H3_PATTERNS</code>: <code>to_q, to_k, to_v, to_out.0, ff.net.0.proj, ff.net.2</code>; <code>null</code> = patterns</td>
+</tr>
+<tr>
+<td><code>lokr_alpha</code> / <code>lokr_factor</code></td>
+<td>1.0 / 4</td>
+<td>factorization scale <code>alpha/rank</code>, decomposition factor</td>
+</tr>
+<tr>
+<td><code>lora_rank</code> / <code>lora_alpha</code></td>
+<td>8 / 8</td>
+<td>PEFT LoRA on the frozen base (when not using LoKR)</td>
+</tr>
+<tr>
+<td><code>lora_target_modules</code></td>
+<td><code>to_q, to_k, to_v, to_out, ff.net.0.proj, ff.net.2</code></td>
+<td>H3-pinned list; diffusers swiglu FFN names, not <code>ff.gate/up/down</code></td>
+</tr>
+<tr>
+<td><code>noise_selector</code></td>
+<td>explorative</td>
+<td><code>K_cond: 2, K_uncond: 5, warmup_steps: 0, schedule: constant, log_stats: true</code></td>
+</tr>
+<tr>
+<td><code>optimizer</code></td>
+<td><code>adamw8bit</code></td>
+<td>8-bit AdamW</td>
+</tr>
+<tr>
+<td><code>quantize</code></td>
+<td><code>nf4</code></td>
+<td>base must fit the GPU Guard (<code>free &gt; total·3/4</code>) — 61.7 GB transformer needs NF4 on 1×80 GB, or 2×80 GB DDP</td>
+</tr>
+<tr>
+<td><code>mixed_precision</code> / <code>weight_dtype</code></td>
+<td><code>bf16</code></td>
+<td>no autocast on bf16-on-bf16 (avoids LayerNorm dtype warnings)</td>
+</tr>
+<tr>
+<td><code>gradient_checkpointing</code></td>
+<td>true</td>
+<td>engages via PEFT <code>enable_input_require_grads</code></td>
+</tr>
+<tr>
+<td><code>batch_size</code> / <code>gradient_accumulation_steps</code></td>
+<td>1 / 1</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>lr</code> / <code>lr_scheduler</code></td>
+<td>1e-4 / constant</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>multi_gpu</code></td>
+<td><code>reserve</code> (default)</td>
+<td><code>ddp</code> via accelerate for &gt;1 GPU</td>
+</tr>
+</tbody>
+</table>
+<h2 id="6-validation">6. Validation</h2>
+<p>Two distinct paths (both <code>torch.no_grad</code>, RNG frozen with <code>val_seed=42</code> and
+restored afterwards):</p>
+<ul>
+<li><strong><code>val_loss</code></strong> (per epoch): same interpolation + forward as training, one σ
+  per batch sampled via <code>adapter.sample_timesteps</code>; EMA weights swapped in;
+  per-loss breakdown accumulated across batches.</li>
+<li><strong>Image/video generation</strong> (<code>generate_images: true</code>, 4 samples, 20 steps):
+  1. initial noise: <code>randn</code>, generator seeded <code>val_seed + sample_idx</code>;
+  2. <code>noise_scheduler.set_timesteps(20)</code> (<code>MiniMaxH3Scheduler</code>, shift=12;
+     no dynamic-shift <code>mu</code> — the scheduler has no <code>mu</code> param);
+  3. <strong>condition rows built once</strong> before the loop (<code>build_condition_rows</code>,
+     fixed seed) — reused at every step (the review fix);
+  4. loop over <code>t</code>: σ → <code>_prepare_model_input(..., condition_rows)</code> → forward →
+     unpack velocities → <strong>Euler step</strong> <code>scheduler.step(v, t, latent)</code>;
+  5. decode: VAE spatial decode → PIL PNG for images, <strong>silent mp4</strong> at
+     24 fps (<code>MINIMAX_H3_FPS</code>) for videos (<code>decode_validation_video</code>);
+  6. <code>guidance_scale</code> <strong>must stay 1.0</strong> — MiniMax-H3 has no CFG (D8); the CFG
+     branch exists generically but is off for H3.</li>
+</ul>
+<h2 id="7-checkpointing-resume">7. Checkpointing &amp; resume</h2>
+<ul>
+<li>Save every <code>save_every_epoch</code> (1) from <code>save_start_epoch</code> (0) to
+  <code>output/&lt;dir&gt;/&lt;save_name&gt;</code>; weights + optimizer state + <code>_training_state.pt</code>.</li>
+<li><strong>ComfyUI copy</strong>: every save also writes <code>&lt;name&gt;_comfyui.safetensors</code> — for
+  LoRA the H3 key map is converted exactly (fused <code>attn.qkv_proj</code> = concat of
+  <code>to_q/to_k/to_v</code> down/up, <code>out_proj</code> ← <code>to_out.0</code>, <code>mlp.fc1/fc2</code> ←
+  <code>ff.net.0.proj/ff.net.2</code>, <code>transformer_blocks</code> → <code>blocks</code>); for LoKR the
+  layer is first converted to an <strong>exact</strong> LoRA pair via the Kronecker
+  mixed-product (<code>kron(w1,w2) = kron(X1,X2)·kron(Y1,Y2)</code>, <code>R = in1·rank</code>, no
+  delta materialization) and then the same key conversion is applied. Load in
+  ComfyUI with the built-in LoRA loader (regular <code>lora_down/lora_up</code> format +
+  explicit <code>.alpha</code>).</li>
+<li><strong>Full resume</strong> (krea2-style): <code>--resume-full &lt;checkpoint.safetensors&gt;</code> or
+  config <code>"resume": {"checkpoint": ..., "full": true}</code> — restores weights +
+  optimizer + scheduler + RNG + step/epoch from the sibling
+  <code>_training_state.pt</code> (saved with every checkpoint).</li>
+<li>LoRA-only resume: <code>--resume &lt;checkpoint&gt;</code> (config- or CLI-driven; epoch
+  off-by-one and <code>num_epochs</code> bump rules apply per the unified trainer
+  conventions).</li>
+</ul>
+<h2 id="8-key-constants-from-the-locked-diffusers-pr-packing-module">8. Key constants (from the locked diffusers PR packing module)</h2>
+<table>
+<thead>
+<tr>
+<th>Constant</th>
+<th>Value</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MINIMAX_H3_KEYFRAME_NOISE_AUG</code></td>
+<td>0.999</td>
+<td>keyframe condition noise level</td>
+</tr>
+<tr>
+<td><code>MINIMAX_H3_KEYFRAME_ENCODE_SEED</code></td>
+<td>42</td>
+<td>(PR reference encode seed)</td>
+</tr>
+<tr>
+<td><code>MINIMAX_H3_TEXT_ENCODER_LAYER</code></td>
+<td>50</td>
+<td>prompt embeds = <code>hidden_states[50]</code></td>
+</tr>
+<tr>
+<td><code>MINIMAX_H3_TEXT_TAG</code> / <code>VIDEO_TAG</code></td>
+<td>1 / 0</td>
+<td>modality tags in the packed sequence</td>
+</tr>
+<tr>
+<td><code>MINIMAX_H3_FPS</code></td>
+<td>24</td>
+<td>validation video frame rate</td>
+</tr>
+<tr>
+<td><code>_H3_AUDIO_IN_CHANNELS</code></td>
+<td>32</td>
+<td>empty audio rows are <code>(B, 0, 32)</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="9-reference-files">9. Reference files</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>UnifiedTrainer/models/minimax_h3/__init__.py</code></td>
+<td>adapter: packing, condition rows, LoRA contract, decode</td>
+</tr>
+<tr>
+<td><code>UnifiedTrainer/engine/trainer.py</code></td>
+<td><code>train_epoch</code>, <code>validate_epoch</code>, <code>_generate_from_val_sample</code></td>
+</tr>
+<tr>
+<td><code>UnifiedTrainer/losses/flow_matching.py</code></td>
+<td>data-ward velocity MSE</td>
+</tr>
+<tr>
+<td><code>UnifiedTrainer/data/video_utils.py</code></td>
+<td>bucket cover-crop, keyframe preprocessing</td>
+</tr>
+<tr>
+<td><code>UnifiedTrainer/configs/minimax_h3_train.json</code></td>
+<td>production image-pair config</td>
+</tr>
+<tr>
+<td><code>UnifiedTrainer/configs/minimax_h3_video_smoke.json</code></td>
+<td>video smoke config</td>
+</tr>
+<tr>
+<td><code>md/07-minimaxh3-training.md</code></td>
+<td>as-built training doc (milestones)</td>
+</tr>
+<tr>
+<td><code>md/minimaxh3_diff.md</code></td>
+<td>review vs. diffusers PR-14355 / ComfyUI</td>
+</tr>
+</tbody>
+</table>
+<p><em>Status: image-pair (M1) + video (M2) code delivered; G2–G7 runtime acceptance
+pending model weights. Audio (D6) deferred.</em></p>
+<div class="footer">Generated from <code>minimaxh3_training_loop.md</code> — UnifiedTrainer MiniMax-H3</div>
+</div>
+</body>
+</html>

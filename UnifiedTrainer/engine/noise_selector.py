@@ -183,7 +183,7 @@ class ExplorativeNoiseSelector(NoiseSelector):
             return noises, sigmas, timesteps
 
         # ── Phase 1: Explore K noise candidates (no_grad, no activations) ──
-        sigmas_b = sigmas.view(-1, 1, 1, 1) if target_latents[0].ndim >= 2 else sigmas
+        sigmas_b = sigmas.view(-1, *(1,) * (target_latents[0].ndim - 1)) if target_latents[0].ndim >= 2 else sigmas
         best_loss = float("inf")
         worst_loss = float("-inf")
         best_noises = None
@@ -205,7 +205,12 @@ class ExplorativeNoiseSelector(NoiseSelector):
                 input_k = adapter.prepare_model_input(batch, noisy_k, sigmas)
                 pred_k = transformer(**input_k)
                 unpacked_k = adapter.unpack_prediction(pred_k)
-                loss_k = self._eval_velocity_mse(unpacked_k, noises_k, target_latents)
+                loss_k = self._eval_velocity_mse(
+                    unpacked_k,
+                    noises_k,
+                    target_latents,
+                    velocity_sign=getattr(adapter, "velocity_sign", "standard"),
+                )
 
             loss_val = loss_k.item()
             all_losses.append(loss_val)
@@ -251,18 +256,30 @@ class ExplorativeNoiseSelector(NoiseSelector):
         unpacked: List[torch.Tensor],
         noises: List[torch.Tensor],
         target_latents: List[torch.Tensor],
+        velocity_sign: str = "standard",
     ) -> torch.Tensor:
         """Compute flow-matching velocity MSE for ranking.
 
-        velocity target = noise - clean_latent
+        The velocity-target direction follows the adapter's velocity_sign
+        convention (same source as losses/flow_matching.py):
+          - "standard" (noise-ward): velocity_target = noise - clean_latent
+          - "data_ward" (e.g. MiniMax-H3): velocity_target = clean_latent - noise
         loss = MSE(predicted_velocity, target_velocity)
 
-        This is the primary training signal (always present, no auxiliary
-        context needed). Used only for argmin ranking during exploration.
+        Default "standard" keeps legacy 4D adapters (krea2, ...) bit-identical.
+        Used only for argmin ranking during exploration.
         """
+        if velocity_sign not in ("standard", "data_ward"):
+            raise ValueError(
+                f"Unsupported velocity_sign {velocity_sign!r}; "
+                "expected 'standard' or 'data_ward'"
+            )
         total = torch.tensor(0.0, device=target_latents[0].device)
         for unpacked_i, noise_i, target_i in zip(unpacked, noises, target_latents):
-            velocity_target = noise_i - target_i
+            if velocity_sign == "data_ward":
+                velocity_target = target_i - noise_i
+            else:
+                velocity_target = noise_i - target_i
             total = total + F.mse_loss(unpacked_i.float(), velocity_target.float())
         return total / len(target_latents)
 

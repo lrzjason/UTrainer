@@ -388,3 +388,46 @@ def __getitem__(self, index):
 
 6. **`get_cache_dir()` logic**: If image is in dataset root → cache root; if in subdir
    → cache root + subdir name.
+
+---
+
+## MiniMax-H3 统一媒体缓存（as-built，P1.3 一次建成；P2 只激活视频分支）
+
+MiniMax-H3 训练复用**同一条**缓存管线（D3：统一媒体管线，图像/视频共用、
+一次建成），与 krea2 等 2D 图片模型的 `(C, H, W)` `.pt` latent 不同：
+
+### 1. 统一 5D 缓存格式
+
+- 所有媒体 latent 一律存 `(C, T, H, W)` 的 `.npz`（B 维折叠进 index 样本
+  维度）；**图像 = `(C, 1, H, W)`**，T 维统一，无 2D/3D 双轨。
+- 每样本 JSON 记录 `media` 字段（`"image"` / `"video"`）与 `num_frames`；
+  加载时 dataset 不再假设 2D。
+- 图像媒体（milestone 1）：`load_image_frames` → PIL → `(1, C, 1, H, W)` →
+  `adapter.encode_video`（单帧 `T == 1` 走 `vae._encode_clip`，PR 关键帧同款
+  路径）→ `(24, 1, h, w)`。
+- 视频媒体（milestone 2，代码就绪、运行验收延后）：`load_video_frames`
+  （PyAV 解码、24fps 均匀抽帧、等比缩放+中心裁剪、5–15s 时长校验、17n+5
+  对齐）→ `(1, C, T, H, W)` → `adapter.encode_video`（`T > 1` 走
+  `vae._encode` 17n+5 分块 + token_drop=3）→ `(24, T_lat, h, w)`。
+
+### 2. 帧数对齐规则（17n+5 → 5n+2）
+
+- 视频 VAE 的 17 像素帧/块 → 5 latent 帧/块（时间压缩 4×，丢每块尾 3 帧）。
+- 像素帧数必须对齐 `17n+5`（`data/video_utils.snap_frames` 向上取整）；
+  latent 帧数 = `5n+2`（`video_latent_num_frames` 包装 PR packing 函数）。
+- 配置默认 `video_frames=124` → **124 → 37 latent 帧**（17×7+5=124，
+  5×7+2=37）——P1.3 视频链路断言以 `(C,T,H,W)=(16,124,8,8)` 样例核实。
+
+### 3. 音频缓存
+
+- **延后**：本期不做音频训练（D6），不构建 `media="audio"` 缓存、不下载
+  audio_vae/audio_scheduler；适配器 `audio_hidden_states` 传空 `(B, 0, 32)`。
+- `media` 字段取值只允许 `"image" | "video"`，`media="audio"` 在
+  schema validate 直接拒绝。
+
+### 4. 与 2D 缓存的关系
+
+- 图像与视频共用同一缓存格式/加载路径/适配器钩子；里程碑 2 无需重建任何
+  数据代码，图像缓存与视频缓存同格式、可互相复用。
+- legacy 2D 适配器（krea2/...）仍收 4D `(B, C, H, W)` 运行时张量：
+  dataset 对非视频适配器把 singleton 时间维 squeeze 后再 collate，行为不变。

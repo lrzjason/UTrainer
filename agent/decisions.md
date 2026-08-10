@@ -306,3 +306,133 @@
   `tmp/test_*.py`（gitignored）；`tmp/test_p5.py` 90 项断言全绿，CLI/API
   冒烟通过，详见 `progress/011-p5-cli-multigpu.md`。
 
+
+---
+
+# MiniMax-H3 训练接入（模型接入决定与实施偏差）
+
+> 本节编号与 `md/minimaxh3_implementation.md` §3 的 D1–D10 一一对应。
+> 本文件既有 D1–D27 为**编排器**决定；为避免歧义，模型接入决定用
+> `H3-` 前缀命名空间保留计划编号（H3-D1 = 计划 D1）。
+
+## H3-D1 — 依赖固定到 diffusers `pr-14355` 分支
+- 训练与推理共用同一 diffusers 源码；本地 `E:\diffusers` 保持
+  `pr-14355`（`git fetch origin refs/pull/14355/head:pr-14355` 可随时更新，
+  PR 可能 force-push）。requirements 注释注明"训练 MiniMax-H3 需 PR #14355
+  分支"。
+- 新增依赖 `av`（PyAV，16.1.0 已装，P0）；不装 torchaudio。
+
+## H3-D2 — Transformer 先直接 import diffusers，LoRA + 梯度检查点起步
+- `MiniMaxH3Transformer3DModel` 原生支持 `PeftAdapterMixin` + gradient
+  checkpointing，且 H3 前向是单 packed 序列，vendor 同步成本高。
+- block swap 作为 P4 增强：OOM 时才按 krea2 模式 vendor +
+  `BlockSwapMiniMaxH3Transformer3DModel`（复用 `utils/block_swap.ModelOffloader`）。
+- LoRA 目标模块实测固化：`["to_q","to_k","to_v","to_out","ff.net.0.proj",
+  "ff.net.2"]`（diffusers swiglu FF 命名，非 ff.gate/ff.up/ff.down）。
+
+## H3-D3 — 数据层一次建成：统一媒体管线（图像/视频共用），音频本期不扩展
+- 里程碑 1 即落地：`ImageConfig.media`（"image"|"video"，默认 "image"）、
+  `DatasetConfig.video_frames/video_fps` 一次加入 schema；validate 规则同步。
+- **统一 5D 缓存格式**：所有 H3 媒体 latents 一律存 (C,T,H,W) npz，
+  图像 = (C,1,H,W)；cache_builder 单一媒体分发（image→PIL→5D；video→PyAV
+  解码→5D），共用 `adapter.encode_video`。
+- `data/video_utils.py` 一次实现（图像/视频两个 loader + 17n+5 对齐），
+  P1 端到端验证 image 分支，video 分支 P2 用真实数据激活——里程碑 2 只加
+  测试数据与验证输出，不改 schema/缓存格式/collate。不做 `media="audio"`。
+
+## H3-D4 — 新增 `MiniMaxH3Adapter`，实现全部抽象方法 + 新可选钩子
+- 新可选钩子（带默认实现/默认行为，不影响现有模型）：`encode_video`、
+  `decode_validation_video`；`velocity_sign` 属性（base 默认 `"standard"`，
+  H3 声明 `"data_ward"`）。
+- `encode_audio/decode_audio/load_audio_vae` 延后到音频阶段再设计。
+- as-built：`decode_validation_video` 刻意不定义为 base 方法（引擎
+  `hasattr` 分发 + T>1 守卫；base 定义会翻转所有图像适配器的 hasattr）。
+
+## H3-D5 — 速度方向约定：`unpack_prediction` 返回模型原值（data-ward）
+- loss 按 `adapter.velocity_sign` 取反 target：`flow_matching.py` 一行
+  `target = learning_target - noise if data_ward else noise - learning_target`。
+- `compute_x0_hat`（base）：data_ward → `noise + velocity`；standard →
+  `noise - velocity`；未知 velocity_sign 直接 ValueError 拒绝。
+
+## H3-D6 — 时间约定 σ→t=1−σ；每前向最多 2 个去重 timestep；音频行省略
+- 引擎插值 `(1-σ)x0 + σ·noise` 与 H3 前向 `x_t = t·x0 + (1−t)·noise`
+  逐位等价，引擎无需改。
+- 目标行 t=1−σ；关键帧条件行钉在 t=0.999（PR noise_aug=0.999 混噪 =
+  0.999·x0+0.001·noise，即引擎 σ_cond=0.001）；文本行继承目标行时间步。
+- 音频行整体省略：`num_audio_latents=0`（`audio_proj_in(空)` +
+  `index_copy` 空索引均为 no-op，代码级核实）；`audio_hidden_states` 空
+  `(B, 0, 32)`（audio_proj_in 输入维 32，非输出维 5376）。
+- `sample_timesteps` 用 logit-normal（mu 可配，mu 守卫 clamp [1e-5,1−1e-5]）。
+
+## H3-D7 — LoRA 目标模块按 H3 命名
+- attention：`to_q/to_k/to_v/to_out`；FeedForward（diffusers swiglu）：
+  `ff.net.0.proj` / `ff.net.2`（P1 用 `named_modules()` 实测后固化）。
+- `proj_in/audio_proj_in/context_embedder/proj_out/audio_proj_out/
+  time_embedder` 保持冻结（fp32 混合精度契约）；`adaln_proj/norm_out`
+  是 bf16 的 AdaLN 调制头，也在冻结清单但**不属于** fp32 契约（P3 审查
+  NOTE ③ 澄清）。
+- 默认 rank 8–16（61.7GB 模型 + 长序列，显存优先）。
+
+## H3-D8 — 验证生成：`load_scheduler` 返回 MiniMaxH3Scheduler(shift=12)
+- CFG 关闭（`val_guidance_scale` 必须 =1，H3 无 CFG）；解码按帧数分发：
+  T==1 → `decode_latent` → PIL；T>1（有能力钩子）→ 静音 mp4。
+- 引擎验证循环迭代 `scheduler.timesteps` 并调 `step(v,t,l)`，H3 调度器
+  语义完全匹配，引擎循环无需改。
+
+## H3-D9 — 编排器零代码改动，GPU 准入靠任务字段
+- 任务即 `train.py --task-id`；单卡 80GB + NF4/int8 量化或 2×80GB DDP
+  （`gpus: 2, multi_gpu: ddp`）均可。GPU Guard `free>total×3/4` 对 61.7GB
+  未量化模型过严 → 任务级 `min_free_mb` 可选字段或直接用量化配置规避。
+- 生产配置采用 `quantize: nf4` + `multi_gpu: "reserve"`。
+
+## H3-D10 — 验收以数值 parity + 过拟合测试为准
+- 先速度符号校验（构造已知 x0/noise/σ 断言输出 ≈ x0−noise），再图像对
+  单样本过拟合（loss 收敛到 ~0，里程碑 1 完成标准），再视频过拟合
+  （里程碑 2），最后真实 LoRA 训练验证保存/恢复与推理质量。
+- as-built 状态：G2–G7 需模型权重，运行验收延后。
+
+---
+
+# MiniMax-H3 实施偏差与事故记录（2026-08-03~05，源自 progress/012）
+
+- **P1-r x0_hat 符号盲区修复（M1）**：engine 曾有两处把 `x0_hat` 写死为
+  `noise - model_pred`（标准符号），对 data-ward 适配器会静默训错方向。
+  修复：`BaseModelAdapter.compute_x0_hat` 按 `velocity_sign` 分发
+  （data_ward → `noise + velocity`），trainer 两处接入；`_eval_velocity_mse`
+  同步分发 + 未知值拒绝（standard 逐位一致回归）。
+- **M2.3 bf16 非确定性发现（条件行混噪 f32）**：关键帧条件行混噪
+  `0.999·x0 + 0.001·noise` 若按 bf16 执行，0.001·noise 项低于 bf16 ulp
+  （~0.0078@1.0）被舍入丢弃，条件行退化为确定性 0.999·x0，seed/σ 派生
+  机制失效。修复：混噪在 float32 下执行（packed 序列进 transformer 仍转
+  bf16，与 PR 行为一致）。
+- **P1.3 引擎偏差（D6 授权）**：`sigmas.view(-1,1,1,1)` → ndim 通用展开
+  `view(-1, *(1,)*(ndim-1))`（trainer.py L614/L1008 + noise_selector.py
+  L186）——旧 4D view 对 5D latent 广播右对齐成 (1,B,1,1,1)，B>1 必炸；
+  4D 行为逐位一致。
+- **P1.2 审查修复闭环**：HIGH caption 规则冲突（caption 与关联图配对）、
+  MEDIUM 解码上限绕过时长校验、MEDIUM 抽帧不足破坏 17n+5 对齐——修复后
+  32/32 断言 + krea2 44 配置回归。
+- **P2 `_reserved_latent_keys` / t2v guard**：目标 latent 不得被误认为
+  条件行——`T==1` 无 source 报 e12（图像对契约保留）；`T>1` 无 source 走
+  纯 t2v（`keyframe_anchors=()`）不报错；非单帧 resolved latent 视为无
+  条件（防御 latents 按 image-key 键控的两种情况）。遗留（范围外）：
+  trainer `_get_reference_latent`/`_decode_reference_images` 仍用旧
+  `k != tc_key` fallback（视频 reference 走 try/except → None，不崩溃）。
+- **P2 LOW 修复**：`decode_validation_video` 原 mp4 文件名跨样本/跨 epoch
+  静默覆盖 → 增 `prefix` 参数 + trainer 按 PNG 身份传
+  `{save_name}_val_epoch{epoch}_{sample_idx}[_{ti}]`（新增断言 5.9/5.10）。
+- **P3 RAM 事故与微型实例化决策**：验证脚本最初用全尺寸 H3 配置
+  （50+2 层、hidden 5376、ffn 14336）`from_config` 随机初始化仅枚举模块名
+  → ~14B 参数 ≈ 56–60GB fp32（峰值实测 OOM 风险）。修复为同结构微型配置
+  （2+2 层、hidden 256、ffn 512，heads×head_dim=hidden）→ 5.35M 参数 ≈
+  20MB，实测峰值 873MB（torch 导入开销）；断言按 num_layers+
+  num_refiner_layers 派生计数，结构断言不变。
+- **P3 审查核实**：`_comment` "2×80GB DDP" 为计划 D9 继承表述（multi_gpu
+  约定 / GPU Guard 3/4 规则 / guidance_scale==1.0 均已对照代码核实）；
+  `lora_target_modules` pin 在 `quantize="nf4"` 下仍解析成功（bnb
+  Linear4bit 继承 nn.Linear，MRO 确认）。
+- **空音频 (B,0,32) 而非 (B,0,5376)**：`audio_proj_in` 是
+  `nn.Linear(32→5376)`，空行仍校验输入特征维；P1 阶段曾按输出维 5376
+  传空张量，已修复并注释（见模型模块 docstring 与偏差报告）。
+- **前瞻（未实施，已记录）**：collate 同批混 T（图像+视频混合 batch）
+  延后；每 forward 需 batch 统一 packed 布局与统一 σ。

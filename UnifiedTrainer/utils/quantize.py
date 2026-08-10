@@ -17,6 +17,12 @@ from typing import List, Optional, Union
 import torch
 import torch.nn as nn
 
+try:  # progress bars for the per-block quantization loop
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm ships with huggingface_hub
+    def tqdm(iterable=None, **kwargs):
+        return iterable if iterable is not None else iter(())
+
 logger = logging.getLogger(__name__)
 
 # ── Conditional torchao import ──────────────────────────────────────────
@@ -140,6 +146,7 @@ def quantize(
     if exclude is not None:
         exclude = [exclude] if isinstance(exclude, str) else exclude
 
+    targets = []
     for name, m in model.named_modules():
         if not isinstance(m, nn.Linear):
             continue  # Only quantize Linear layers (matches T2ITrainer behaviour)
@@ -153,6 +160,8 @@ def quantize(
             fnmatch(name, pattern) for pattern in exclude
         ):
             continue
+        targets.append((name, m))
+    for name, m in tqdm(targets, desc="torchao quantize", unit="linear", leave=False):
         try:
             if isinstance(weights, AOType):
                 torchao_quantize_(m, weights.config)
@@ -237,7 +246,7 @@ def quantize_model(
 
     logger.info(f"Quantizing {len(all_blocks)} transformer blocks one at a time...")
 
-    for block in all_blocks:
+    for block in tqdm(all_blocks, desc="torchao per-block quantize", unit="block", leave=False):
         # Move single block to GPU
         block.to(device, dtype=dtype, non_blocking=True)
 

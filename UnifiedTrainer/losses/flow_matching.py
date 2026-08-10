@@ -3,6 +3,7 @@ Flow-Matching Loss -standard velocity prediction MSE.
 
 This is the base loss, always active in flow-matching diffusion training.
 target = noise - learning_target
+target = learning_target - noise   (adapter.velocity_sign == "data_ward", MiniMax-H3)
 loss   = mean(weighting * (model_pred - target)^2)
 """
 from __future__ import annotations
@@ -40,7 +41,20 @@ class FlowMatchingLoss(BaseLoss):
         self.use_weighting = use_weighting
 
     def compute(self, context: LossContext) -> torch.Tensor:
-        target = context.noise - context.learning_target
+        # MiniMax-H3's scheduler is data-ward: v = x0 - x_t, so the flow
+        # target flips sign relative to the standard convention.  A typo'd
+        # or missing override would silently train the wrong direction
+        # (loss still decreases), so reject unknown values outright.
+        velocity_sign = getattr(context.adapter, "velocity_sign", "standard")
+        if velocity_sign not in ("standard", "data_ward"):
+            raise ValueError(
+                f"Unsupported velocity_sign {velocity_sign!r}; "
+                "expected 'standard' or 'data_ward'"
+            )
+        if velocity_sign == "data_ward":
+            target = context.learning_target - context.noise
+        else:
+            target = context.noise - context.learning_target
 
         if self.use_weighting:
             weighting = compute_loss_weighting_for_sd3(context.sigmas)

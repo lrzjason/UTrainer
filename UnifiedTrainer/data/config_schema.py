@@ -10,6 +10,13 @@ This mirrors T2ITrainer's config structure:
 
 All five layers are required — configs must specify target_configs, reference_configs,
 caption_configs, and batch_configs explicitly.
+
+MiniMax-H3 统一媒体管线（D3）扩展：
+    - ImageConfig.media: "image" | "video"（默认 "image"）——图像/视频共用同一
+      5D 缓存格式 (C,T,H,W)，视频媒体键只能被 target_configs 引用（视频参考图
+      本期不支持；视频字幕本期支持——.mp4 旁的 .txt 是标准配对）；
+    - DatasetConfig.video_frames / video_fps：视频抽帧数与帧率，video_frames 必须
+      满足 17n+5 对齐（视频 VAE 分块前提）。
 """
 from __future__ import annotations
 
@@ -61,13 +68,21 @@ class ImageConfig:
     key: str
     suffix: str = ""
     prefix: str = ""
+    media: str = "image"  # "image" | "video" — 统一媒体管线媒体字段（D3）;视频媒体键只能被 target_configs 引用（视频参考图本期不支持，视频字幕本期支持）
 
     @classmethod
     def from_dict(cls, key: str, d: dict) -> "ImageConfig":
+        media = d.get("media", "image")
+        if media not in ("image", "video"):
+            raise ValueError(
+                f"image_configs['{key}'].media must be 'image' or 'video', got {media!r}. "
+                f"Audio media is not supported this phase."
+            )
         return cls(
             key=key,
             suffix=d.get("suffix", ""),
             prefix=d.get("prefix", ""),
+            media=media,
         )
 
 
@@ -156,6 +171,10 @@ class DatasetConfig:
     recreate_latents: bool = False
     recreate_embeddings: bool = False
 
+    # 统一媒体管线（D3）：视频抽帧数与帧率（视频媒体一次建成，P2 激活）
+    video_frames: int = 124  # 视频抽帧数，须满足 17n+5 对齐
+    video_fps: int = 24      # 视频实际帧率，用于时长校验
+
     # 5 config layers
     image_configs: Dict[str, ImageConfig] = field(default_factory=dict)
     target_configs: Dict[str, List[TargetEntry]] = field(default_factory=dict)
@@ -173,6 +192,8 @@ class DatasetConfig:
         recreate_cache = d.get("recreate_cache", False)
         recreate_latents = d.get("recreate_latents", False)
         recreate_embeddings = d.get("recreate_embeddings", False)
+        video_frames = int(d.get("video_frames", 124))
+        video_fps = int(d.get("video_fps", 24))
 
         # ── Parse image_configs ───────────────────────────────────────
         raw_image_configs = d.get("image_configs", {})
@@ -237,6 +258,8 @@ class DatasetConfig:
             recreate_cache=recreate_cache,
             recreate_latents=recreate_latents,
             recreate_embeddings=recreate_embeddings,
+            video_frames=video_frames,
+            video_fps=video_fps,
             image_configs=image_configs,
             target_configs=target_configs,
             reference_configs=reference_configs,
@@ -250,7 +273,10 @@ class DatasetConfig:
     def validate(self) -> None:
         """Cross-reference validation between config layers.
 
-        Raises ValueError if any referenced key is not found.
+        Raises ValueError if any referenced key is not found, or if a
+        unified-media rule is violated (D3: video reference images are not
+        supported this phase — video media keys may not be referenced by
+        reference_configs; video_frames must be 17n+5 aligned).
         """
         # Validate target_configs reference valid image_configs keys
         for t_key, entries in self.target_configs.items():
@@ -269,8 +295,17 @@ class DatasetConfig:
                         f"reference_configs['{r_key}'] references image '{entry.image}' "
                         f"which is not in image_configs. Available: {list(self.image_configs.keys())}"
                     )
+                # 视频媒体键只能被 target_configs 引用（D3：视频参考图本期不支持）
+                img_cfg = self.image_configs.get(entry.image)
+                if img_cfg is not None and img_cfg.media == "video":
+                    raise ValueError(
+                        f"reference_configs['{r_key}'] references video media image "
+                        f"'{entry.image}'. Video reference images are not supported this "
+                        f"phase — only target_configs may reference video media keys."
+                    )
 
         # Validate caption_configs reference valid image_configs keys
+        # 视频字幕本期支持：caption_configs.image 允许引用视频媒体键（.mp4 旁的 .txt 是标准配对）
         for c_key, cfg in self.caption_configs.items():
             if cfg.image and cfg.image not in self.image_configs:
                 raise ValueError(
@@ -295,6 +330,19 @@ class DatasetConfig:
                     f"batch_configs[{i}].reference_config='{bc.reference_config}' "
                     f"not found in reference_configs. Available: {list(self.reference_configs.keys())}"
                 )
+
+        # 视频帧数 17n+5 对齐（D3：视频 VAE 分块前提，17 像素帧/块 → 5 latent 帧/块）。
+        # 仅含视频媒体的 dataset 才执行——图像-only 配置的 video_frames 无实际用途，
+        # 不应因无意义的占位值/默认值硬报错（krea2 等历史图像配置默认 124 本就通过，
+        # 跳过校验后更宽松）。
+        has_video_media = any(
+            cfg.media == "video" for cfg in self.image_configs.values()
+        )
+        if has_video_media and (self.video_frames - 5) % 17 != 0:
+            raise ValueError(
+                f"video_frames must satisfy 17n+5 alignment ((video_frames - 5) % 17 == 0), "
+                f"got {self.video_frames}. Valid examples: 5, 22, 39, 56, 73, 90, 107, 124."
+            )
 
         logger.info(
             f"DatasetConfig validated: "

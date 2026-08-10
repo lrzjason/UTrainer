@@ -105,10 +105,20 @@ _FLUX_PATTERNS = [
     "*single_blocks.*.proj_out",
 ]
 
+_H3_PATTERNS = [
+    "*transformer_blocks.*.attn.to_q",
+    "*transformer_blocks.*.attn.to_k",
+    "*transformer_blocks.*.attn.to_v",
+    "*transformer_blocks.*.attn.to_out.0",
+    "*transformer_blocks.*.ff.net.0.proj",
+    "*transformer_blocks.*.ff.net.2",
+]
+
 _MODEL_PATTERNS = {
     "krea2": _KREA2_PATTERNS,
     "qwen": _QWEN_PATTERNS,
     "flux": _FLUX_PATTERNS,
+    "minimax_h3": _H3_PATTERNS,
 }
 
 

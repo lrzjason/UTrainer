@@ -7,8 +7,8 @@ in subdirs mirroring the dataset structure, and builds explicit index files
 
 Per-sample JSON schema:
     {
-        "targets":     {target_key: {image_path, latent_path, bucket, ...}},
-        "references":  {ref_key: {image_path, latent_path, bucket, ...}},
+        "targets":     {target_key: {image_path, latent_path, bucket, media, num_frames, ...}},
+        "references":  {ref_key: {image_path, latent_path, bucket, media, num_frames, ...}},
         "captions":    {caption_key: {npz_path, text_path}},
         "bucket":      "WxH",
         "mapping_key": "/dataset/subdir/base_name"
@@ -18,6 +18,17 @@ Index entry (datarow):
     {"json_path": "/cache/subdir/base.json", "bucket": "WxH", "dataset": "name"}
 
 No batch_configs in cache — resolved at training time from config.
+
+Unified media pipeline (D3):
+    Every latent is stored in the unified (C, T, H, W) .npz format via the
+    single media dispatch ``_construct_media``:
+      media == "video" → load_video_frames (DatasetConfig.video_frames/video_fps)
+      otherwise        → load_image_frames (default "image")
+    Both branches go through ``adapter.encode_video(vae, frames)`` — image
+    samples (T == 1) keep every existing adapter's exact behavior through the
+    base default implementation, and the MiniMax-H3 adapter (P1.4) overrides
+    the hook for real video encoding.  Per-sample metadata records ``media``
+    and ``num_frames``.
 """
 from __future__ import annotations
 
@@ -45,11 +56,12 @@ from UnifiedTrainer.data.config_schema import (
 )
 from UnifiedTrainer.data.cache_manager import CacheManager
 from UnifiedTrainer.data.embedding_cache import EmbeddingCache
-from UnifiedTrainer.data.transforms import to_tensor_universal
+from UnifiedTrainer.data.video_utils import load_image_frames, load_video_frames
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_IMAGE_TYPES = [".jpg", ".jpeg", ".png", ".webp"]
+SUPPORTED_VIDEO_TYPES = [".mp4"]
 
 
 class CacheBuilder:
@@ -284,6 +296,30 @@ class CacheBuilder:
 
     # ── Image pair construction ────────────────────────────────────────
 
+    def _file_matches_key(self, filename: str, img_cfg: ImageConfig) -> bool:
+        """Whether a media file (basename, extension attached) belongs to an
+        image_configs key.
+
+        Media-aware (D3): image keys only match image extensions, video keys only
+        match video extensions.  The key's ``suffix`` may be a name marker inside
+        the base name (``_t``, ``_s`` — existing krea2 convention) OR the file
+        extension itself (``.jpg`` / ``.mp4`` — the MiniMax-H3 image-pair
+        convention).  An empty suffix matches every file of the key's media type.
+        """
+        ext = os.path.splitext(filename)[1].lower()
+        if img_cfg.media == "video":
+            if ext not in SUPPORTED_VIDEO_TYPES:
+                return False
+        elif ext not in SUPPORTED_IMAGE_TYPES:
+            return False
+
+        if not img_cfg.suffix:
+            return True
+        if img_cfg.suffix.lower() == ext:
+            return True
+        base = os.path.splitext(filename)[0]
+        return find_index_from_right(base, img_cfg.suffix) > 0
+
     def _construct_image_pairs(self) -> List[dict]:
         """Scan the dataset directory and construct image pairs by base name.
 
@@ -298,11 +334,19 @@ class CacheBuilder:
             logger.warning(f"Dataset directory not found: {data_dir}")
             return []
 
-        # Scan all image files recursively
+        # Scan all media files recursively: image extensions always, plus video
+        # extensions when any image_configs key declares media="video" (D3 —
+        # built once in P1, P2 only activates the existing video branch).
+        supported_exts = set(SUPPORTED_IMAGE_TYPES)
+        if any(
+            img_cfg.media == "video"
+            for img_cfg in self.ds_config.image_configs.values()
+        ):
+            supported_exts.update(SUPPORTED_VIDEO_TYPES)
         image_files = [
             f for f in glob.iglob(os.path.join(data_dir, "**"), recursive=True)
             if os.path.isfile(f)
-            and os.path.splitext(f)[1].lower() in SUPPORTED_IMAGE_TYPES
+            and os.path.splitext(f)[1].lower() in supported_exts
         ]
 
         # Build image pools: image_pool[key] = [file_paths]
@@ -310,15 +354,9 @@ class CacheBuilder:
 
         for f in image_files:
             base_name = os.path.basename(f)
-            filename, _ = os.path.splitext(base_name)
 
             for key, img_cfg in self.ds_config.image_configs.items():
-                if img_cfg.suffix and len(img_cfg.suffix) > 0:
-                    idx = find_index_from_right(filename, img_cfg.suffix)
-                    if idx > 0:
-                        image_pool[key].append(f)
-                else:
-                    # No suffix means this image type matches everything
+                if self._file_matches_key(base_name, img_cfg):
                     image_pool[key].append(f)
 
         # Build mapping: mapping[key][mapping_key] = [file_paths]
@@ -370,7 +408,7 @@ class CacheBuilder:
 
         return pairs
 
-    # ── VAE encoding ──────────────────────────────────────────────────
+    # ── Media encoding (unified 5D cache) ─────────────────────────────
 
     def _encode_target_entries(
         self,
@@ -380,15 +418,15 @@ class CacheBuilder:
         device: torch.device,
         recreate: bool,
     ) -> dict:
-        """Encode target images with VAE. Returns single dict (first target)."""
+        """Encode target media with VAE. Returns single dict (first target)."""
         for entry in entries:
             image_key = entry.image
             if image_key not in pair:
                 continue
 
             image_path = pair[image_key]
-            cached = self._cache_image(vae, image_path, device, recreate)
-            return cached
+            media = self._media_for_key(image_key)
+            return self._construct_media(vae, image_path, device, recreate, media=media)
         return {}
 
     def _encode_reference_entries(
@@ -413,7 +451,8 @@ class CacheBuilder:
                 if image_key not in pair:
                     continue
                 image_path = pair[image_key]
-                return self._cache_image(vae, image_path, device, recreate)
+                media = self._media_for_key(image_key)
+                return self._construct_media(vae, image_path, device, recreate, media=media)
 
             elif entry.sample_type == "from_subdir":
                 if image_key not in pair:
@@ -441,74 +480,155 @@ class CacheBuilder:
 
                 count = min(entry.count, len(filtered))
                 if count > 0:
-                    return self._cache_image(vae, filtered[0], device, recreate)
+                    media = self._media_for_key(image_key)
+                    return self._construct_media(vae, filtered[0], device, recreate, media=media)
         return {}
 
-    def _cache_image(
+    def _media_for_key(self, image_key: str) -> str:
+        """Resolve the media type ("image" | "video") for an image_configs key."""
+        img_cfg = self.ds_config.image_configs.get(image_key)
+        return img_cfg.media if img_cfg is not None else "image"
+
+    def _construct_media(
         self,
         vae: Optional[torch.nn.Module],
-        image_path: str,
+        media_path: str,
         device: torch.device,
         recreate: bool,
+        media: str = "image",
     ) -> dict:
-        """Cache a single image: resize, VAE encode, save latent.
+        """Encode one media sample into the unified 5D cache.
 
-        Uses T2ITrainer's get_cache_dir to place files in subdir.
+        Single media dispatch (D3): ``media == "video"`` → ``load_video_frames``
+        (DatasetConfig.video_frames/video_fps); otherwise (default ``"image"``)
+        → ``load_image_frames``.  Both branches call ``adapter.encode_video``
+        and store the latent as the unified ``(C, T, H, W)`` npz (an image is
+        ``(C, 1, H, W)``).  B is folded into the per-sample dimension — one npz
+        per sample, matching the existing cache convention.  Per-sample metadata
+        records ``media`` and ``num_frames``.
+
+        Image behavior is exactly equivalent to the pre-unified pipeline: the
+        same bucket crop is applied, the resized webp is still saved, and the
+        latent values are identical (via the base ``encode_video`` default which
+        delegates to ``encode_image``).  Existing adapters (krea2, ...) are
+        unaware of the media dispatch.
         """
         from PIL import Image
 
+        if media not in ("image", "video"):
+            raise ValueError(
+                f"Unsupported media {media!r} for {media_path!r}; "
+                f"expected 'image' or 'video'."
+            )
+
         resolution = self.ds_config.resolution
-        basename = os.path.splitext(os.path.basename(image_path))[0]
-        cache_subdir = self.cache.get_cache_dir(image_path)
+        basename = os.path.splitext(os.path.basename(media_path))[0]
+        cache_subdir = self.cache.get_cache_dir(media_path)
         cache_dir = str(cache_subdir)
 
         resized_path = os.path.join(cache_dir, f"{basename}_{resolution}.webp")
-        latent_path = os.path.join(cache_dir, f"{basename}_{resolution}.pt")
+        latent_path = os.path.join(cache_dir, f"{basename}_{resolution}.npz")
 
-        if os.path.exists(resized_path) and os.path.exists(latent_path) and not recreate:
-            try:
-                img = np.array(Image.open(resized_path).convert("RGB"))
-                h, w, _ = img.shape
-                return {
-                    "image_path": resized_path,
-                    "original_image_path": image_path,
-                    "latent_path": latent_path,
-                    "bucket": f"{w}x{h}",
-                }
-            except Exception:
-                pass
+        # ── Cache hit: skip re-encoding when the sample is already cached ──
+        # Images additionally require the resized webp (legacy layout); an
+        # incomplete/stale image sample falls through to re-encode.
+        if os.path.exists(latent_path) and not recreate:
+            if media == "image" and not os.path.exists(resized_path):
+                pass  # incomplete → re-encode below
+            else:
+                try:
+                    if media == "image":
+                        img = np.array(Image.open(resized_path).convert("RGB"))
+                        h, w, _ = img.shape
+                        latent_hit = self.cache.load_latent(latent_path)
+                        num_frames = int(latent_hit.shape[1]) if latent_hit.ndim >= 4 else 1
+                    else:
+                        latent_hit = self.cache.load_latent(latent_path)
+                        if latent_hit.ndim == 4:
+                            h = latent_hit.shape[2] * self.adapter.vae_scale_factor
+                            w = latent_hit.shape[3] * self.adapter.vae_scale_factor
+                        else:
+                            raise ValueError(
+                                f"expected (C,T,H,W) latent in {latent_path!r}, "
+                                f"got {tuple(latent_hit.shape)}"
+                            )
+                        # 复用第一次 load 的 latent_hit 算 H/W 与 num_frames，
+                        # 不再二次 load（缓存命中时避免双重磁盘 I/O）。
+                        num_frames = int(latent_hit.shape[1])
+                    return {
+                        "image_path": resized_path if media == "image" else None,
+                        "original_image_path": media_path,
+                        "latent_path": latent_path,
+                        "bucket": f"{w}x{h}",
+                        "media": media,
+                        "num_frames": num_frames,
+                    }
+                except Exception:
+                    pass  # corrupt/missing → re-encode below
 
-        # Load and resize image
-        from UnifiedTrainer.data.bucket import BucketSystem
-        bucket_system = BucketSystem(
-            divisibility=self.adapter.bucket_divisibility,
-            resolution_config=self.adapter.resolution_config,
-        )
-        pil_image = Image.open(image_path).convert("RGB")
-        bucket = bucket_system.find_bucket_for_image(resolution, pil_image)
-        pil_image = bucket_system.crop_to_bucket(pil_image, bucket)
-
-        # Save resized image
-        pil_image.save(resized_path, "webp")
-
-        # VAE encode
-        if vae is not None:
-            image_tensor = to_tensor_universal(np.array(pil_image)).unsqueeze(0).to(device=device, dtype=vae.dtype)
-            with torch.no_grad():
-                latent_dict = self.adapter.encode_image(vae, image_tensor)
-            latent = latent_dict["latent"]
-            if latent.ndim == 4 and latent.shape[0] == 1:
-                latent = latent.squeeze(0)
-            torch.save(latent.cpu(), latent_path)
+        # ── Load frames as unified 5D (B=1, C, T, H, W) float32 [0, 1] ──
+        if media == "video":
+            frames = load_video_frames(
+                media_path,
+                num_frames=self.ds_config.video_frames,
+                fps=self.ds_config.video_fps,
+                resolution=resolution,
+                divisibility=self.adapter.bucket_divisibility,
+                resolution_config=self.adapter.resolution_config,
+            )
         else:
-            torch.save(torch.zeros(1, self.adapter.latent_channels, 1, resolution // 8, resolution // 8), latent_path)
+            frames = load_image_frames(
+                media_path,
+                resolution=resolution,
+                divisibility=self.adapter.bucket_divisibility,
+                resolution_config=self.adapter.resolution_config,
+            )
 
-        w, h = pil_image.size
+        h, w = int(frames.shape[3]), int(frames.shape[4])
+
+        # Save the resized image (image media only) — matches legacy layout.
+        if media == "image":
+            pil_image = Image.fromarray(
+                (frames[0, :, 0].clamp(0, 1).permute(1, 2, 0).numpy() * 255)
+                .round()
+                .astype("uint8")
+            )
+            pil_image.save(resized_path, "webp")
+
+        # ── Encode via the unified media hook ───────────────────────────
+        if vae is not None:
+            with torch.no_grad():
+                latent_dict = self.adapter.encode_video(vae, frames.to(device))
+            latent = latent_dict["latent"]
+            # Fold B → canonical (C, T, H, W) npz (B=1 per-sample).
+            if latent.ndim == 5:
+                if latent.shape[0] != 1:
+                    raise ValueError(
+                        f"encode_video returned batch size {latent.shape[0]}; "
+                        f"expected 1 (B folds into the per-sample dimension)"
+                    )
+                latent = latent.squeeze(0)
+            if latent.ndim != 4:
+                raise ValueError(
+                    f"encode_video must return (C,T,H,W) or (1,C,T,H,W), "
+                    f"got shape {tuple(latent.shape)}"
+                )
+            self.cache.save_latent_npz(latent_path, latent)
+        else:
+            # Placeholder latent (no VAE available) — same (C,T,H,W) convention.
+            scale = self.adapter.vae_scale_factor
+            latent = torch.zeros(
+                self.adapter.latent_channels, int(frames.shape[2]), h // scale, w // scale
+            )
+            self.cache.save_latent_npz(latent_path, latent)
+
         return {
-            "image_path": resized_path,
-            "original_image_path": image_path,
+            "image_path": resized_path if media == "image" else None,
+            "original_image_path": media_path,
             "latent_path": latent_path,
             "bucket": f"{w}x{h}",
+            "media": media,
+            "num_frames": int(frames.shape[2]),
         }
 
     # ── Caption encoding ──────────────────────────────────────────────
@@ -588,11 +708,24 @@ class CacheBuilder:
                         pair, cap_cfg.reference_list, device
                     )
 
+                # Optional image-conditioned caption encoding hook: only when
+                # the adapter declares encode_text_accepts_image (MiniMax-H3
+                # P1.4, whose vision-block presentation needs the associated
+                # keyframe image).  Existing adapters keep their exact
+                # encode_text contract — no extra kwargs are passed to them.
+                encode_kwargs: Dict[str, Any] = dict(
+                    reference_image=ref_images,
+                    processor=processor,
+                )
+                condition_image = None
+                if getattr(self.adapter, "encode_text_accepts_image", False):
+                    condition_image = self._load_condition_image(pair, cap_cfg.image)
+                    encode_kwargs["condition_image"] = condition_image
+
                 try:
                     embedding = self.adapter.encode_text(
                         text_encoder, tokenizer, content, device, torch.float32,
-                        reference_image=ref_images,
-                        processor=processor,
+                        **encode_kwargs,
                     )
                     if embedding and "prompt_embed" in embedding:
                         # Pop metadata before saving (not part of the embedding).
@@ -619,6 +752,45 @@ class CacheBuilder:
                     )
 
         return caption_data
+
+    def _load_condition_image(
+        self, pair: dict, image_key: str
+    ) -> Optional[Any]:
+        """Load the associated source image for image-conditioned caption encoding.
+
+        Only invoked when the adapter declares ``encode_text_accepts_image=True``
+        (MiniMax-H3 P1.4 — its caption encoding constructs a vision-block
+        presentation from the keyframe image).  Returns a bucket-cropped PIL
+        image for ``media == "image"`` sources; ``None`` for video sources
+        (video caption conditioning is a P2 concern — the adapter handles it).
+        """
+        if not image_key or image_key not in pair:
+            return None
+        img_cfg = self.ds_config.image_configs.get(image_key)
+        if img_cfg is not None and img_cfg.media == "video":
+            return None
+
+        from PIL import Image
+
+        from UnifiedTrainer.data.bucket import BucketSystem
+
+        try:
+            image_path = pair[image_key]
+            bucket_system = BucketSystem(
+                divisibility=self.adapter.bucket_divisibility,
+                resolution_config=self.adapter.resolution_config,
+            )
+            pil = Image.open(image_path).convert("RGB")
+            bucket = bucket_system.find_bucket_for_image(
+                self.ds_config.resolution, pil
+            )
+            return bucket_system.crop_to_bucket(pil, bucket)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load condition image for caption encoding "
+                f"({image_key!r}): {e}"
+            )
+            return None
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -667,4 +839,3 @@ class CacheBuilder:
                     logger.warning(f"Failed to load reference image {image_path}: {e}")
 
         return image_list
-

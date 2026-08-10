@@ -10,6 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -23,6 +24,18 @@ class BaseModelAdapter(ABC):
 
     The shared Trainer never accesses model internals directly — it always goes
     through the adapter.
+
+    Optional video-validation hook (documented here, deliberately NOT defined as
+    a base method so ``hasattr``-based dispatch keeps working):
+
+    - ``decode_validation_video(vae, latent, output_dir, prefix="") -> list[str]``
+      — implemented by video-capable adapters (MiniMax-H3, P2).  Decodes a 5D
+      ``(B, C, T, H, W)`` latent with ``T > 1`` to one silent h264 mp4 per batch
+      item (no audio track) and returns the mp4 paths.  The engine's validation
+      loop dispatches via ``hasattr(self.adapter, "decode_validation_video")``
+      plus a ``latent.ndim == 5 and latent.shape[2] > 1`` guard: adapters that
+      do not define the hook keep the legacy ``decode_latent`` -> PIL image path
+      unchanged, so the *absence* of this method is the default implementation.
     """
 
     # ── Identity ──────────────────────────────────────────────────────
@@ -122,6 +135,31 @@ class BaseModelAdapter(ABC):
         """True for pixel-space diffusion (no VAE latent encoding)."""
         return False
 
+    @property
+    def supports_video(self) -> bool:
+        """Whether this adapter consumes unified 5D (B, C, T, H, W) latents.
+
+        The unified media pipeline stores every latent as (C, T, H, W) — an
+        image is simply (C, 1, H, W).  Legacy image adapters (krea2, ...)
+        keep receiving 4D (B, C, H, W) runtime tensors: the dataset squeezes
+        the singleton temporal dim before collate.  Video-capable adapters
+        (MiniMax-H3, P1.4) override this to ``True`` so the full 5D path is
+        preserved — P2 video samples only change T, no data-layer changes.
+        """
+        return False
+
+    @property
+    def velocity_sign(self) -> str:
+        """Velocity parameterization sign convention.
+
+        "standard": velocity points from data toward noise
+        (flow target = noise - x0), matching most flow-matching trainers
+        (Flux, Krea2).
+        "data_ward": velocity points from noise toward data
+        (MiniMax-H3 scheduler convention, flow target = x0 - noise).
+        """
+        return "standard"
+
     # ── Encoding ──────────────────────────────────────────────────────
 
     @abstractmethod
@@ -140,6 +178,101 @@ class BaseModelAdapter(ABC):
     ) -> dict:
         """Encode a text prompt. Returns dict with embedding tensors."""
         ...
+
+    def encode_video(self, vae: nn.Module, frames: torch.Tensor) -> dict:
+        """Encode a 5D frame tensor ``(B=1, C, T, H, W)`` to latent space.
+
+        Default implementation — single-frame images (``T == 1``):
+        The 5D [0, 1] pixel frames are converted back to a PIL image (the
+        input convention the cache pipeline historically fed ``encode_image``:
+        a diffusion-normalized 4D tensor derived from a PIL image) and the
+        call is delegated to ``self.encode_image``.  This keeps every existing
+        image adapter's behavior exactly unchanged.
+
+        Video-capable adapters (MiniMax-H3, P1.4) override this method for
+        ``T > 1`` and return a dict with ``latent`` of shape ``(C, T, H, W)``
+        (B already folded) — or ``(1, C, T, H, W)`` which the cache builder
+        folds.
+
+        Args:
+            vae: Loaded VAE module.
+            frames: ``(1, C, T, H, W)`` float32 pixel frames in [0, 1].
+
+        Returns:
+            dict with ``latent`` key (canonical ``(C, T, H, W)`` for the
+            default single-frame path).
+
+        Raises:
+            ValueError: frames is not ``(B=1, C, T, H, W)``.
+            NotImplementedError: when ``T > 1`` (video encoding requires
+                adapter support — the MiniMax-H3 adapter overrides this).
+        """
+        if frames.ndim != 5:
+            raise ValueError(
+                f"encode_video expects 5D (B=1, C, T, H, W) frames, "
+                f"got shape {tuple(frames.shape)}"
+            )
+        if frames.shape[0] != 1:
+            raise ValueError(
+                f"encode_video supports B=1 batches only, got B={frames.shape[0]}"
+            )
+        if frames.shape[2] != 1:
+            raise NotImplementedError(
+                "video encoding requires adapter support — override encode_video "
+                "for T > 1 (e.g. MiniMax-H3 in P1.4)"
+            )
+
+        # ── T == 1: image path — reconstruct encode_image's input convention ──
+        # frames (1, C, 1, H, W) float32 [0,1] → PIL RGB → to_tensor_universal
+        # (diffusion [-1,1]) → (1, C, H, W) — byte-equivalent to what
+        # cache_builder previously fed encode_image for every existing adapter.
+        from PIL import Image
+
+        from UnifiedTrainer.data.transforms import to_tensor_universal
+
+        arr = (
+            frames[0, :, 0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255
+        ).round().astype(np.uint8)
+        pil_image = Image.fromarray(arr)
+        image_tensor = to_tensor_universal(np.array(pil_image)).unsqueeze(0)
+        # Legacy cache pipeline moved the tensor to the VAE device/dtype; the
+        # VAE's own dtype attribute (diffusers ModelMixin) is the same one the
+        # old `_cache_image` used.  Defensive fallbacks keep plain nn.Module
+        # (and stub) VAEs working.
+        try:
+            vae_dtype = vae.dtype
+        except (AttributeError, TypeError):
+            vae_dtype = torch.float32
+        try:
+            vae_device = next(vae.parameters()).device
+        except (AttributeError, TypeError, StopIteration):
+            vae_device = frames.device
+        image_tensor = image_tensor.to(device=vae_device, dtype=vae_dtype)
+
+        latent_dict = self.encode_image(vae, image_tensor)
+        latent = latent_dict["latent"]
+
+        # Normalize to the canonical (C, T, H, W) contract: fold B, keep T=1.
+        if latent.ndim == 5 and latent.shape[0] == 1:
+            latent = latent.squeeze(0)  # (C, T, H, W)
+        elif latent.ndim == 4 and latent.shape[0] == 1:
+            latent = latent.squeeze(0).unsqueeze(1)  # (C, H, W) → (C, 1, H, W)
+        elif latent.ndim == 3:
+            latent = latent.unsqueeze(1)  # (C, H, W) → (C, 1, H, W)
+        return {"latent": latent}
+
+    @property
+    def encode_text_accepts_image(self) -> bool:
+        """Whether ``encode_text`` accepts a ``condition_image`` keyword argument.
+
+        MiniMax-H3 (P1.4) overrides this to ``True``: its caption encoding
+        builds a vision-block presentation from the associated keyframe image,
+        so the cache builder passes the keyframe PIL as ``condition_image``.
+
+        Default ``False`` — existing adapters keep their exact ``encode_text``
+        contract (the cache builder never adds the extra keyword).
+        """
+        return False
 
     @abstractmethod
     def decode_latent(self, vae: nn.Module, latent: torch.Tensor) -> Any:
@@ -192,6 +325,22 @@ class BaseModelAdapter(ABC):
         Models with different parameterizations override this.
         """
         ...
+
+    def compute_x0_hat(
+        self, noise: torch.Tensor, velocity: torch.Tensor
+    ) -> torch.Tensor:
+        """Estimate the clean latent from a predicted velocity.
+
+        Standard (noise-ward): v = noise - x0  → x0_hat = noise - v.
+        Data-ward (MiniMax-H3): v = x0 - noise → x0_hat = noise + v.
+
+        符号约定与 ``velocity_sign`` / ``compute_target`` /
+        ``losses/flow_matching.py`` 同源——trainer 不得写死公式（写反会静默
+        训错方向：loss 下降但模型发散）。MiniMaxH3Adapter 继承默认实现即正确。
+        """
+        if self.velocity_sign == "data_ward":
+            return noise + velocity
+        return noise - velocity
 
     # ── Timestep sampling ─────────────────────────────────────────────
 

@@ -34,11 +34,32 @@ import math
 import random
 import sys
 
+try:  # progress bars for quantization passes
+    from tqdm import tqdm as _progress
+except ImportError:  # pragma: no cover - tqdm ships with huggingface_hub
+    def _progress(iterable=None, **kwargs):
+        return iterable if iterable is not None else iter(())
+
 # Ensure the package is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _collect_linears(module, targets, skip_lora=True):
+    """Collect every replaceable (parent, attr_name, child) nn.Linear in the tree.
+
+    Collecting first (instead of recursing while replacing) makes the
+    replacement loop safe to drive with a progress bar.
+    """
+    import torch.nn as nn
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear) and (not skip_lora or "lora" not in name.lower()):
+            targets.append((module, name, child))
+        else:
+            _collect_linears(child, targets, skip_lora)
 
 
 def _replace_linear_with_4bit(module, compute_dtype, quant_type="nf4"):
@@ -50,25 +71,26 @@ def _replace_linear_with_4bit(module, compute_dtype, quant_type="nf4"):
     import bitsandbytes as bnb
     import torch.nn as nn
 
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear) and "lora" not in name.lower():
-            new_module = bnb.nn.Linear4bit(
-                child.in_features,
-                child.out_features,
-                bias=child.bias is not None,
-                compute_dtype=compute_dtype,
-                quant_type=quant_type,
-            )
-            new_module.weight = bnb.nn.Params4bit(
-                child.weight.data,
-                requires_grad=False,
-                quant_type=quant_type,
-            )
-            if child.bias is not None:
-                new_module.bias = nn.Parameter(child.bias.data.clone())
-            setattr(module, name, new_module)
-        else:
-            _replace_linear_with_4bit(child, compute_dtype, quant_type)
+    targets = []
+    _collect_linears(module, targets)
+    for parent, name, child in _progress(
+        targets, desc=f"{quant_type} quantize", unit="linear", leave=False
+    ):
+        new_module = bnb.nn.Linear4bit(
+            child.in_features,
+            child.out_features,
+            bias=child.bias is not None,
+            compute_dtype=compute_dtype,
+            quant_type=quant_type,
+        )
+        new_module.weight = bnb.nn.Params4bit(
+            child.weight.data,
+            requires_grad=False,
+            quant_type=quant_type,
+        )
+        if child.bias is not None:
+            new_module.bias = nn.Parameter(child.bias.data.clone())
+        setattr(parent, name, new_module)
 
 
 def _replace_linear_with_8bit(module, threshold=0.0):
@@ -81,25 +103,41 @@ def _replace_linear_with_8bit(module, threshold=0.0):
     import bitsandbytes as bnb
     import torch.nn as nn
 
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear) and "lora" not in name.lower():
-            new_module = bnb.nn.Linear8bitLt(
-                child.in_features,
-                child.out_features,
-                bias=child.bias is not None,
-                has_fp16_weights=False,
-                threshold=threshold,
-            )
-            new_module.weight = bnb.nn.Int8Params(
-                child.weight.data,
-                requires_grad=False,
-                has_fp16_weights=False,
-            )
-            if child.bias is not None:
-                new_module.bias = nn.Parameter(child.bias.data.clone())
-            setattr(module, name, new_module)
-        else:
-            _replace_linear_with_8bit(child, threshold)
+    targets = []
+    _collect_linears(module, targets)
+    for parent, name, child in _progress(
+        targets, desc="int8 quantize", unit="linear", leave=False
+    ):
+        new_module = bnb.nn.Linear8bitLt(
+            child.in_features,
+            child.out_features,
+            bias=child.bias is not None,
+            has_fp16_weights=False,
+            threshold=threshold,
+        )
+        new_module.weight = bnb.nn.Int8Params(
+            child.weight.data,
+            requires_grad=False,
+            has_fp16_weights=False,
+        )
+        if child.bias is not None:
+            new_module.bias = nn.Parameter(child.bias.data.clone())
+        setattr(parent, name, new_module)
+
+
+def _quantize_text_encoder(te, mode, compute_dtype):
+    """Apply training.text_encoder_quantize (none|nf4|int8) to a text encoder.
+
+    Used by the cache build so the large H3 Qwen3-VL encoder fits in VRAM
+    while encoding; the same bnb helpers power transformer quantization.
+    """
+    if mode == "nf4":
+        _replace_linear_with_4bit(te, compute_dtype=compute_dtype, quant_type="nf4")
+    elif mode == "int8":
+        _replace_linear_with_8bit(te, threshold=0.0)
+    else:
+        return
+    logger.info(f"Text encoder quantized ({mode})")
 
 
 def _is_rank0() -> bool:
@@ -313,6 +351,10 @@ def main():
 
     # VRAM optimization options (all default-enabled for 16GB safety)
     quantize_mode = config.get("training", {}).get("quantize") or "none"  # none|int8|nf4|torchao_float8|torchao_int8|torchao_int4
+    # Text encoder quantization for the cache build (the H3 Qwen3-VL encoder
+    # is ~15GB bf16; nf4/int8 keeps the cache phase within VRAM).  Same bnb
+    # helpers as the transformer path; applied to every text encoder load.
+    text_encoder_quantize = config.get("training", {}).get("text_encoder_quantize") or "none"  # none|nf4|int8
     block_swap = config.get("training", {}).get("block_swap", 0)  # 0=disabled
     # offload_base_weights=true (default): BouncingOffloader keeps frozen torchao
     # base weights on CPU (pinned) and streams them H2D per forward/backward.
@@ -367,7 +409,8 @@ def main():
 
     model_path = config.get("model_path", "")
     transformer_path = config.get(
-        "transformer_path", os.path.join(model_path, "transformer")
+        "transformer_path",
+        os.path.join(model_path, config.get("transformer_subfolder", "transformer")),
     )
     vae_path = config.get("vae_path", os.path.join(model_path, "vae"))
     text_encoder_path = config.get(
@@ -516,6 +559,7 @@ def main():
             try:
                 if text_encoder_path:
                     te = adapter.load_text_encoder(text_encoder_path, weight_dtype)
+                    _quantize_text_encoder(te, text_encoder_quantize, weight_dtype)
                 if tokenizer_path:
                     tok = adapter.load_tokenizer(tokenizer_path)
                 if hasattr(adapter, "load_processor"):
@@ -563,6 +607,7 @@ def main():
             if text_encoder_path:
                 logger.info(f"Loading text encoder from {text_encoder_path}...")
                 text_encoder = adapter.load_text_encoder(text_encoder_path, weight_dtype)
+                _quantize_text_encoder(text_encoder, text_encoder_quantize, weight_dtype)
             if tokenizer_path:
                 tokenizer = adapter.load_tokenizer(tokenizer_path)
         else:

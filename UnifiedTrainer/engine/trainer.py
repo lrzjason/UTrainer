@@ -11,6 +11,7 @@ Target: ~300 lines instead of 3000+ per-model training scripts.
 from __future__ import annotations
 
 import gc
+import inspect
 import logging
 import math
 import os
@@ -611,7 +612,7 @@ class Trainer:
                 batch, target_latents, self.adapter, self.transformer,
                 self.step, pre_forward_fn=_pre_forward,
             )
-            sigmas_b = sigmas.view(-1, 1, 1, 1) if target_latents[0].ndim >= 2 else sigmas
+            sigmas_b = sigmas.view(-1, *(1,) * (target_latents[0].ndim - 1)) if target_latents[0].ndim >= 2 else sigmas
 
             # ── Flow matching interpolation ──────────────────────────
             # One noisy latent per target.
@@ -693,7 +694,10 @@ class Trainer:
                 for i, (noise_i, unpacked_i, target_i) in enumerate(
                     zip(noises, unpacked, target_latents)
                 ):
-                    x0_hat = noise_i - unpacked_i
+                    # 按 velocity_sign 分发估算干净 latent（与 losses/flow_matching.py
+                    # 同源：standard v = noise - x0 → x0_hat = noise - v；
+                    # data_ward v = x0 - noise → x0_hat = noise + v）
+                    x0_hat = self.adapter.compute_x0_hat(noise_i, unpacked_i)
 
                     loss_ctx = LossContext(
                         model_pred=unpacked_i,
@@ -1005,7 +1009,7 @@ class Trainer:
                         latent_width=target_latents[0].shape[3],
                     )
                     # Flow matching interpolation per target
-                    sigmas_b = sigmas.view(-1, 1, 1, 1) if target_latents[0].ndim >= 2 else sigmas
+                    sigmas_b = sigmas.view(-1, *(1,) * (target_latents[0].ndim - 1)) if target_latents[0].ndim >= 2 else sigmas
                     noisy_latents = [
                         (1.0 - sigmas_b) * tl + sigmas_b * n
                         for tl, n in zip(target_latents, noises)
@@ -1034,7 +1038,8 @@ class Trainer:
                     )
                     batch_breakdown = {}
                     for noise_i, unpacked_i, target_i in zip(noises, unpacked, target_latents):
-                        x0_hat = noise_i - unpacked_i
+                        # 按 velocity_sign 分发估算干净 latent（与 losses/flow_matching.py 同源）
+                        x0_hat = self.adapter.compute_x0_hat(noise_i, unpacked_i)
                         loss_ctx = LossContext(
                             model_pred=unpacked_i,
                             noise=noise_i,
@@ -1237,7 +1242,22 @@ class Trainer:
                                     ref_pils, ref_cond_pils = ref_pils
 
                                 # Save each generated image with target index suffix.
+                                # Video artifacts are mp4 path strings (or lists
+                                # of them) produced by decode_validation_video;
+                                # images are PIL objects saved as .png.
                                 for ti, gen_pil in enumerate(gen_pils):
+                                    if isinstance(gen_pil, str):
+                                        saved_paths.append(gen_pil)
+                                        logger.info(f"Saved validation video: {gen_pil}")
+                                        continue
+                                    if isinstance(gen_pil, (list, tuple)):
+                                        vid_list = [
+                                            p for p in gen_pil if isinstance(p, str)
+                                        ]
+                                        saved_paths.extend(vid_list)
+                                        for vp in vid_list:
+                                            logger.info(f"Saved validation video: {vp}")
+                                        continue
                                     suffix = f"_{ti}" if len(gen_pils) > 1 else ""
                                     gen_path = os.path.join(
                                         img_output_dir,
@@ -1246,7 +1266,6 @@ class Trainer:
                                     gen_pil.save(gen_path)
                                     saved_paths.append(gen_path)
                                     logger.info(f"Saved validation image: {gen_path}")
-
                                 # Save reference targets for comparison.
                                 for ti, ref_pil in enumerate(ref_pils):
                                     if ref_pil is not None:
@@ -1304,6 +1323,27 @@ class Trainer:
 
         logger.info(f"--- End image generation: {len(saved_paths)} images ---")
         return saved_paths
+
+    def _prepare_model_input(
+        self,
+        batch: dict,
+        latent_list: list,
+        sigmas: torch.Tensor,
+        condition_rows=None,
+    ) -> dict:
+        """``adapter.prepare_model_input`` with optional pre-built condition rows.
+
+        MiniMax-H3-style adapters build the keyframe-condition rows once per
+        generation request (``build_condition_rows``, PR parity — the PR
+        freezes the condition for the whole denoising trajectory); the kwarg
+        is forwarded only when the adapter supports it, so generic adapters
+        are unaffected.
+        """
+        if hasattr(self.adapter, "build_condition_rows"):
+            return self.adapter.prepare_model_input(
+                batch, latent_list, sigmas, condition_rows=condition_rows
+            )
+        return self.adapter.prepare_model_input(batch, latent_list, sigmas)
 
     def _generate_from_val_sample(
         self,
@@ -1370,15 +1410,41 @@ class Trainer:
             b = base_shift - m * base_seq
             mu = total_image_seq_len * m + b
 
-        self.noise_scheduler.set_timesteps(
-            self.val_num_inference_steps, device=device, mu=mu,
-        )
+        # Only schedulers that accept the dynamic-shift `mu` parameter
+        # (FlowMatch family) receive it; e.g. MiniMaxH3Scheduler.set_timesteps
+        # has no `mu` and would raise TypeError on the first validation pass.
+        set_timesteps_params = inspect.signature(
+            self.noise_scheduler.set_timesteps
+        ).parameters
+        if "mu" in set_timesteps_params:
+            self.noise_scheduler.set_timesteps(
+                self.val_num_inference_steps, device=device, mu=mu,
+            )
+        else:
+            self.noise_scheduler.set_timesteps(
+                self.val_num_inference_steps, device=device,
+            )
 
         # ── CFG setup ──
         use_cfg = self.val_guidance_scale > 1.0
         uncond_batch = None
         if use_cfg:
             uncond_batch = self._build_uncond_batch(batch, device, dtype)
+
+        # ── Pre-built condition rows (once per request, PR parity) ──
+        # MiniMax-H3-style adapters: the keyframe-condition rows are built
+        # ONCE before the loop and reused at every denoising step.  Building
+        # them inside prepare_model_input per step re-draws the noise-aug
+        # component at every sigma (the adapter's condition seed is
+        # sigma-derived), so the model would see a wobbling conditioning
+        # across the trajectory — a distribution it was never trained on.
+        # The uncond batch shares the same latents, so one tensor serves
+        # both CFG forwards.
+        condition_rows = None
+        if hasattr(self.adapter, "build_condition_rows"):
+            condition_rows = self.adapter.build_condition_rows(
+                batch, device=device, dtype=dtype
+            )
 
         # ── Denoising loop ──
         # Multi-target: latent_list is a list[torch.Tensor]; prepare_model_input
@@ -1396,16 +1462,16 @@ class Trainer:
 
             if use_cfg:
                 # Conditional forward — pass list of noise tensors.
-                model_input_cond = self.adapter.prepare_model_input(
-                    batch, latent_list, sigmas
+                model_input_cond = self._prepare_model_input(
+                    batch, latent_list, sigmas, condition_rows
                 )
                 v_conds = self.adapter.unpack_prediction(
                     self.transformer(**model_input_cond)
                 )  # list[torch.Tensor]
 
                 # Unconditional forward.
-                model_input_uncond = self.adapter.prepare_model_input(
-                    uncond_batch, latent_list, sigmas
+                model_input_uncond = self._prepare_model_input(
+                    uncond_batch, latent_list, sigmas, condition_rows
                 )
                 v_unconds = self.adapter.unpack_prediction(
                     self.transformer(**model_input_uncond)
@@ -1417,8 +1483,8 @@ class Trainer:
                     for vc, vu in zip(v_conds, v_unconds)
                 ]
             else:
-                model_input = self.adapter.prepare_model_input(
-                    batch, latent_list, sigmas
+                model_input = self._prepare_model_input(
+                    batch, latent_list, sigmas, condition_rows
                 )
                 model_pred = self.transformer(**model_input)
                 velocities = self.adapter.unpack_prediction(model_pred)
@@ -1430,19 +1496,57 @@ class Trainer:
                 for v, l in zip(velocities, latent_list)
             ]
 
-        # ── Decode each final latent to PIL ──
+        # ── Decode each final latent: images -> PIL, videos -> silent mp4 ──
         gen_pils = []
-        for latent in latent_list:
-            image = self.adapter.decode_latent(self.vae, latent)
-            image = (image / 2 + 0.5).clamp(0, 1)
-            image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-            if image.ndim == 4:
-                image = image[0]
-            gen_pils.append(PILImage.fromarray((image * 255).round().astype("uint8")))
+        video_output_dir = self.epoch_output_dir or self.val_output_dir
+        multi_target = len(latent_list) > 1
+        for ti, latent in enumerate(latent_list):
+            if (
+                hasattr(self.adapter, "decode_validation_video")
+                and latent.ndim == 5
+                and latent.shape[2] > 1
+            ):
+                # Video path (MiniMax-H3 etc.): the adapter decodes to pixels
+                # and writes silent mp4s (one per batch item), returning their
+                # paths.  gen_pils therefore carries str / list[str] artifacts;
+                # the caller saves PIL images (.png) and records video paths
+                # verbatim.
+                #
+                # The mp4 prefix mirrors the PNG identity
+                # ({save_name}_val_epoch{epoch}_{sample_idx}[_{ti}]) so
+                # per-sample artifacts never collide — validation slices
+                # per-sample, so the adapter's batch index b is always 0 and
+                # without the prefix samples ≥2 silently overwrite each
+                # other's mp4 (and epochs too, when epoch_output_dir is None).
+                prefix = f"{self.save_name}_val_epoch{epoch}_{sample_idx}"
+                if multi_target:
+                    prefix += f"_{ti}"
+                vid_paths = self.adapter.decode_validation_video(
+                    self.vae, latent, video_output_dir, prefix=prefix
+                )
+                gen_pils.append(vid_paths[0] if len(vid_paths) == 1 else vid_paths)
+            else:
+                # Image path (unchanged for krea2 etc.): decode_latent -> PIL.
+                image = self.adapter.decode_latent(self.vae, latent)
+                image = (image / 2 + 0.5).clamp(0, 1)
+                image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+                if image.ndim == 4:
+                    image = image[0]
+                gen_pils.append(PILImage.fromarray((image * 255).round().astype("uint8")))
 
-        # Decode reference targets for comparison.
+        # Decode reference targets for comparison.  Video references are
+        # skipped (None): the generated mp4 already covers the target clip, so
+        # decoding a separate target-reference artifact is redundant (avoids a
+        # redundant full VAE decode).
         ref_pils = []
         for target_latent in target_latents:
+            if (
+                hasattr(self.adapter, "decode_validation_video")
+                and target_latent.ndim == 5
+                and target_latent.shape[2] > 1
+            ):
+                ref_pils.append(None)
+                continue
             try:
                 ref_image = self.adapter.decode_latent(self.vae, target_latent)
                 ref_image = (ref_image / 2 + 0.5).clamp(0, 1)

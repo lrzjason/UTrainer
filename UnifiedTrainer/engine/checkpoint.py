@@ -141,13 +141,22 @@ class CheckpointManager:
     _BLOCKS_PATTERN = _re.compile(
         r'(?<!refiner_)(?<!layerwise_)(?<![A-Za-z])blocks'
     )
+    # H3 comfy keys: top-level 'blocks.N.attn...' only — NOT
+    # 'token_refiner.blocks.N...' (refiner blocks keep their own name).
+    _H3_BLOCKS_PATTERN = _re.compile(
+        r'(?<!refiner\.)(?<![A-Za-z])blocks\.'
+    )
 
     @classmethod
     def _convert_lora_to_comfyui(cls, state_dict: dict) -> dict:
         """Convert PEFT-format LoRA keys to ComfyUI format.
 
-        All keys get the 'diffusion_model.' prefix required by ComfyUI Krea-2.
+        MiniMax-H3 checkpoints (swiglu FFN keys 'ff.net.*') go through the
+        H3 fused-qkv conversion; everything else keeps the krea2-style path.
+        All keys get the 'diffusion_model.' prefix required by ComfyUI.
         """
+        if cls._is_minimax_h3_peft(state_dict):
+            return cls._convert_h3_lora_to_comfyui(state_dict)
         converted = {}
         for key, tensor in state_dict.items():
             new_key = key
@@ -162,9 +171,12 @@ class CheckpointManager:
     def _convert_comfyui_to_peft(cls, state_dict: dict) -> dict:
         """Convert ComfyUI-format LoRA keys back to PEFT format.
 
-        Reverses: diffusion_model. prefix, blocks/txtfusion/wq-style names,
-        lora_down/up suffixes back to lora_A/lora_B.default.
+        MiniMax-H3 comfy keys (fused 'qkv_proj' / 'mlp.fc1-fc2') are
+        converted through the H3 path (fused qkv split back into
+        to_q/to_k/to_v); everything else uses the generic reverse mapping.
         """
+        if cls._is_minimax_h3_comfyui(state_dict):
+            return cls._convert_h3_comfyui_to_peft(state_dict)
         converted = {}
         for key, tensor in state_dict.items():
             new_key = key
@@ -181,6 +193,206 @@ class CheckpointManager:
                 new_key = "base_model.model." + new_key
             converted[new_key] = tensor
         return converted
+
+    # ── MiniMax-H3 ComfyUI conversion ───────────────────────────────
+    # ComfyUI's MiniMax-H3 (comfy/ldm/minimax/model.py) uses FUSED attention:
+    #   blocks.N.attn.qkv_proj  Linear(hidden, inner*3)  (split q,k,v in order)
+    #   blocks.N.attn.out_proj, blocks.N.mlp.fc1, blocks.N.mlp.fc2 (swiglu)
+    # The diffusers PEFT names (to_q/to_k/to_v, to_out.0, ff.net.0.proj,
+    # ff.net.2) must therefore be FUSED/renamed — the krea2-style wq/wk/wv
+    # mapping is wrong for H3.  ComfyUI loads `diffusion_model.<exact-key>`
+    # lora keys generically (comfy/lora.py model_lora_keys_unet), so the
+    # fused qkv_proj pair loads without any H3-specific key map.
+    _H3_QKV = ("to_q", "to_k", "to_v")
+
+    @staticmethod
+    def _is_minimax_h3_peft(state_dict: dict) -> bool:
+        """H3 PEFT keys use the swiglu FFN names ff.net.* (krea2/qwen use
+        ff.gate/up/down or img_mlp/txt_mlp), so 'ff.net.' uniquely identifies
+        an H3-style (also flux-style) checkpoint."""
+        return any("ff.net." in k for k in state_dict)
+
+    @staticmethod
+    def _is_minimax_h3_comfyui(state_dict: dict) -> bool:
+        """ComfyUI H3 keys use fused qkv_proj / mlp.fc1-fc2 (krea2 comfy uses
+        wq/wk/wv/wo + mlp.gate/up/down)."""
+        return any("qkv_proj" in k or ".mlp.fc" in k for k in state_dict)
+
+    @staticmethod
+    def _split_h3_key(key: str):
+        """Normalize a PEFT H3 key to (module_key, suffix).
+
+        Handles both get_peft_model_state_dict output
+        (`base_model.model.transformer_blocks.0.attn.to_q.lora_A.default.weight`)
+        and the manual fallback (`transformer_blocks.0.attn.to_q.lora_A.weight`).
+        Returns (None, None) for non-weight keys (e.g. alpha buffers).
+        """
+        k = key
+        if k.startswith("base_model.model."):
+            k = k[len("base_model.model."):]
+        for suffix in (".lora_A.default.weight", ".lora_B.default.weight",
+                       ".lora_A.weight", ".lora_B.weight"):
+            if k.endswith(suffix):
+                return k[:-len(suffix)], suffix
+        return None, None
+
+    @staticmethod
+    def _rename_h3_module(mod_key: str) -> str:
+        """Rename a diffusers H3 module key to the ComfyUI H3 name."""
+        k = mod_key.replace("transformer_blocks", "blocks")
+        # token_refiner.blocks stays as-is (already the ComfyUI name)
+        if k.endswith(".attn.to_out.0"):
+            k = k[:-len(".attn.to_out.0")] + ".attn.out_proj"
+        elif k.endswith(".attn.to_out"):
+            k = k[:-len(".attn.to_out")] + ".attn.out_proj"
+        elif k.endswith(".ff.net.0.proj"):
+            k = k[:-len(".ff.net.0.proj")] + ".mlp.fc1"
+        elif k.endswith(".ff.net.2"):
+            k = k[:-len(".ff.net.2")] + ".mlp.fc2"
+        return k
+
+    @classmethod
+    def _convert_h3_lora_to_comfyui(cls, state_dict: dict) -> dict:
+        """Convert MiniMax-H3 PEFT keys to ComfyUI fused-qkv format.
+
+        attn to_q/to_k/to_v LoRA pairs are FUSED into one qkv_proj pair:
+          lora_down = cat([A_q, A_k, A_v], dim=0)   [3R, hidden]
+          lora_up    = cat([B_q, B_k, B_v], dim=1)  [inner*3, 3R]
+          alpha      = 3x (ComfyUI scales by alpha / down_rows)
+        All other keys are renamed (to_out.0->out_proj, ff.net.*->mlp.fc1/fc2)
+        and every key gets the 'diffusion_model.' prefix.
+        """
+        modules: dict = {}   # mod_key -> {"A": tensor, "B": tensor}
+        alphas: dict = {}    # mod_key -> alpha value (from lora_A.alpha buffers)
+        for key, tensor in state_dict.items():
+            if key.endswith(".lora_A.alpha") or key.endswith(".lora_B.alpha"):
+                suffix = ".lora_A.alpha" if key.endswith(".lora_A.alpha") \
+                    else ".lora_B.alpha"
+                mod_key = key[:-len(suffix)]
+                if mod_key.startswith("base_model.model."):
+                    mod_key = mod_key[len("base_model.model."):]
+                alphas[mod_key] = float(tensor)
+                continue
+            mod_key, suffix = cls._split_h3_key(key)
+            if mod_key is None:
+                continue
+            entry = modules.setdefault(mod_key, {"A": None, "B": None})
+            entry["A" if suffix.startswith(".lora_A") else "B"] = tensor
+
+        # Group attn q/k/v per block for fusion
+        fused: dict = {}     # "transformer_blocks.N.attn" -> {to_q: (A, B), ...}
+        singles: list = []
+        for mod_key, entry in modules.items():
+            if entry["A"] is None or entry["B"] is None:
+                logger.warning(
+                    f"H3 comfy conversion: skipping incomplete pair {mod_key}"
+                )
+                continue
+            parts = mod_key.split(".")
+            if (len(parts) >= 3 and parts[-2] == "attn"
+                    and parts[-1] in cls._H3_QKV):
+                fused.setdefault(".".join(parts[:-1]), {})[parts[-1]] = (
+                    entry["A"], entry["B"]
+                )
+            else:
+                singles.append((mod_key, entry["A"], entry["B"]))
+
+        converted: dict = {}
+        for attn_key, qkv in fused.items():
+            if set(qkv) == set(cls._H3_QKV):
+                A_q, A_k, A_v = (qkv[n][0] for n in cls._H3_QKV)
+                B_q, B_k, B_v = (qkv[n][1] for n in cls._H3_QKV)
+                if (A_q.shape[1] == A_k.shape[1] == A_v.shape[1]
+                        and B_q.shape[0] == B_k.shape[0] == B_v.shape[0]):
+                    fused_key = f"{attn_key}.qkv_proj"
+                    new_key = "diffusion_model." + cls._rename_h3_module(fused_key)
+                    converted[f"{new_key}.lora_down.weight"] = torch.cat(
+                        [A_q, A_k, A_v], dim=0)
+                    converted[f"{new_key}.lora_up.weight"] = torch.cat(
+                        [B_q, B_k, B_v], dim=1)
+                    if all(f"{attn_key}.{n}" in alphas
+                           for n in cls._H3_QKV):
+                        converted[f"{new_key}.alpha"] = torch.tensor(
+                            sum(alphas[f"{attn_key}.{n}"]
+                                for n in cls._H3_QKV))
+                    continue
+            # Partial/mismatched qkv — keep as separate keys
+            for name, (A, B) in qkv.items():
+                singles.append((f"{attn_key}.{name}", A, B))
+
+        for mod_key, A, B in singles:
+            new_key = "diffusion_model." + cls._rename_h3_module(mod_key)
+            converted[f"{new_key}.lora_down.weight"] = A
+            converted[f"{new_key}.lora_up.weight"] = B
+            if mod_key in alphas:
+                converted[f"{new_key}.alpha"] = torch.tensor(alphas[mod_key])
+
+        return converted
+
+    @classmethod
+    def _convert_h3_comfyui_to_peft(cls, state_dict: dict) -> dict:
+        """Convert ComfyUI fused-qkv H3 keys back to PEFT format.
+
+        Splits qkv_proj lora_down/up back into to_q/to_k/to_v thirds
+        (down rows dim 0, up cols dim 1) and reverses all renames.
+        Alpha keys are dropped (PEFT recomputes scale from module alpha).
+        """
+        converted: dict = {}
+        fused: dict = {}     # "blocks.N.attn" -> {"down": t, "up": t}
+        singles: list = []
+        for key, tensor in state_dict.items():
+            k = key
+            if k.startswith("diffusion_model."):
+                k = k[len("diffusion_model."):]
+            if k.endswith(".alpha"):
+                continue  # PEFT derives scale from the module's own alpha
+            if k.endswith(".lora_down.weight") or k.endswith(".lora_up.weight"):
+                suffix = ".lora_down.weight" if k.endswith(".lora_down.weight") \
+                    else ".lora_up.weight"
+                mod_key = k[:-len(suffix)]
+                is_down = suffix == ".lora_down.weight"
+                if mod_key.endswith(".attn.qkv_proj"):
+                    attn_key = mod_key[:-len(".qkv_proj")]
+                    fused.setdefault(attn_key, {})["down" if is_down else "up"] = tensor
+                else:
+                    singles.append((mod_key, tensor, is_down))
+
+        for attn_key, pair in fused.items():
+            down, up = pair.get("down"), pair.get("up")
+            if (down is None or up is None or down.shape[0] % 3 != 0
+                    or up.shape[1] != down.shape[0]):
+                logger.warning(
+                    f"H3 comfy->peft: skipping malformed fused qkv {attn_key}"
+                )
+                continue
+            r = down.shape[0] // 3
+            base = cls._unrename_h3_module(attn_key)
+            for i, name in enumerate(cls._H3_QKV):
+                mod_key = f"{base}.{name}"
+                converted[f"base_model.model.{mod_key}.lora_A.default.weight"] = \
+                    down[i * r:(i + 1) * r]
+                converted[f"base_model.model.{mod_key}.lora_B.default.weight"] = \
+                    up[:, i * r:(i + 1) * r]
+
+        for mod_key, tensor, is_down in singles:
+            new_key = "base_model.model." + cls._unrename_h3_module(mod_key)
+            converted[f"{new_key}.{'lora_A' if is_down else 'lora_B'}.default.weight"] = \
+                tensor
+
+        return converted
+
+    @classmethod
+    def _unrename_h3_module(cls, mod_key: str) -> str:
+        """Reverse _rename_h3_module (ComfyUI H3 name -> diffusers name)."""
+        k = mod_key
+        if k.endswith(".attn.out_proj"):
+            k = k[:-len(".attn.out_proj")] + ".attn.to_out.0"
+        elif k.endswith(".mlp.fc1"):
+            k = k[:-len(".mlp.fc1")] + ".ff.net.0.proj"
+        elif k.endswith(".mlp.fc2"):
+            k = k[:-len(".mlp.fc2")] + ".ff.net.2"
+        k = cls._H3_BLOCKS_PATTERN.sub("transformer_blocks.", k)
+        return k
 
     @staticmethod
     def _detect_lora_format(state_dict: dict) -> str:
@@ -433,11 +645,14 @@ class CheckpointManager:
         epoch: int,
         config: Optional[dict] = None,
         is_final: bool = False,
+        save_comfyui: bool = True,
     ) -> Path:
         """Save LoKR adapter weights via LyCORIS native API.
 
         Saves in LyCORIS format (lycoris_ prefix, lokr_w1/w2 keys).
-        Also saves metadata JSON for resume.
+        Also saves metadata JSON for resume.  When save_comfyui is set, an
+        exact LoRA-converted copy ({stem}_comfyui.safetensors) is saved
+        alongside for direct loading in ComfyUI.
         """
         suffix = "final" if is_final else f"epoch{epoch}"
         filename = f"{self.save_name}_{suffix}.safetensors"
@@ -446,6 +661,11 @@ class CheckpointManager:
         # Self-contained LoKR save — safetensors with lycoris-compatible keys
         lycoris_net.save_weights(str(path), dtype=torch.bfloat16)
         logger.info(f"Saved LoKR checkpoint: {path} ({lycoris_net.num_modules} modules)")
+
+        if save_comfyui:
+            comfyui_path = self._save_lokr_comfyui_copy(lycoris_net, path)
+            if comfyui_path:
+                logger.info(f"Saved ComfyUI LoKR (LoRA-converted): {comfyui_path}")
 
         # Metadata
         meta = {"step": step, "epoch": epoch, "network_type": "lokr",
@@ -457,6 +677,107 @@ class CheckpointManager:
             json.dump(meta, f, indent=2, default=str)
 
         return path
+
+    @staticmethod
+    def _export_lokr_layer(layer) -> tuple:
+        """Exact LoKR -> LoRA export factors for one LokrLayer.
+
+        Uses the Kronecker mixed-product property:
+            kron(w1, w2) = kron(X1, X2) @ kron(Y1, Y2)
+        for any split w1 = X1 @ Y1, w2 = X2 @ Y2.  With the standard
+        decomposed w2 (w2_a @ w2_b) this yields an EXACT rank-R LoRA pair
+        (R = in1 * rank) without materializing the full [out, in] delta.
+
+        Returns (up [out, R], down [R, in], alpha_val) with
+        alpha_val / R == layer.scale * layer.multiplier (ComfyUI scaling).
+        """
+        # w1 side: direct (X1 = w1, Y1 = I) or decomposed (X1 = w1_a, Y1 = w1_b)
+        if layer.use_w1:
+            X1 = layer.lokr_w1.detach().float()
+            Y1 = torch.eye(X1.shape[1], dtype=X1.dtype)
+        else:
+            X1 = layer.lokr_w1_a.detach().float()
+            Y1 = layer.lokr_w1_b.detach().float()
+        # w2 side: decomposed (w2_a @ w2_b) or direct (exact SVD split)
+        if layer.use_w2:
+            U, S, Vt = torch.linalg.svd(
+                layer.lokr_w2.detach().float(), full_matrices=False)
+            tol = S[0] * 1e-10 if S.numel() else 0.0
+            t = max(int((S > tol).sum()) if S.numel() else 1, 1)
+            sq = torch.sqrt(S[:t])
+            X2 = U[:, :t] * sq
+            Y2 = sq[:, None] * Vt[:t, :]
+        else:
+            X2 = layer.lokr_w2_a.detach().float()
+            Y2 = layer.lokr_w2_b.detach().float()
+        R = X1.shape[1] * X2.shape[1]
+        # svd factors can carry column-major strides (torch.linalg.svd on
+        # some builds returns U/Vt with stride (1, n)); kron's internal view
+        # requires standard layout, so force contiguous (no-op on params)
+        up = torch.kron(X1.contiguous(), X2.contiguous())
+        down = torch.kron(Y1.contiguous(), Y2.contiguous())
+        alpha_val = float(layer.scale * layer.multiplier) * R
+        return up, down, alpha_val
+
+    @staticmethod
+    def _save_lokr_comfyui_copy(lycoris_net, original_path: Path) -> Optional[Path]:
+        """Export the LoKR network as a ComfyUI-loadable standard LoRA file.
+
+        Each LokrLayer becomes an exact lora_down/lora_up pair (see
+        _export_lokr_layer); attn to_q/to_k/to_v are fused into qkv_proj to
+        match ComfyUI's fused MiniMax-H3 attention.
+        """
+        from safetensors.torch import save_file as save_safetensors
+
+        try:
+            names = list(getattr(lycoris_net, "_target_names", []))
+            layers = list(getattr(lycoris_net, "layers", {}).values())
+            fused: dict = {}
+            singles: list = []
+            for name, layer in zip(names, layers):
+                up, down, alpha_val = CheckpointManager._export_lokr_layer(layer)
+                parts = name.split(".")
+                if (len(parts) >= 3 and parts[-2] == "attn"
+                        and parts[-1] in CheckpointManager._H3_QKV):
+                    fused.setdefault(".".join(parts[:-1]), {})[parts[-1]] = (
+                        up, down, alpha_val)
+                else:
+                    singles.append((name, up, down, alpha_val))
+
+            state: dict = {}
+            for attn_key, qkv in fused.items():
+                if set(qkv) == set(CheckpointManager._H3_QKV):
+                    ups, downs, alphas = [], [], []
+                    for n in CheckpointManager._H3_QKV:
+                        up, down, a = qkv[n]
+                        ups.append(up)
+                        downs.append(down)
+                        alphas.append(a)
+                    fused_key = "diffusion_model." + \
+                        CheckpointManager._rename_h3_module(f"{attn_key}.qkv_proj")
+                    state[f"{fused_key}.lora_down.weight"] = \
+                        torch.cat(downs, dim=0).to(torch.bfloat16)
+                    state[f"{fused_key}.lora_up.weight"] = \
+                        torch.cat(ups, dim=1).to(torch.bfloat16)
+                    state[f"{fused_key}.alpha"] = torch.tensor(sum(alphas))
+                    continue
+                for name, (up, down, a) in qkv.items():
+                    singles.append((f"{attn_key}.{name}", up, down, a))
+
+            for name, up, down, alpha_val in singles:
+                new_key = "diffusion_model." + \
+                    CheckpointManager._rename_h3_module(name)
+                state[f"{new_key}.lora_down.weight"] = down.to(torch.bfloat16)
+                state[f"{new_key}.lora_up.weight"] = up.to(torch.bfloat16)
+                state[f"{new_key}.alpha"] = torch.tensor(alpha_val)
+
+            comfyui_path = original_path.with_name(
+                f"{original_path.stem}_comfyui.safetensors")
+            save_safetensors(state, str(comfyui_path))
+            return comfyui_path
+        except Exception as e:
+            logger.warning(f"Failed to save LoKR ComfyUI copy: {e}")
+            return None
 
     def load_lokr(self, lycoris_net, checkpoint_path: str) -> dict:
         """Load LoKR weights into an existing LyCORIS network.

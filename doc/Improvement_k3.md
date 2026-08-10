@@ -529,3 +529,80 @@ CLI 只操作数据库 + 文件，不要求 orchestrator 在线；在线时自�
   内置采样逻辑抽离到 `engine/sampling.py`；
 - `UnifiedTrainer/engine/checkpoint.py`：full checkpoint 补 wandb run 元数据；
 - 新增 `orchestrator/`、`web/`，不侵入 `models/` `losses/` `data/`。
+
+
+---
+
+## 11. MiniMax-H3 训练接入（2026-08，图像对 → 视频，音频延后）
+
+> 实现计划见 `md/minimaxh3_implementation.md`，阶段小结见
+> `progress/012-minimaxh3.md`，as-built 设计见 `md/07-minimaxh3-training.md`，
+> 决定记录见 `agent/decisions.md` H3-D1–H3-D10。**状态：代码交付完成；
+> G2–G7 运行时验收需模型权重，延后未运行。**
+
+### 11.1 目标
+
+- **里程碑 1（图像对训练，优先）**：把 MiniMax-H3 当图像模型训练——源图作
+  关键帧条件行、目标图作目标视频行（1 帧视频即图像），配文本 caption。
+- **里程碑 2（视频训练）**：激活（不重写）P1 已建成的统一媒体管线视频分支，
+  同一条适配器路径扩展到 T>1 帧。
+- **音频训练本期不做**（D6 正式决定）。
+
+### 11.2 决策摘要（H3-D1–H3-D10，编号与计划 §3 一致）
+
+| # | 决策 | 要点 |
+|---|------|------|
+| H3-D1 | 依赖固定到 diffusers `pr-14355` 分支 | 训练/推理共用同一源码；requirements 注释注明 PR #14355；新增 `av`（PyAV 16.1.0），不装 torchaudio |
+| H3-D2 | Transformer 直接 import diffusers | `MiniMaxH3Transformer3DModel` 原生 PeftAdapterMixin；LoRA + 梯度检查点起步；block swap 作 P4 增强（OOM 才 vendor） |
+| H3-D3 | 数据层一次建成：统一媒体管线 | `media` 字段 + `video_frames/video_fps` 一次入 schema；统一 5D 缓存 (C,T,H,W)，图像 = (C,1,H,W)；cache_builder 单一媒体分发；`data/video_utils.py` 一次实现；里程碑 2 只激活，不改 schema/缓存格式/collate |
+| H3-D4 | 新增 `MiniMaxH3Adapter` | 全部抽象方法 + 新可选钩子 `encode_video` / `decode_validation_video` / `velocity_sign`；音频钩子延后 |
+| H3-D5 | data-ward 速度约定 | `unpack_prediction` 返回模型原值；loss 按 `velocity_sign` 取反 target（flow_matching 一行） |
+| H3-D6 | σ→t=1−σ 时间约定 | 引擎插值逐位等价，无需改；关键帧 t_cond=0.999；每前向最多 2 个去重 timestep；音频行整体省略（空 (B,0,32)） |
+| H3-D7 | LoRA 目标模块按 H3 命名 | `["to_q","to_k","to_v","to_out","ff.net.0.proj","ff.net.2"]`（swiglu FF 命名，实测固化）；冻结 proj_in/.../time_embedder（fp32 契约） |
+| H3-D8 | 验证生成 | `load_scheduler` 返回 `MiniMaxH3Scheduler(shift=12)`，CFG 关闭（guidance_scale=1）；解码按帧数分发（T==1→PIL，T>1→静音 mp4） |
+| H3-D9 | 编排器零代码改动 | 任务即 `train.py --task-id`；61.7GB transformer 用 NF4/int8 或 2×80GB DDP 过 GPU Guard |
+| H3-D10 | 验收 = 数值 parity + 过拟合 | 速度符号校验 → 图像对过拟合（里程碑 1）→ 视频过拟合（里程碑 2）→ LoRA 训练验证；运行验收延后 |
+
+### 11.3 数据改动点（统一媒体管线）
+
+- **schema**：`ImageConfig.media`（"image"|"video"，默认 "image"）、
+  `DatasetConfig.video_frames=124/video_fps=24`；validate 规则（video 键只能
+  被同名媒体 target 引用、17n+5 对齐）一次落地。
+- **`data/video_utils.py`**：`load_image_frames` → `(1,C,1,H,W)`；
+  `load_video_frames`（PyAV 解码、24fps 抽帧、17n+5 对齐、5–15s 校验）→
+  `(1,C,T,H,W)`；`snap_frames` / `video_latent_num_frames` 包装 PR 函数。
+- **缓存**：cache_builder 单一媒体分发 → `adapter.encode_video` → 统一
+  (C,T,H,W) npz；每样本 JSON 记录 media/num_frames。
+- **dataset/collate/bucket**：5D 堆叠与 bucket 在 P1 以图像样本 (C,1,H,W)
+  打通硬化；P2 视频只是 T 变大，代码零改动。
+- **引擎小改（D6 授权）**：`sigmas.view(-1,1,1,1)` → ndim 通用展开
+  `view(-1, *(1,)*(ndim-1))`（trainer.py + noise_selector.py），旧 4D view
+  对 5D latent 右对齐成 (1,B,1,1,1)，B>1 必炸；4D 行为逐位一致。
+
+### 11.4 图像对 / 视频配置
+
+- 图像对 smoke：`configs/minimax_h3_image_smoke.json`（S=源图关键帧、
+  P=目标图，caption C→S 带 vision block）。
+- 生产图像对：`configs/minimax_h3_train.json`（nf4 + adamw8bit +
+  gradient_checkpointing + `multi_gpu: "reserve"` + `guidance_scale: 1.0`）。
+- 视频 smoke：`configs/minimax_h3_video_smoke.json`（V=.mp4 media video、
+  `video_frames=124` → 37 latent 帧；`reference_configs: {"none": []}` =
+  纯 t2v 无关键帧）。
+
+### 11.5 音频延后原因（D6）
+
+- PR packed 布局 `[ text | 关键帧 | 音频(A) | 视频(V) ]` 中音频块可整体
+  省略：`num_audio_latents=0` → 无 A 块，transformer 内 `audio_proj_in(空)`
+  + `index_copy` 空索引均为 no-op（代码级核实）。
+- 适配器 `audio_hidden_states` 传空 `(B, 0, 32)`（audio_proj_in 输入维）。
+- 不下载 audio_vae/audio_scheduler，不实现音频数据/损失/解码代码——音频
+  训练是后续阶段，本期视频 = 无声视频建模。
+
+### 11.6 状态与延后项
+
+- 已交付（无权重验证全绿）：packing 布局、统一媒体管线、适配器 53/53、
+  图像对/视频 smoke 配置 validate、LoRA 目标模块固化 + checkpoint 往返、
+  --list-models 回归、krea2 44 配置回归。
+- **延后（需模型权重）**：G2 图像对缓存、G3 dry-run + 符号校验、
+  G4 图像对过拟合、G5 视频缓存、G6 视频过拟合、G7 编排器全链路；
+  P4 可选增强（PR parity、量化冒烟、DDP 冒烟）。
