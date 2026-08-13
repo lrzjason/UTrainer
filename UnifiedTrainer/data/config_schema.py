@@ -69,6 +69,7 @@ class ImageConfig:
     suffix: str = ""
     prefix: str = ""
     media: str = "image"  # "image" | "video" — 统一媒体管线媒体字段（D3）;视频媒体键只能被 target_configs 引用（视频参考图本期不支持，视频字幕本期支持）
+    resolution: Optional[int] = None  # per-image encode resolution override (default: dataset resolution)
 
     @classmethod
     def from_dict(cls, key: str, d: dict) -> "ImageConfig":
@@ -78,11 +79,24 @@ class ImageConfig:
                 f"image_configs['{key}'].media must be 'image' or 'video', got {media!r}. "
                 f"Audio media is not supported this phase."
             )
+        resolution = d.get("resolution")
+        if resolution is not None:
+            try:
+                resolution = int(resolution)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"image_configs['{key}'].resolution must be a positive int, got {resolution!r}"
+                )
+            if resolution <= 0:
+                raise ValueError(
+                    f"image_configs['{key}'].resolution must be a positive int, got {resolution!r}"
+                )
         return cls(
             key=key,
             suffix=d.get("suffix", ""),
             prefix=d.get("prefix", ""),
             media=media,
+            resolution=resolution,
         )
 
 

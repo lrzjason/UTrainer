@@ -98,6 +98,43 @@ class UnifiedDataset(Dataset):
                     "reference_dropout": bc.reference_dropout,
                 })
 
+        # Per-sample reference signature — lets the batch sampler keep batches
+        # homogeneous w.r.t. reference availability.  The model packs reference
+        # latents as extra sequence tokens, so samples with different reference
+        # counts cannot share a batch.  Only the reference roles actually used
+        # by batch_configs matter; a missing role contributes count 0 ("no refs"
+        # samples group separately).  Name-agnostic: any reference group works,
+        # single- or multi-entry, regardless of its config key.
+        self.sample_ref_sigs: List[tuple] = []
+        ref_roles_used = sorted(
+            {bc["reference_config"] for bc in self.batch_configs if bc.get("reference_config")}
+        )
+        if ref_roles_used:
+            for dr in self.datarows:
+                try:
+                    with open(dr["json_path"], "r", encoding="utf-8") as f:
+                        refs = json.load(f).get("references", {})
+                except (OSError, ValueError) as e:
+                    logger.warning(f"Could not read {dr['json_path']} for ref signature: {e}")
+                    refs = {}
+                counts = []
+                for role in ref_roles_used:
+                    entry = refs.get(role)
+                    if isinstance(entry, list):
+                        counts.append(len(entry))
+                    elif isinstance(entry, dict) and entry.get("latent_path"):
+                        counts.append(1)
+                    else:
+                        counts.append(0)
+                self.sample_ref_sigs.append(tuple(zip(ref_roles_used, counts)))
+        else:
+            self.sample_ref_sigs = [()] * len(self.datarows)
+
+        # Effective batch size — set by train.py from the resolved per-dataset
+        # batch sizes.  Default 1 = legacy per-sample behavior.
+        self.batch_size = 1
+        self._warned_ref_dropout_batched = False
+
         # Load dataset metadata
         self.metadata = self.cache.load_metadata()
 
@@ -156,6 +193,26 @@ class UnifiedDataset(Dataset):
             return latent.squeeze(1)
         return latent
 
+    def _load_reference_entry(self, entry: Any) -> Any:
+        """Load one reference entry from a per-sample JSON into runtime latents.
+
+        Single-entry (dict) → one latent tensor; multi-entry (list, produced
+        by multi-reference groups whose missing images are skipped at cache
+        build) → list of latent tensors.  Returns ``None`` when nothing can
+        be loaded.
+        """
+        if isinstance(entry, list):
+            loaded = []
+            for e in entry:
+                if isinstance(e, dict) and e.get("latent_path"):
+                    loaded.append(
+                        self._runtime_latent(self.cache.load_latent(e["latent_path"]))
+                    )
+            return loaded or None
+        if isinstance(entry, dict) and entry.get("latent_path"):
+            return self._runtime_latent(self.cache.load_latent(entry["latent_path"]))
+        return None
+
     def __getitem__(self, idx: int) -> dict:
         base_len = len(self.datarows)
         base_idx = idx % base_len
@@ -205,16 +262,14 @@ class UnifiedDataset(Dataset):
         # Load reference latents
         references = sample.get("references", {})
         if reference_key and reference_key in references:
-            entry = references[reference_key]
-            latent_path = entry.get("latent_path") if isinstance(entry, dict) else None
-            if latent_path:
-                latents[reference_key] = self._runtime_latent(self.cache.load_latent(latent_path))
+            loaded = self._load_reference_entry(references[reference_key])
+            if loaded is not None:
+                latents[reference_key] = loaded
         else:
             for role, entry in references.items():
-                if isinstance(entry, dict):
-                    latent_path = entry.get("latent_path")
-                    if latent_path:
-                        latents[role] = self._runtime_latent(self.cache.load_latent(latent_path))
+                loaded = self._load_reference_entry(entry)
+                if loaded is not None:
+                    latents[role] = loaded
 
 
         # Load caption embedding
@@ -230,11 +285,20 @@ class UnifiedDataset(Dataset):
             if npz_path:
                 embedding = self.embedding_cache.load(npz_path)
 
-        # Apply reference_dropout
-        if reference_dropout > 0 and random.random() < reference_dropout:
+        # Apply reference_dropout — per-sample only when batches are size 1.
+        # With batch_size > 1, dropping refs for one sample desyncs the batch
+        # (the sampler groups by reference signature); the trainer applies
+        # batch-level caption_dropout instead.  Log once when suppressed.
+        if reference_dropout > 0 and self.batch_size <= 1 and random.random() < reference_dropout:
             ref_keys_to_drop = [k for k in latents if k != target_key and not k.endswith("_from_image")]
             for k in ref_keys_to_drop:
                 del latents[k]
+        elif reference_dropout > 0 and not self._warned_ref_dropout_batched:
+            self._warned_ref_dropout_batched = True
+            logger.warning(
+                f"reference_dropout={reference_dropout} ignored: per-sample reference "
+                f"dropout is unsupported with batch_size>1 (use caption_dropout instead)."
+            )
 
 
         return {
@@ -279,9 +343,35 @@ def collate_fn(batch: list) -> dict:
         all_roles.update(b["latents"].keys())
 
     for role in all_roles:
-        tensors = [b["latents"][role] for b in batch if role in b["latents"]]
-        if tensors:
-            result["latents"][role] = torch.stack(tensors)
+        values = [b["latents"][role] for b in batch if role in b["latents"]]
+        if not values:
+            continue
+        if isinstance(values[0], list) or any(isinstance(v, list) for v in values):
+            # Multi-reference role: stack per position across samples.
+            # Normalize single-tensor entries (samples whose group resolved
+            # to one reference) to single-element lists so ``v[i]`` never
+            # indexes a tensor's batch dim.  The sampler groups batches by
+            # reference signature, so every position stacks the full batch;
+            # any leftover inconsistency is caught below with a clear error.
+            entries = [v if isinstance(v, list) else [v] for v in values]
+            n = max(len(v) for v in entries)
+            stacked = []
+            for i in range(n):
+                parts = [v[i] for v in entries if len(v) > i]
+                if parts:
+                    stacked.append(torch.stack(parts))
+            # The sampler groups batches by reference signature, so every sample
+            # in a batch carries the same number of references.  Catch violations
+            # early with a clear error instead of an obscure pack/cat failure.
+            if len(stacked) > 1 and any(s.shape[0] != stacked[0].shape[0] for s in stacked[1:]):
+                raise ValueError(
+                    f"reference role {role!r} has inconsistent counts across the batch "
+                    f"({[tuple(s.shape) for s in stacked]}); samples with different "
+                    f"reference availability must not share a batch."
+                )
+            result["latents"][role] = stacked
+        else:
+            result["latents"][role] = torch.stack(values)
 
     return result
 
@@ -295,6 +385,10 @@ class BucketBatchSampler(Sampler):
     datasets use larger ones, maximizing VRAM utilization.
 
     Features:
+        - **Reference-signature grouping**: batches are homogeneous w.r.t.
+          per-sample reference availability (the count of each reference role
+          used by batch_configs), so multi-reference samples with missing
+          images never share a batch with samples that have more refs.
         - **Per-dataset batch_size**: each dataset can override the global
           batch_size via dataset_batch_sizes.
         - **Per-dataset repeats**: each dataset's samples are duplicated
@@ -344,21 +438,27 @@ class BucketBatchSampler(Sampler):
 
         base_len = len(dataset.datarows)
 
-        # Build (dataset, bucket) -> [indices] map using PER-DATASET repeats
+        # Reference signatures keep batches homogeneous: samples in one batch
+        # must carry the same reference counts (the model packs references as
+        # extra sequence tokens, so mixed counts break the batch).
+        sample_sigs = getattr(dataset, "sample_ref_sigs", None)
+
+        # Build (dataset, bucket, ref_sig) -> [indices] map using PER-DATASET repeats
         group_map: dict[tuple, List[int]] = defaultdict(list)
         for i in range(base_len):
             dr = dataset.datarows[i]
             bucket = dr.get("bucket", "unknown")
             ds_name = dr.get("dataset", "default")
+            ref_sig = sample_sigs[i] if sample_sigs else ()
             ds_repeats = self.dataset_repeats.get(ds_name, 1)
             for r in range(ds_repeats):
                 idx = r * base_len + i
-                group_map[(ds_name, bucket)].append(idx)
+                group_map[(ds_name, bucket, ref_sig)].append(idx)
 
         self._group_indices: dict[tuple, List[int]] = dict(group_map)
 
         self._num_batches = 0
-        for (ds_name, _bucket), indices in self._group_indices.items():
+        for (ds_name, _bucket, _ref_sig), indices in self._group_indices.items():
             bs = self._get_batch_size(ds_name)
             n = len(indices)
             if self.drop_last:
@@ -381,7 +481,7 @@ class BucketBatchSampler(Sampler):
         # Build all batches from all groups
         batches: List[List[int]] = []
         batch_weights: List[float] = []  # per-batch weight (for weighted mode)
-        for (ds_name, _bucket), indices in group_indices.items():
+        for (ds_name, _bucket, _ref_sig), indices in group_indices.items():
             bs = self._get_batch_size(ds_name)
             w = self.dataset_weights.get(ds_name, 1.0)
             for start in range(0, len(indices), bs):

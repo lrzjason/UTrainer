@@ -559,10 +559,7 @@ class Trainer:
             else:
                 compute_dtype = model_dtype
             latents = batch.get("latents", {})
-            latents = {
-                k: v.to(device=device, dtype=compute_dtype) if isinstance(v, torch.Tensor) else v
-                for k, v in latents.items()
-            }
+            latents = self._move_latents_to_device(latents, device, compute_dtype)
             batch["latents"] = latents
 
             # ── Get ALL target latents (multi-target) ──
@@ -980,10 +977,7 @@ class Trainer:
                     # Move latents to device (use self.device — reliable after BouncingOffloader)
                     device = self.device
                     latents = batch.get("latents", {})
-                    latents = {
-                        k: v.to(device=device) if isinstance(v, torch.Tensor) else v
-                        for k, v in latents.items()
-                    }
+                    latents = self._move_latents_to_device(latents, device)
                     batch["latents"] = latents
 
                     target_latents = self._get_target_latents(
@@ -1372,10 +1366,7 @@ class Trainer:
         resolved_bc = batch_configs[0] if batch_configs else None
 
         latents = batch.get("latents", {})
-        latents = {
-            k: v.to(device=device) if isinstance(v, torch.Tensor) else v
-            for k, v in latents.items()
-        }
+        latents = self._move_latents_to_device(latents, device)
         batch["latents"] = latents
 
         # ── Get ALL target latents (single or multi-target) ──
@@ -1672,6 +1663,25 @@ class Trainer:
         # Fallback — single target via the existing resolution logic.
         return [self._get_target_latent(batch, latents, resolved_bc)]
 
+    @staticmethod
+    def _move_latents_to_device(
+        latents: dict, device: torch.device, dtype: Optional[torch.dtype] = None
+    ) -> dict:
+        """Move batch latents to ``device`` (and optionally ``dtype``).
+
+        Single latents are tensors; multi-reference latents are LISTS of
+        tensors (one per reference image) and are moved element-wise.
+        """
+        moved = {}
+        for k, v in latents.items():
+            if isinstance(v, torch.Tensor):
+                moved[k] = v.to(device=device, dtype=dtype)
+            elif isinstance(v, list):
+                moved[k] = [t.to(device=device, dtype=dtype) for t in v]
+            else:
+                moved[k] = v
+        return moved
+
     def _get_reference_latent(
         self, batch: dict, latents: dict, resolved_bc: dict = None
     ) -> Optional[torch.Tensor]:
@@ -1685,13 +1695,20 @@ class Trainer:
         if resolved_bc and resolved_bc.get("reference_config"):
             ref_key = resolved_bc["reference_config"]
             if ref_key in latents:
-                return latents[ref_key]
+                v = latents[ref_key]
+                # Multi-reference roles are lists of tensors — use the
+                # primary reference for loss/decode consumers.
+                return v[0] if isinstance(v, list) and v else v
         # Fallback: any non-target latent
         if resolved_bc and resolved_bc.get("target_config"):
             tc_key = resolved_bc["target_config"]
             for k, v in latents.items():
-                if k != tc_key and isinstance(v, torch.Tensor):
+                if k == tc_key:
+                    continue
+                if isinstance(v, torch.Tensor):
                     return v
+                if isinstance(v, list) and v:
+                    return v[0]
         return None
 
     def _apply_caption_dropout(self, batch: dict, resolved_bc: dict) -> None:

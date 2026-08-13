@@ -42,7 +42,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from UnifiedTrainer.models.base import BaseModelAdapter
+from UnifiedTrainer.models.base import BaseModelAdapter, sample_sigma_uniform
 from UnifiedTrainer.registry import ModelRegistry
 
 # Packed-sequence geometry and constants, reused verbatim from the locked
@@ -126,6 +126,11 @@ class MiniMaxH3Adapter(BaseModelAdapter):
         # plain logit-normal used by the base adapter; positive mu shifts the
         # density toward noisier steps.
         self.timestep_mu: float = float(self.config.get("timestep_mu", 0.0))
+
+        # Uniform-σ sampling (musubi-aligned, opt-in): timestep_shift_mode="sigma"
+        # uses the shared sample_sigma_uniform helper (one draw broadcast across
+        # the batch, consistent with the packed single-sigma design below).
+        self.timestep_shift_mode: Optional[str] = self.config.get("timestep_shift_mode")
 
         # Base seed for the keyframe-conditioning noise.  The per-forward seed
         # is derived from this base plus the current sigma value, so the same
@@ -1431,6 +1436,12 @@ class MiniMaxH3Adapter(BaseModelAdapter):
         returned value is the engine's sigma; the H3 transformer's actual
         timestep ``t = 1 - sigma`` is built inside ``prepare_model_input``.
         """
+        if self.timestep_shift_mode == "sigma":
+            # Uniform σ ∈ [0.001, 1] — shared musubi-aligned helper, one draw
+            # broadcast across the batch (H3 shares one packed layout).
+            _, sigma = sample_sigma_uniform(1, device, dtype)
+            sigmas = sigma.expand(batch_size)
+            return sigmas, sigmas
         u = torch.normal(mean=self.timestep_mu, std=1.0, size=(1,), device=device)
         sigma = torch.sigmoid(u).clamp(1e-5, 1.0 - 1e-5)
         sigmas = sigma.expand(batch_size).to(dtype=dtype)

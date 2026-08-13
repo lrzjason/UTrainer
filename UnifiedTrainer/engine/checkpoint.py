@@ -433,6 +433,7 @@ class CheckpointManager:
         epoch_idx: int,
         config: Optional[dict] = None,
         is_final: bool = False,
+        extra_state: Optional[dict] = None,
     ) -> Path:
         """Save full training state for exact resume.
 
@@ -467,6 +468,9 @@ class CheckpointManager:
 
         import random as _random
         state["python_rng_state"] = _random.getstate()
+
+        if extra_state is not None:
+            state["extra_state"] = extra_state
 
         torch.save(state, str(path))
         logger.info(f"Saved training state: {path}")
@@ -542,7 +546,11 @@ class CheckpointManager:
             _random.setstate(state["python_rng_state"])
 
         logger.info(f"Restored RNG states from {path}")
-        return {"step": state["step"], "epoch": state["epoch"]}
+        return {
+            "step": state["step"],
+            "epoch": state["epoch"],
+            "extra_state": state.get("extra_state"),
+        }
 
     @staticmethod
     def get_training_state_path(checkpoint_path: str) -> Path:

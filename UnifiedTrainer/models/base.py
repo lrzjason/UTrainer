@@ -15,6 +15,27 @@ import torch
 import torch.nn as nn
 
 
+def sample_sigma_uniform(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_timesteps: int = 1000,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Uniform sigma over [1/num_timesteps, 1.0] — musubi-aligned recipe.
+
+    musubi ``timestep_sampling="sigma"``: ``scheduler.timesteps = sigmas[:-1]*1000``
+    → [1000, …, 1]; index with ``(u * 1000).long()`` (u ~ U[0,1)) → t ∈ [1, 1000];
+    σ = t/1000.  Every integer level is equally likely — resolution-independent.
+
+    Returns:
+        Tuple of (timesteps, sigmas) — both shape (batch_size,).
+    """
+    u = torch.rand(batch_size, device=device)
+    indices = (u * num_timesteps).long() + 1  # integer timesteps ∈ [1, num_timesteps]
+    sigmas = indices / num_timesteps          # σ ∈ [1/1000, 1.0]
+    return indices.to(dtype=dtype), sigmas.to(dtype=dtype)
+
+
 class BaseModelAdapter(ABC):
     """Abstract base class for model adapters.
 
@@ -355,6 +376,9 @@ class BaseModelAdapter(ABC):
         """Sample timesteps and sigmas for flow-matching.
 
         Default: logit-normal distribution (sigma = sigmoid(N(0,1))).
+        Config ``timestep_shift_mode: "sigma"`` switches to uniform sigma
+        over [0.001, 1.0] via the shared :func:`sample_sigma_uniform` helper
+        (musubi-aligned; krea2 defaults to it, other adapters opt in).
         Override per-model for custom distributions (e.g. Krea2 mu-shift).
 
         Args:
@@ -367,6 +391,15 @@ class BaseModelAdapter(ABC):
         Returns:
             Tuple of (timesteps, sigmas) — both shape (batch_size,).
         """
+        mode = getattr(self, "config", None)
+        mode = mode.get("timestep_shift_mode") if isinstance(mode, dict) else None
+        if mode == "sigma":
+            return sample_sigma_uniform(batch_size, device, dtype)
+        if mode is not None:
+            raise ValueError(
+                f"Unknown timestep_shift_mode '{mode}' for model '{self.name}'. "
+                "Expected 'sigma'."
+            )
         u = torch.randn(batch_size, device=device, dtype=torch.float32)
         sigmas = torch.sigmoid(u).to(dtype=dtype)
         timesteps = sigmas  # default: sigma is the timestep

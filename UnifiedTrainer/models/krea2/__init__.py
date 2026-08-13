@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from UnifiedTrainer.models.base import BaseModelAdapter
+from UnifiedTrainer.models.base import BaseModelAdapter, sample_sigma_uniform
 from UnifiedTrainer.registry import ModelRegistry
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,15 @@ RESOLUTION_CONFIG = {
         (960, 1120), (896, 1152), (832, 1216),
         (768, 1280), (704, 1344), (640, 1408), (576, 1472),
         (544, 1536), (512, 1600), (480, 1664), (448, 1728),
+    ],
+    1536: [
+        (1536, 1536),
+        (1664, 1440), (1728, 1344), (1824, 1248),
+        (1920, 1152), (2016, 1056), (2112, 960), (2208, 864),
+        (2304, 832), (2400, 768), (2496, 704), (2592, 672),
+        (1440, 1664), (1344, 1728), (1248, 1824),
+        (1152, 1920), (1056, 2016), (960, 2112), (864, 2208),
+        (832, 2304), (768, 2400), (704, 2496), (672, 2592),
     ],
     2048: [
         (2048, 2048),
@@ -113,19 +122,22 @@ class Krea2Adapter(BaseModelAdapter):
         self.suffix_mask: Optional[torch.Tensor] = None
 
         # Timestep shift mode for training-time sigma sampling:
-        #   "comfy_fixed"      — fixed mu=1.15 at every resolution, exactly
+        #   "sigma"            — uniform σ ∈ [0.001, 1] (musubi timestep_sampling=
+        #                        sigma recipe: u ~ U[0,1), t = floor(u*1000)+1,
+        #                        σ = t/1000). DEFAULT — musubi-aligned.
+        #   "comfy_fixed"      — logit-normal μ=1.15 at every resolution, exactly
         #                        matching ComfyUI inference (supported_models.py
-        #                        Krea2 sampling_settings shift=1.15). DEFAULT.
-        #   "pretrain_dynamic" — mu linearly interpolated 0.5→1.15 over
-        #                        256→6400 image tokens, matching the model's
+        #                        Krea2 sampling_settings shift=1.15).
+        #   "pretrain_dynamic" — logit-normal, mu linearly interpolated 0.5→1.15
+        #                        over 256→6400 image tokens, matching the model's
         #                        pretraining distribution (ai-toolkit /
         #                        T2ITrainer convention).
-        # Both cover sigma ∈ (0,1]; only the sampling density differs.
-        self.timestep_shift_mode: str = config.get("timestep_shift_mode", "comfy_fixed")
-        if self.timestep_shift_mode not in ("comfy_fixed", "pretrain_dynamic"):
+        # All cover sigma ∈ (0,1]; only the sampling density differs.
+        self.timestep_shift_mode: str = config.get("timestep_shift_mode", "sigma")
+        if self.timestep_shift_mode not in ("sigma", "comfy_fixed", "pretrain_dynamic"):
             raise ValueError(
                 f"Unknown timestep_shift_mode '{self.timestep_shift_mode}'. "
-                "Expected 'comfy_fixed' or 'pretrain_dynamic'."
+                "Expected 'sigma', 'comfy_fixed' or 'pretrain_dynamic'."
             )
 
         # Target grid dimensions cached from prepare_model_input — used by unpack_prediction.
@@ -154,7 +166,8 @@ class Krea2Adapter(BaseModelAdapter):
     # always returns 1.15 regardless of resolution — exactly matching ComfyUI.
     # (When config timestep_shift_mode="pretrain_dynamic", sample_timesteps
     # instead interpolates mu 0.5→1.15 over base/max_image_seq_len, matching
-    # the model's pretraining distribution.)
+    # the model's pretraining distribution. With "sigma", sample_timesteps
+    # samples uniform σ∈[0.001,1] directly and ignores the shift entirely.)
     KREA2_SCHEDULER_CONFIG = {
         "base_image_seq_len": 256,
         "max_image_seq_len": 6400,
@@ -839,7 +852,7 @@ class Krea2Adapter(BaseModelAdapter):
     def compute_target(self, noise: torch.Tensor, learning_target: torch.Tensor) -> torch.Tensor:
         return noise - learning_target
 
-    # ── Krea2 logit-normal timestep sampling ──────────────────────────
+    # ── Krea2 timestep sampling (uniform-σ / logit-normal modes) ──────
 
     def sample_timesteps(
         self,
@@ -849,21 +862,34 @@ class Krea2Adapter(BaseModelAdapter):
         latent_height: int | None = None,
         latent_width: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample timesteps from a logit-normal distribution with mu-shift.
+        """Sample timesteps for flow-matching, honoring timestep_shift_mode.
 
-        Samples sigma = sigmoid(N(mu, 1)) where mu is resolution-dependent,
-        matching the ControlNet-LoRA training convention.  Logit-normal
-        concentrates samples around the mode sigma ≈ sigmoid(mu), reducing
-        wasted gradient on trivial low/high-noise steps.
+        - "sigma": uniform σ ∈ [0.001, 1] — the musubi timestep_sampling=sigma
+          recipe (u ~ U[0,1), integer timestep = floor(u*1000)+1 ∈ [1, 1000], σ = t/1000).
+          Resolution-independent; DEFAULT.
+        - "comfy_fixed": logit-normal σ = sigmoid(N(1.15, 1)) at every resolution.
+        - "pretrain_dynamic": logit-normal with mu interpolated 0.5→1.15 over
+          256→6400 image tokens (pretraining distribution).
 
         Returns timesteps = sigma * num_train_timesteps (for the transformer
         to normalize to [0,1] via timestep/1000).
         """
+        n = self.KREA2_SCHEDULER_CONFIG["num_train_timesteps"]
+
+        # Uniform σ ∈ [0.001, 1] — musubi-aligned (resolution-independent).
+        # Shared helper in models/base.py; other adapters honor the same
+        # timestep_shift_mode config key (opt-in there, default here).
+        if self.timestep_shift_mode == "sigma":
+            return sample_sigma_uniform(
+                batch_size,
+                device,
+                dtype,
+                num_timesteps=self.KREA2_SCHEDULER_CONFIG["num_train_timesteps"],
+            )
+
         if latent_height is None or latent_width is None:
             # Fallback to base logit-normal (mu=0) if no shape info available
             return super().sample_timesteps(batch_size, device, dtype)
-
-        n = self.KREA2_SCHEDULER_CONFIG["num_train_timesteps"]
 
         # Compute mu from image token count, honoring timestep_shift_mode:
         # comfy_fixed → mu=1.15 always; pretrain_dynamic → 0.5→1.15 by tokens.

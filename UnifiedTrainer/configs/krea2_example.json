@@ -10,6 +10,7 @@
 
     "reference_conditioning": false,
     "multimodal_reference": false,
+    "timestep_shift_mode": "sigma",
 
     "data": {
         "cache_dir": "cache/krea2_example_cache",
@@ -60,7 +61,7 @@
         "network_type": "lokr",
         "lora_rank": 64,
         "lokr_alpha": 1.0,
-        "lokr_factor": 4,
+        "lokr_factor": -1,
         "lokr_model_type": "krea2",
         "lokr_target_modules": null,
         "include_suffix": true,

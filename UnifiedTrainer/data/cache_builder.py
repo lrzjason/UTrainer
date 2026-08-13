@@ -426,8 +426,22 @@ class CacheBuilder:
 
             image_path = pair[image_key]
             media = self._media_for_key(image_key)
-            return self._construct_media(vae, image_path, device, recreate, media=media)
+            return self._construct_media(
+                vae, image_path, device, recreate, media=media,
+                resolution=self._resolution_for_key(image_key),
+            )
         return {}
+
+    def _resolution_for_key(self, image_key: str) -> int:
+        """Resolve the encode resolution for an image_configs key.
+
+        ``image_configs.<key>.resolution`` overrides the dataset resolution
+        (e.g. face crops fixed at 512 while targets encode at 1024/1536).
+        """
+        img_cfg = self.ds_config.image_configs.get(image_key)
+        if img_cfg is not None and img_cfg.resolution:
+            return img_cfg.resolution
+        return self.ds_config.resolution
 
     def _encode_reference_entries(
         self,
@@ -437,13 +451,20 @@ class CacheBuilder:
         subdir_caches: Dict[str, List[str]],
         device: torch.device,
         recreate: bool,
-    ) -> dict:
+    ) -> Any:
         """Encode reference images with VAE.
 
-        Returns a dict with first ref for from_same_name,
-        or a list for from_subdir.
-        For simplicity (matching T2ITrainer), returns the first reference entry.
+        Collects one encoded media dict per entry whose image exists in the
+        pair — entries with missing images are skipped (per-sample optional
+        references, e.g. a second face ``F2`` that only some samples have).
+
+        Returns:
+            - a single dict when exactly one entry was encoded (backward
+              compatible with existing caches),
+            - a list of dicts for multi-reference groups (one per image),
+            - ``{}`` when nothing was encoded.
         """
+        encoded: List[dict] = []
         for entry in entries:
             image_key = entry.image
 
@@ -452,7 +473,12 @@ class CacheBuilder:
                     continue
                 image_path = pair[image_key]
                 media = self._media_for_key(image_key)
-                return self._construct_media(vae, image_path, device, recreate, media=media)
+                encoded.append(
+                    self._construct_media(
+                        vae, image_path, device, recreate, media=media,
+                        resolution=self._resolution_for_key(image_key),
+                    )
+                )
 
             elif entry.sample_type == "from_subdir":
                 if image_key not in pair:
@@ -479,10 +505,20 @@ class CacheBuilder:
                 random.shuffle(filtered)
 
                 count = min(entry.count, len(filtered))
-                if count > 0:
+                for ref_file in filtered[:count]:
                     media = self._media_for_key(image_key)
-                    return self._construct_media(vae, filtered[0], device, recreate, media=media)
-        return {}
+                    encoded.append(
+                        self._construct_media(
+                            vae, ref_file, device, recreate, media=media,
+                            resolution=self._resolution_for_key(image_key),
+                        )
+                    )
+
+        if not encoded:
+            return {}
+        if len(encoded) == 1:
+            return encoded[0]
+        return encoded
 
     def _media_for_key(self, image_key: str) -> str:
         """Resolve the media type ("image" | "video") for an image_configs key."""
@@ -496,6 +532,7 @@ class CacheBuilder:
         device: torch.device,
         recreate: bool,
         media: str = "image",
+        resolution: Optional[int] = None,
     ) -> dict:
         """Encode one media sample into the unified 5D cache.
 
@@ -512,6 +549,10 @@ class CacheBuilder:
         latent values are identical (via the base ``encode_video`` default which
         delegates to ``encode_image``).  Existing adapters (krea2, ...) are
         unaware of the media dispatch.
+
+        Args:
+            resolution: Encode resolution override (per-image-config);
+                defaults to the dataset resolution.
         """
         from PIL import Image
 
@@ -521,7 +562,8 @@ class CacheBuilder:
                 f"expected 'image' or 'video'."
             )
 
-        resolution = self.ds_config.resolution
+        if resolution is None:
+            resolution = self.ds_config.resolution
         basename = os.path.splitext(os.path.basename(media_path))[0]
         cache_subdir = self.cache.get_cache_dir(media_path)
         cache_dir = str(cache_subdir)

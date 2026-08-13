@@ -759,9 +759,9 @@ def main():
 
         training_cfg = config.get("training", {})
         lokr_cfg = LokrConfig(
-            rank=training_cfg.get("lora_rank", 64),
+            rank=training_cfg.get("lora_rank", 4),
             alpha=training_cfg.get("lokr_alpha", 1.0),
-            factor=training_cfg.get("lokr_factor", 4),
+            factor=training_cfg.get("lokr_factor", -1),
             model_type=training_cfg.get("lokr_model_type", "krea2"),
             target_modules=training_cfg.get("lokr_target_modules", None),
         )
@@ -1157,6 +1157,13 @@ def main():
                 trainer.step = state_meta["step"]
                 # saved epoch = last COMPLETED epoch, so start from the next one
                 trainer.epoch = state_meta["epoch"] + 1
+                extra_state = state_meta.get("extra_state")
+                if extra_state and hasattr(trainer.noise_selector, "load_state_dict"):
+                    try:
+                        trainer.noise_selector.load_state_dict(extra_state["noise_selector"])
+                        logger.info("FULL resume: restored noise_selector state (improved XM baselines)")
+                    except Exception as e:
+                        logger.warning(f"FULL resume: failed to restore noise_selector state: {e}")
                 logger.info(
                     f"FULL resume: restored optimizer, scheduler, RNG, "
                     f"step={trainer.step}, starting at epoch={trainer.epoch}"
@@ -1258,6 +1265,12 @@ def main():
     if any(bs != trainer.batch_size for bs in dataset_batch_sizes.values()):
         logger.info(f"Per-dataset batch sizes: {dataset_batch_sizes}")
 
+    # Effective batch size — gates per-sample reference_dropout (unsupported
+    # with batch_size > 1, where batches must stay homogeneous w.r.t. refs).
+    dataset.batch_size = (
+        max(dataset_batch_sizes.values()) if dataset_batch_sizes else trainer.batch_size
+    )
+
     dataset_repeats = dataset.get_dataset_repeats()
     if any(r != 1 for r in dataset_repeats.values()):
         logger.info(f"Per-dataset repeats: {dataset_repeats}")
@@ -1290,6 +1303,9 @@ def main():
             cache_dir=cache_dir,
             config=data_cfg,
             split="val",
+        )
+        val_dataset.batch_size = max(
+            val_dataset.get_dataset_batch_sizes(trainer.batch_size).values()
         )
         if len(val_dataset) > 0:
             val_dataloader = DataLoader(
@@ -1445,6 +1461,11 @@ def main():
             logger.info(f"Checkpoint saved: {path}")
             # Save full training state for exact resume (--resume-full)
             if trainer.optimizer is not None:
+                extra = (
+                    {"noise_selector": trainer.noise_selector.state_dict()}
+                    if hasattr(trainer.noise_selector, "state_dict")
+                    else None
+                )
                 state_path = ckpt_mgr.save_training_state(
                     optimizer=trainer.optimizer,
                     lr_scheduler=trainer.lr_scheduler,
@@ -1452,6 +1473,7 @@ def main():
                     epoch=epoch,
                     epoch_idx=epoch,
                     config=config,
+                    extra_state=extra,
                 )
                 logger.info(f"Training state saved: {state_path} (step={trainer.step}, epoch={epoch})")
             else:
@@ -1531,6 +1553,11 @@ def main():
             )
         # Save final training state too
         if trainer.optimizer is not None:
+            extra = (
+                {"noise_selector": trainer.noise_selector.state_dict()}
+                if hasattr(trainer.noise_selector, "state_dict")
+                else None
+            )
             ckpt_mgr.save_training_state(
                 optimizer=trainer.optimizer,
                 lr_scheduler=trainer.lr_scheduler,
@@ -1539,6 +1566,7 @@ def main():
                 epoch_idx=num_epochs,
                 config=config,
                 is_final=True,
+                extra_state=extra,
             )
         # Report peak VRAM for scoring/monitoring
         if torch.cuda.is_available():

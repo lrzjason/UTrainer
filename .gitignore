@@ -219,3 +219,5 @@ __marimo__/
 .tmp
 workspace
 start.sh
+
+wandb

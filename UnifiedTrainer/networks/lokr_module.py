@@ -40,7 +40,8 @@ class LokrConfig:
 
     Attributes:
         rank: Low-rank dimension for W2 decomposition (and W1 if decompose_both).
-        alpha: Scaling factor. Effective scale = alpha / rank.
+        alpha: Scaling factor. Effective scale = alpha / rank; in full-W2 mode
+        alpha is forced to rank -> scale = 1.0 (musubi-aligned).
         factor: Factorization factor for splitting dimensions (-1 = auto).
         model_type: Preset selector for target layer patterns.
         target_modules: Override fnmatch patterns; None uses model_type defaults.
@@ -48,9 +49,9 @@ class LokrConfig:
         decompose_both: Also decompose W1 into w1_a @ w1_b (saves params).
     """
 
-    rank: int = 64
+    rank: int = 4
     alpha: float = 1.0
-    factor: int = 4
+    factor: int = -1
     model_type: str = "krea2"
     target_modules: Optional[List[str]] = None
     multiplier: float = 1.0
@@ -115,7 +116,8 @@ _H3_PATTERNS = [
 ]
 
 _MODEL_PATTERNS = {
-    "krea2": _KREA2_PATTERNS,
+    # None → attach to ALL Linear modules (musubi-aligned: KREA2_TARGET_REPLACE_MODULES=None)
+    "krea2": None,
     "qwen": _QWEN_PATTERNS,
     "flux": _FLUX_PATTERNS,
     "minimax_h3": _H3_PATTERNS,
@@ -171,9 +173,9 @@ class LokrLayer(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        rank: int = 64,
+        rank: int = 4,
         alpha: float = 1.0,
-        factor: int = 4,
+        factor: int = -1,
         multiplier: float = 1.0,
         decompose_both: bool = False,
     ):
@@ -186,11 +188,9 @@ class LokrLayer(nn.Module):
         self.out1, self.out2 = factorization(out_features, factor)
         self.in1, self.in2 = factorization(in_features, factor)
 
-        # Scale: alpha / rank (standard LoRA scaling)
-        self.scale = alpha / rank if rank > 0 else 1.0
-
         # ── W1: "small" factor [out1, in1] ───────────────────────────
-        # With typical factor=4-8, this is tiny (e.g. [4, 4] or [8, 8])
+        # With factor=-1 (balanced) this is e.g. [64, 64] for 6144-dim layers;
+        # with factor=4-8 it shrinks to [4, 4] or [8, 8].
         if decompose_both and rank < max(self.out1, self.in1) / 2:
             # Low-rank decomposition: W1 = w1_a @ w1_b
             self.lokr_w1_a = nn.Parameter(torch.empty(self.out1, rank))
@@ -211,8 +211,15 @@ class LokrLayer(nn.Module):
             self.lokr_w2 = nn.Parameter(torch.empty(self.out2, self.in2))
             self.use_w2 = True
 
+        # Scale: alpha / rank (standard LoRA scaling).
+        # musubi-aligned: full-matrix W2 mode forces alpha = rank -> scale = 1.0
+        # (musubi lokr.py: "if both w1 and w2 are full matrices, use scale = 1").
+        alpha_eff = rank if self.use_w2 else alpha
+        self.scale = alpha_eff / rank if rank > 0 else 1.0
+
         # Register alpha as buffer for checkpoint compatibility
-        self.register_buffer("alpha", torch.tensor(alpha))
+        # (full-W2 mode stores alpha = rank, matching musubi checkpoints)
+        self.register_buffer("alpha", torch.tensor(alpha_eff))
 
         self._init_weights()
 
@@ -315,15 +322,17 @@ class LokrNetwork(nn.Module):
         Returns:
             self (for chaining).
         """
-        patterns = self.config.target_modules or _MODEL_PATTERNS.get(
-            self.config.model_type, _KREA2_PATTERNS
-        )
+        patterns = self.config.target_modules
+        if patterns is None:
+            patterns = _MODEL_PATTERNS.get(self.config.model_type, _KREA2_PATTERNS)
+        # patterns=None (krea2 default) → attach to ALL Linear modules,
+        # matching musubi's KREA2_TARGET_REPLACE_MODULES=None behavior.
 
         # Discover matching Linear modules
         for name, module in model.named_modules():
             if not isinstance(module, nn.Linear):
                 continue
-            if not any(fnmatch.fnmatch(name, p) for p in patterns):
+            if patterns is not None and not any(fnmatch.fnmatch(name, p) for p in patterns):
                 continue
 
             # Create LokrLayer for this Linear

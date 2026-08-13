@@ -4,7 +4,7 @@ Provides LoKR (Kronecker-product) adapter support via a self-contained,
 VRAM-optimized implementation (no third-party lycoris-lora dependency).
 
 Usage in config JSON:
-    {"training": {"network_type": "lokr", "lokr_factor": 4, ...}}
+    {"training": {"network_type": "lokr", "lokr_factor": -1, ...}}
 """
 from UnifiedTrainer.networks.lokr_module import (
     LokrConfig,
