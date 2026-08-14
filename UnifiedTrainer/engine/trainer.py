@@ -581,9 +581,17 @@ class Trainer:
                 for lk, lv in latents.items():
                     if lk in target_keys:
                         continue
-                    if not isinstance(lv, torch.Tensor):
-                        continue
-                    latents[lk] = apply_helios_corrupt(lv, self.helios_config)
+                    if isinstance(lv, torch.Tensor):
+                        # Single-reference role — corrupt the tensor.
+                        latents[lk] = apply_helios_corrupt(lv, self.helios_config)
+                    elif isinstance(lv, list):
+                        # Multi-reference role (e.g. D+F1+F2) — corrupt EVERY
+                        # reference latent, not just the first frame.
+                        latents[lk] = [
+                            apply_helios_corrupt(t, self.helios_config)
+                            if isinstance(t, torch.Tensor) else t
+                            for t in lv
+                        ]
                 batch["latents"] = latents
 
             # ── Dynamic caption dropout (T2ITrainer-style: per-step, on-the-fly) ──
