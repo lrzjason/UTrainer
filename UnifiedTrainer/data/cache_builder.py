@@ -749,6 +749,13 @@ class CacheBuilder:
                     ref_images = self._load_reference_images(
                         pair, cap_cfg.reference_list, device
                     )
+                    if not ref_images:
+                        # All reference images for this caption are missing on
+                        # this sample (e.g. a sample with no _f1 face crop).
+                        # Fall back to TEXT-ONLY encoding: passing an empty list
+                        # would leave is_multimodal=True with zero images and
+                        # crash the Qwen3VL processor path.
+                        ref_images = None
 
                 # Optional image-conditioned caption encoding hook: only when
                 # the adapter declares encode_text_accepts_image (MiniMax-H3
@@ -865,7 +872,10 @@ class CacheBuilder:
         for ref_entry in ref_entries:
             image_key = ref_entry.image
             if image_key not in pair:
-                logger.warning(f"Reference image key '{image_key}' not found in pair")
+                # Expected graceful degradation: this sample simply lacks the
+                # reference image (e.g. no _f1). The caption falls back to
+                # text-only when no images remain (see _encode_caption).
+                logger.debug(f"Reference image key '{image_key}' not found in pair — skipping")
                 continue
 
             image_path = pair[image_key]

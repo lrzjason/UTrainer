@@ -15,15 +15,16 @@ Config:
         "noise_selector": {
             "type": "explorative_improved", // "random" (default) | "explorative" | "explorative_improved"
             "K_cond": 4,             // noise candidates for text-conditioned batches
-            "K_uncond": 5,           // candidates for caption-dropped (uncond) batches
+            "K_uncond": 1,           // caption-dropped (uncond) batches: no exploration (empirically little gain)
             "warmup_steps": 0,       // K=1 for first N steps (0 = explore from step 1)
             "schedule": "constant",  // "constant" | "linear_decay" | "cosine"
             "log_stats": true,       // expose xm/* stats to callbacks
             "num_buckets": 20,       // per-sigma-bucket count for global_min_loss baselines
             "bucket_mode": "log",    // "linear" | "log" sigma bucketing
             "sigma_min": 0.001,      // sigma floor for the log bucket mapping
-            "dead_zone_delta": 0.1,  // relative dead-zone for baseline updates
+            "ema_alpha": 0.1,        // EMA smoothing for per-bucket baseline: g_b ← (1-α)·g_b + α·L_min
             "init_k": 0,             // first-hit candidate budget for uninitialized buckets (0 = disabled; e.g. 100 when K=10)
+            "combo_norm": false,     // normalize loss by per-combo scale before the sigma baseline (md/xm_combo_normalization.md)
         }
     }
 
@@ -33,14 +34,33 @@ from __future__ import annotations
 
 import logging
 import math
+import zlib
 from abc import ABC, abstractmethod
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+def _combo_key_from_batch(batch: dict) -> str:
+    """Canonical training-combination id from the batch's resolved batch_config.
+
+    One batch_config == one combo (target × caption × reference). Missing
+    fields fall back to "?" / "none" so keys stay stable across samples.
+    Used by the improved selector's per-combo loss-scale normalization
+    (md/xm_combo_normalization.md).
+    """
+    bc_list = batch.get("batch_configs", []) if isinstance(batch, dict) else []
+    bc = bc_list[0] if bc_list else None
+    if isinstance(bc, dict):
+        target = bc.get("target_config", "?")
+        caption = bc.get("caption_config", "?")
+        reference = bc.get("reference_config") or "none"
+        return f"{target}|{caption}|{reference}"
+    return "__unknown__"
 
 
 # ── Abstract base ────────────────────────────────────────────────────────
@@ -116,14 +136,12 @@ class ExplorativeNoiseSelector(NoiseSelector):
     are evaluated via no_grad forwards; the noise yielding lowest velocity MSE
     is returned for the actual gradient-enabled training forward.
 
-    Adaptive K (per the Explorative Modeling practical guide):
-    - Text-conditioned batches have narrow p(x|prompt) → low K (default 4).
-      The paper's own SOTA (XRAE on ImageNet) uses K=2; rich-text LoRA can
-      afford a few more candidates.
-    - Unconditional batches (caption dropped) match the WHOLE dataset → very
-      high multimodality → high K (default 5) so the empty-text branch learns
-      real modes instead of the blurry global mean (which is exactly what CFG
-      compensates for).
+    Adaptive K (empirical):
+    - Text-conditioned batches have narrow p(x|prompt) → exploration helps
+      (K_cond, default 4; the paper's XRAE SOTA uses K=2).
+    - Unconditional batches (caption dropped) have a single "average" mode,
+      so best-of-K mostly re-picks similar noises and brings little gain —
+      set K_uncond=1 to disable exploration (falls to the random-noise path).
     The selector reads batch["_caption_dropped"] (set by the trainer's caption
     dropout) to pick K_cond vs K_uncond per batch.
 
@@ -185,7 +203,7 @@ class ExplorativeNoiseSelector(NoiseSelector):
                     "xm/uncond": float(is_uncond),
                 }
                 self.last_log_line = (
-                    f"[XM] step={step} K=1 (warmup/decay) "
+                    f"[XM] step={step} K=1 "
                     f"mode={'uncond' if is_uncond else 'cond'} — random noise"
                 )
             return noises, sigmas, timesteps
@@ -248,9 +266,8 @@ class ExplorativeNoiseSelector(NoiseSelector):
                 "xm/loss_std": statistics.stdev(all_losses) if len(all_losses) > 1 else 0.0,
             }
             self.last_log_line = (
-                f"[XM] step={step} K={K} mode={'uncond' if is_uncond else 'cond'} "
-                f"min={best_loss:.4f} max={worst_loss:.4f} mean={mean_loss:.4f} "
-                f"gap={worst_loss - best_loss:.4f} best_k={best_k_idx}"
+                f"[XM] step={step} K={K} best_k={best_k_idx} "
+                f"gap={worst_loss - best_loss:.4f} min={best_loss:.4f}"
             )
 
         # ── Phase 2: Return winning noise (sigma unchanged) ──
@@ -335,7 +352,7 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
     (md/xm_improved_search.md §4/§5): the sigma range is split into
     ``num_buckets`` per-timestep buckets; each bucket independently tracks a
     ``global_min_loss`` baseline — the typical full-K best loss observed in that
-    bucket (dead-zone update). Within a round, candidates are sampled one by
+    bucket (EMA update). Within a round, candidates are sampled one by
     one; as soon as the running min loss reaches the bucket baseline
     (min-rule), exploration stops early.
 
@@ -366,10 +383,13 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
                 f"num_buckets must be >= 1, got {self.num_buckets}"
             )
         self.sigma_min: float = float(config.get("sigma_min", 1e-3))
-        self.dead_zone_delta: float = float(config.get("dead_zone_delta", 0.1))
+        self.ema_alpha: float = float(config.get("ema_alpha", 0.1))
+        if not (0.0 < self.ema_alpha <= 1.0):
+            raise ValueError(f"ema_alpha must be in (0, 1], got {self.ema_alpha}")
         self.init_k: int = int(config.get("init_k", 0))
         if self.init_k < 0:
             raise ValueError(f"init_k must be >= 0, got {self.init_k}")
+        self.combo_norm: bool = bool(config.get("combo_norm", False))
 
         # Per-bucket baselines: global_min_loss[b] = typical full-K best loss
         # observed in bucket b. 0.0 = uninitialized → first round always runs
@@ -377,13 +397,16 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
         self.global_min_loss: List[float] = [0.0] * self.num_buckets
         self.total_candidates: int = 0
         self.total_stopped_early: int = 0
+        # Per-combo raw-loss scale EMA (only populated when combo_norm is on).
+        self.combo_mu: Dict[str, float] = {}
 
         logger.info(
             f"ExplorativeImprovedNoiseSelector: K_cond={self.K_cond}, "
             f"K_uncond={self.K_uncond}, warmup={self.warmup_steps}, "
             f"schedule={self.schedule}, num_buckets={self.num_buckets}, "
             f"bucket_mode={self.bucket_mode}, sigma_min={self.sigma_min}, "
-            f"dead_zone_delta={self.dead_zone_delta}, init_k={self.init_k}"
+            f"ema_alpha={self.ema_alpha}, init_k={self.init_k}, "
+            f"combo_norm={self.combo_norm}"
         )
 
     # ── Bucket mapping ────────────────────────────────────────────────
@@ -443,7 +466,7 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
                     "xm/uncond": float(is_uncond),
                 }
                 self.last_log_line = (
-                    f"[XM-IMP] step={step} K=1 (warmup/decay) "
+                    f"[XM-IMP] step={step} K=1 "
                     f"mode={'uncond' if is_uncond else 'cond'} — random noise"
                 )
             return noises, sigmas, timesteps
@@ -462,6 +485,21 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
         # After adoption the baseline is non-zero → normal K for this bucket.
         loop_K = self.init_k if (g_b == 0 and self.init_k > 0) else K
         init_round = loop_K != K
+
+        # ── Combo identity + per-combo loss scale (combo_norm) ───────────
+        # loss ≈ mu[combo] × h[sigma] (md/xm_combo_normalization.md): the
+        # sigma baseline below tracks h on the NORMALIZED loss, so early-stop
+        # is comparable across training combinations.
+        combo_key = _combo_key_from_batch(batch) if self.combo_norm else ""
+        mu_pre = self.combo_mu.get(combo_key) if self.combo_norm else None
+
+        # Early-stop threshold (pre-round values). combo_norm scales the
+        # sigma baseline by the combo's loss scale; a combo's first round
+        # (mu unknown) has no threshold → full-K exploration to seed mu.
+        if self.combo_norm:
+            thresh = (mu_pre * g_b) if (mu_pre is not None and g_b > 0) else None
+        else:
+            thresh = g_b if g_b > 0 else None
 
         best_loss = float("inf")
         worst_loss = float("-inf")
@@ -503,12 +541,11 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
             if loss_val > worst_loss:
                 worst_loss = loss_val
 
-            # Min-rule early stop: stop once the running min reaches the
-            # bucket baseline. Conditions (md/xm_improved_search.md §4.3):
-            #   - at least 2 candidates observed (i >= 1)
-            #   - baseline initialized (g_b > 0)
-            #   - running min <= baseline (only a GOOD candidate triggers it)
-            if i >= 1 and g_b > 0 and best_loss <= g_b:
+            # Min-rule early stop: stop as soon as the running min reaches
+            # the (normalized) bucket baseline — no minimum-candidate floor.
+            #   - threshold available (baseline initialized; combo scale known)
+            #   - running min <= threshold (only a GOOD candidate triggers it)
+            if thresh is not None and best_loss <= thresh:
                 stopped_early = True
                 del pred_k, unpacked_k, input_k, noisy_k, noises_k
                 break
@@ -519,8 +556,33 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
         # ── Bookkeeping after the round ────────────────────────────────
         # i + 1 == number of candidates actually evaluated (full run: K).
         self.total_candidates += (i + 1)
-        if g_b == 0 or abs(best_loss - g_b) > self.dead_zone_delta * g_b:
-            self.global_min_loss[b] = best_loss
+        # Per-combo loss-scale EMA (raw loss) — absorbs combo difficulty when
+        # combo_norm is on (md/xm_combo_normalization.md).
+        if self.combo_norm:
+            if mu_pre is None:
+                # First round for this combo: adopt its best as the scale.
+                self.combo_mu[combo_key] = best_loss
+                mu_now = best_loss
+                l_norm = 1.0
+            else:
+                self.combo_mu[combo_key] = (
+                    (1.0 - self.ema_alpha) * mu_pre + self.ema_alpha * best_loss
+                )
+                mu_now = mu_pre
+                l_norm = best_loss / mu_pre
+        else:
+            mu_now = None
+            l_norm = best_loss
+        # EMA baseline update (no ratchet): g_b tracks the bucket's *typical*
+        # normalized best, not its historical minimum.
+        #   - first hit (g_b == 0): adopt l_norm directly.
+        #   - otherwise: g_b ← (1-α)·g_b + α·l_norm.
+        if g_b == 0:
+            self.global_min_loss[b] = l_norm
+        else:
+            self.global_min_loss[b] = (
+                (1.0 - self.ema_alpha) * g_b + self.ema_alpha * l_norm
+            )
         if stopped_early:
             self.total_stopped_early += 1
 
@@ -542,14 +604,24 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
                 "xm/stopped_early": 1.0 if stopped_early else 0.0,
                 "xm/init_round": 1.0 if init_round else 0.0,
             }
+            if self.combo_norm:
+                self.last_stats["xm/loss_norm"] = l_norm
+                self.last_stats["xm/combo_mu"] = mu_now
+                self.last_stats["xm/combo_id"] = (
+                    zlib.crc32(combo_key.encode("utf-8")) & 0x7FFFFFFF
+                )
+            # Terminal line stays minimal (K, best_k, gap, min, thr); the
+            # full breakdown lives in last_stats → wandb (loss/xm/*).
+            # thr = the raw-unit threshold min is compared against
+            # (combo_norm: mu[combo] × g_b; otherwise g_b). "-" = no
+            # comparison this round (init round or combo first round).
+            thr_str = f"{thresh:.4f}" if thresh is not None else "-"
             self.last_log_line = (
-                f"[XM-IMP] step={step} K={loop_K} "
-                f"mode={'uncond' if is_uncond else 'cond'} "
-                f"min={best_loss:.4f} max={worst_loss:.4f} mean={mean_loss:.4f} "
-                f"gap={worst_loss - best_loss:.4f} best_k={best_k_idx} "
-                f"bucket={b} stop={1 if stopped_early else 0} "
-                f"baseline={self.global_min_loss[b]:.4f} "
-                f"init={1 if init_round else 0}"
+                f"[XM-IMP] step={step} K={i + 1}/{loop_K} "
+                f"best_k={best_k_idx} "
+                f"gap={worst_loss - best_loss:.4f} min={best_loss:.4f} "
+                f"max={worst_loss:.4f} "
+                f"thr={thr_str}"
             )
 
         # ── Phase 2: Return winning noise (sigma unchanged) ──
@@ -560,10 +632,11 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
     def state_dict(self) -> dict:
         """Serializable selector state (baselines + counters) for checkpoints."""
         return {
-            "version": 1,
+            "version": 2,
             "global_min_loss": list(self.global_min_loss),
             "total_candidates": self.total_candidates,
             "total_stopped_early": self.total_stopped_early,
+            "combo_mu": dict(self.combo_mu),
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -603,6 +676,16 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
             )
         else:
             self.global_min_loss = [float(v) for v in state_list]
+
+        combo_mu = state.get("combo_mu", {})
+        if isinstance(combo_mu, dict):
+            self.combo_mu = {str(k): float(v) for k, v in combo_mu.items()}
+        else:
+            logger.warning(
+                "load_state_dict: 'combo_mu' is not a dict; "
+                "re-initializing combo scales to empty"
+            )
+            self.combo_mu = {}
 
 
 # ── Factory ──────────────────────────────────────────────────────────────

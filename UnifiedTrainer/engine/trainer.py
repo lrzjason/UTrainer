@@ -453,9 +453,9 @@ class Trainer:
             )
             return
 
-        import numpy as np
+        from UnifiedTrainer.data.embedding_cache import EmbeddingCache
         try:
-            npz = np.load(self._suffix_embed_path)
+            npz = EmbeddingCache.load(self._suffix_embed_path)
             suffix_pe = torch.from_numpy(npz["prompt_embed"])
             suffix_mask = torch.from_numpy(npz["prompt_embeds_mask"])
             if self.adapter is not None and hasattr(self.adapter, "suffix_embed"):
@@ -895,6 +895,10 @@ class Trainer:
                 "s/step": f"{_total:.1f}",
             }
             for lname, lval in self.last_loss_breakdown.items():
+                # xm/* exploration stats are noise for the bar — they are
+                # shown by the [XM-IMP] line and logged to wandb instead.
+                if lname.startswith("xm/"):
+                    continue
                 postfix[lname] = f"{lval:.4f}"
             pbar.set_postfix(postfix, refresh=False)
 
@@ -1375,6 +1379,18 @@ class Trainer:
 
         latents = batch.get("latents", {})
         latents = self._move_latents_to_device(latents, device)
+        # The npz cache stores latents as fp32; training re-casts them to the
+        # compute dtype on load.  Do the same here so the sampling loop and the
+        # VAE decode run in bf16 (fp32 latents would crash the bf16 VAE's conv
+        # bias add and slow the loop).
+        _first_param = next(self.transformer.parameters())
+        if _first_param.dtype in (torch.int8, torch.uint8,
+                                  torch.float8_e4m3fn, torch.float8_e5m2):
+            compute_dtype = torch.bfloat16
+        else:
+            compute_dtype = _first_param.dtype
+        if compute_dtype not in (torch.float32, torch.float64):
+            latents = self._move_latents_to_device(latents, device, compute_dtype)
         batch["latents"] = latents
 
         # ── Get ALL target latents (single or multi-target) ──
@@ -1748,8 +1764,8 @@ class Trainer:
                     f"not found at {self._val_empty_embed_path}. Skipping dropout."
                 )
                 return
-            import numpy as np
-            npz = np.load(self._val_empty_embed_path)
+            from UnifiedTrainer.data.embedding_cache import EmbeddingCache
+            npz = EmbeddingCache.load(self._val_empty_embed_path)
             self._train_empty_embed = {
                 "prompt_embed": npz["prompt_embed"],
                 "prompt_embeds_mask": npz["prompt_embeds_mask"],
@@ -1783,7 +1799,8 @@ class Trainer:
                     f"Empty embedding not found at {self._val_empty_embed_path}. "
                     f"Cannot use CFG (guidance_scale > 1) without unconditional embeddings."
                 )
-            npz = np.load(self._val_empty_embed_path)
+            from UnifiedTrainer.data.embedding_cache import EmbeddingCache
+            npz = EmbeddingCache.load(self._val_empty_embed_path)
             self._val_empty_embed = {
                 "prompt_embed": torch.from_numpy(npz["prompt_embed"]).to(
                     dtype=dtype, device=device

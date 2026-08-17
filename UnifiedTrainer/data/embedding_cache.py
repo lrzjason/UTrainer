@@ -39,7 +39,16 @@ class EmbeddingCache:
         data = np.load(str(path), allow_pickle=True)
         result = {}
         for key in data.files:
-            result[key] = data[key]
+            if key.endswith("_scale"):
+                continue
+            arr = data[key]
+            # Dequantize int8 -> fp32 when a matching per-tensor scale is present
+            # (see save(): float arrays are stored as int8 + scale). Old fp16
+            # caches load unchanged; the trainer casts to bf16 on load anyway.
+            if arr.dtype == np.int8 and (key + "_scale") in data.files:
+                scale = data[key + "_scale"]
+                arr = arr.astype(np.float32) * scale
+            result[key] = arr
         return result
 
     @staticmethod
@@ -65,19 +74,20 @@ class EmbeddingCache:
     def save(npz_path: str, embedding: dict) -> Path:
         """Save a caption embedding to .npz file.
 
-        Floating-point arrays are cast to float16 before saving to halve
-        disk usage (~50% reduction vs float32).  Text encoder outputs have
-        sufficient precision in fp16 for training — the trainer casts to
-        bf16 on load anyway.  Boolean arrays (masks) are preserved as-is.
+        Floating-point arrays are quantized **directly to int8** with a
+        per-tensor absmax scale (float32 -> int8), giving ~4x smaller disk
+        usage than float32. The trainer casts to bf16 on load anyway, and
+        text-encoder hidden states tolerate uniform 8-bit quantization for
+        conditioning. The per-tensor scale is stored alongside as ``<key>_scale``
+        and the loader dequantizes back to fp32. Boolean/int arrays are preserved.
 
-        Uses np.savez (uncompressed) — not savez_compressed — because fp16
-        float data is nearly incompressible (only ~7% gain) while compressed
-        writes are ~42x slower (337ms vs 8ms per 10MB file).
+        Uses np.savez (uncompressed) — not savez_compressed — because the
+        quantized int8 data is nearly incompressible while compressed writes
+        are dramatically slower.
         """
         path = Path(npz_path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Convert torch tensors to numpy, cast floats to fp16
         save_dict = {}
         for key, val in embedding.items():
             if isinstance(val, torch.Tensor):
@@ -86,10 +96,19 @@ class EmbeddingCache:
                 arr = val
             else:
                 arr = np.array(val)
-            # Cast float32/float64 → float16 for 50% disk reduction
-            if arr.dtype in (np.float32, np.float64):
-                arr = arr.astype(np.float16)
-            save_dict[key] = arr
+            # Quantize float32/float64 -> int8 directly (per-tensor absmax scale)
+            # for a ~4x disk reduction vs float32.
+            if arr.dtype in (np.float32, np.float64) and arr.size:
+                f = arr.astype(np.float32)
+                amax = float(np.max(np.abs(f)))
+                if amax == 0.0:
+                    amax = 1.0
+                scale = amax / 127.0
+                q = np.clip(np.round(f / scale), -127, 127).astype(np.int8)
+                save_dict[key] = q
+                save_dict[key + "_scale"] = np.float32(scale)
+            else:
+                save_dict[key] = arr
 
         np.savez(str(path), **save_dict)
         return path
