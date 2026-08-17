@@ -135,11 +135,38 @@ _H3_PATTERNS = [
     "*transformer_blocks.*.ff.net.2",
 ]
 
+# Flux2 Klein 4B (models/flux2_klein/transformer_flux2.py):
+# - double-stream blocks: Flux2Attention (to_q/to_k/to_v/to_out.0 + add_*_proj)
+#   and Flux2FeedForward (ff.linear_in/linear_out — NOT ff.net.*)
+# - single-stream blocks: Flux2ParallelSelfAttention with FUSED qkv+mlp
+#   (attn.to_qkv_mlp_proj) + attn.to_out
+# - patch embed / text embed / final proj: x_embedder / context_embedder / proj_out
+# Modulation (double_stream_modulation_*/single_stream_modulation .linear) and
+# norms are intentionally NOT targeted.
+_FLUX2_KLEIN_PATTERNS = [
+    "*transformer_blocks.*.attn.to_k",
+    "*transformer_blocks.*.attn.to_q",
+    "*transformer_blocks.*.attn.to_v",
+    "*transformer_blocks.*.attn.to_out.0",
+    "*transformer_blocks.*.attn.add_k_proj",
+    "*transformer_blocks.*.attn.add_q_proj",
+    "*transformer_blocks.*.attn.add_v_proj",
+    "*transformer_blocks.*.attn.to_add_out",
+    "*transformer_blocks.*.ff.linear_in",
+    "*transformer_blocks.*.ff.linear_out",
+    "*single_blocks.*.attn.to_qkv_mlp_proj",
+    "*single_blocks.*.attn.to_out",
+    "*x_embedder",
+    "*context_embedder",
+    "*proj_out",
+]
+
 _MODEL_PATTERNS = {
     # None → attach to ALL Linear modules (musubi-aligned: KREA2_TARGET_REPLACE_MODULES=None)
     "krea2": None,
     "qwen": _QWEN_PATTERNS,
     "flux": _FLUX_PATTERNS,
+    "flux2_klein": _FLUX2_KLEIN_PATTERNS,
     "minimax_h3": _H3_PATTERNS,
 }
 

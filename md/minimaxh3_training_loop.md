@@ -221,6 +221,7 @@ From `minimax_h3_train.json`:
 | `network_type` | `lokr` | LoKR on the frozen base (fall back to PEFT LoRA by removing this key) |
 | `lokr_model_type` / `lokr_target_modules` | `minimax_h3` / `null` | `_H3_PATTERNS`: `to_q, to_k, to_v, to_out.0, ff.net.0.proj, ff.net.2`; `null` = patterns |
 | `lokr_alpha` / `lokr_factor` | 1.0 / 4 | factorization scale `alpha/rank`, decomposition factor |
+| `lokr_full_rank` | `false` (default) | musubi-compatible full-rank LoKr: full-matrix W1/W2, rank/alpha overridden to the 9999 sentinel → scale = 1.0 (checkpoint alpha = 9999) |
 | `lora_rank` / `lora_alpha` | 8 / 8 | PEFT LoRA on the frozen base (when not using LoKR) |
 | `lora_target_modules` | `to_q, to_k, to_v, to_out, ff.net.0.proj, ff.net.2` | H3-pinned list; diffusers swiglu FFN names, not `ff.gate/up/down` |
 | `noise_selector` | explorative | `K_cond: 2, K_uncond: 5, warmup_steps: 0, schedule: constant, log_stats: true` |

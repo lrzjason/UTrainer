@@ -2,7 +2,7 @@
 
 设计见 md/03-hooks.md：
 - 允许：training.learning_rate、各 loss 权重 / 开关类、log/save 间隔；
-- 拒绝：batch_size、分辨率、lora_rank 等结构参数（返回明确错误，
+- 拒绝：batch_size、分辨率、lora_rank、lokr_full_rank 等结构参数（返回明确错误，
   提示需 suspend + 修改 + resume 重启）。
 
 本模块不 import torch，可在无 GPU / 无 torch 环境下使用与测试。
