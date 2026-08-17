@@ -764,6 +764,9 @@ def main():
             factor=training_cfg.get("lokr_factor", -1),
             model_type=training_cfg.get("lokr_model_type", "krea2"),
             target_modules=training_cfg.get("lokr_target_modules", None),
+            # musubi `lokr_full_rank: true` → full-matrix W1/W2, rank/alpha
+            # overridden to the 9999 sentinel inside LokrConfig (scale = 1.0).
+            full_rank=training_cfg.get("lokr_full_rank", False),
         )
 
         # Prepare for k-bit training if quantized (same as LoRA path)
@@ -777,7 +780,7 @@ def main():
         logger.info(
             f"LoKR applied (self-contained): rank={lokr_cfg.rank}, "
             f"alpha={lokr_cfg.alpha}, factor={lokr_cfg.factor}, "
-            f"model_type={lokr_cfg.model_type}, "
+            f"model_type={lokr_cfg.model_type}, full_rank={lokr_cfg.full_rank}, "
             f"modules={lycoris_net.num_modules}"
         )
 

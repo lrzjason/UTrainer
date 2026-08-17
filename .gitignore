@@ -223,3 +223,6 @@ start.sh
 wandb
 cache
 output
+
+ref
+inspect

@@ -31,6 +31,13 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+# musubi-tuner LoKr full-rank sentinel: its GUI translates `lokr_full_rank: true`
+# into network_dim / network_alpha = 9999 (checkpoint metadata: ss_network_dim=9999,
+# ss_network_alpha=9999.0). The huge dim forces the full-matrix W2 path
+# (lora_dim >= max(out_k, in_n)/2) and scale = alpha/dim = 1.0.
+# We reuse the same sentinel so checkpoints stay alpha-compatible with musubi.
+FULL_RANK_SENTINEL = 9999
+
 
 # ── Configuration ────────────────────────────────────────────────────────
 
@@ -47,6 +54,10 @@ class LokrConfig:
         target_modules: Override fnmatch patterns; None uses model_type defaults.
         multiplier: Global multiplier for adapter contribution.
         decompose_both: Also decompose W1 into w1_a @ w1_b (saves params).
+        full_rank: Force full-matrix W1 and W2 (musubi `lokr_full_rank: true`).
+        Disables both low-rank decompositions; scale becomes 1.0. Like musubi,
+        rank and alpha are overridden to FULL_RANK_SENTINEL (9999), so the
+        saved alpha buffer matches musubi full-rank checkpoints.
     """
 
     rank: int = 4
@@ -56,6 +67,15 @@ class LokrConfig:
     target_modules: Optional[List[str]] = None
     multiplier: float = 1.0
     decompose_both: bool = False
+    full_rank: bool = False
+
+    def __post_init__(self):
+        if self.full_rank:
+            # musubi-compatible full-rank mode: the configured rank/alpha are
+            # ignored, exactly like musubi's GUI overriding `linear`/`linear_alpha`
+            # with the 9999 sentinel when `lokr_full_rank` is checked.
+            self.rank = FULL_RANK_SENTINEL
+            self.alpha = float(FULL_RANK_SENTINEL)
 
 
 # ── Model-specific target patterns ───────────────────────────────────────
@@ -178,6 +198,7 @@ class LokrLayer(nn.Module):
         factor: int = -1,
         multiplier: float = 1.0,
         decompose_both: bool = False,
+        full_rank: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
@@ -191,7 +212,7 @@ class LokrLayer(nn.Module):
         # ── W1: "small" factor [out1, in1] ───────────────────────────
         # With factor=-1 (balanced) this is e.g. [64, 64] for 6144-dim layers;
         # with factor=4-8 it shrinks to [4, 4] or [8, 8].
-        if decompose_both and rank < max(self.out1, self.in1) / 2:
+        if not full_rank and decompose_both and rank < max(self.out1, self.in1) / 2:
             # Low-rank decomposition: W1 = w1_a @ w1_b
             self.lokr_w1_a = nn.Parameter(torch.empty(self.out1, rank))
             self.lokr_w1_b = nn.Parameter(torch.empty(rank, self.in1))
@@ -202,14 +223,15 @@ class LokrLayer(nn.Module):
 
         # ── W2: "large" factor [out2, in2] ───────────────────────────
         # This is the bigger matrix. Decompose if rank is small enough.
-        if rank < max(self.out2, self.in2) / 2:
-            # Low-rank: W2 = w2_a @ w2_b
+        # full_rank forces the full matrix (musubi `lokr_full_rank`), same as
+        # a huge rank satisfying rank >= max(out2, in2)/2.
+        if full_rank or rank >= max(self.out2, self.in2) / 2:
+            self.lokr_w2 = nn.Parameter(torch.empty(self.out2, self.in2))
+            self.use_w2 = True
+        else:
             self.lokr_w2_a = nn.Parameter(torch.empty(self.out2, rank))
             self.lokr_w2_b = nn.Parameter(torch.empty(rank, self.in2))
             self.use_w2 = False
-        else:
-            self.lokr_w2 = nn.Parameter(torch.empty(self.out2, self.in2))
-            self.use_w2 = True
 
         # Scale: alpha / rank (standard LoRA scaling).
         # musubi-aligned: full-matrix W2 mode forces alpha = rank -> scale = 1.0
@@ -344,6 +366,7 @@ class LokrNetwork(nn.Module):
                 factor=self.config.factor,
                 multiplier=self.config.multiplier,
                 decompose_both=self.config.decompose_both,
+                full_rank=self.config.full_rank,
             )
             # Sanitize name for ModuleDict (replace dots with underscores)
             safe_name = name.replace(".", "_")
@@ -359,7 +382,8 @@ class LokrNetwork(nn.Module):
         logger.info(
             f"LokrNetwork attached: {len(self.layers)} modules, "
             f"rank={self.config.rank}, alpha={self.config.alpha}, "
-            f"factor={self.config.factor}, model_type={self.config.model_type}"
+            f"factor={self.config.factor}, model_type={self.config.model_type}, "
+            f"full_rank={self.config.full_rank}"
         )
         return self
 
@@ -442,7 +466,8 @@ class LokrNetwork(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"modules={len(self.layers)}, rank={self.config.rank}, "
-            f"alpha={self.config.alpha}, factor={self.config.factor}"
+            f"alpha={self.config.alpha}, factor={self.config.factor}, "
+            f"full_rank={self.config.full_rank}"
         )
 
 
@@ -469,6 +494,7 @@ def apply_lokr(model: nn.Module, config: LokrConfig) -> LokrNetwork:
     logger.info(
         f"LoKR applied (self-contained): "
         f"modules={network.num_modules}, params={num_params:,}, "
-        f"rank={config.rank}, factor={config.factor}"
+        f"rank={config.rank}, factor={config.factor}, "
+        f"full_rank={config.full_rank}"
     )
     return network

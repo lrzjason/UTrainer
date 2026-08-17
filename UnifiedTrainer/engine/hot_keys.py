@@ -45,6 +45,7 @@ _REJECT_STRUCTURAL = {
     "training.gradient_accumulation_steps",
     "training.lora_rank",
     "training.lora_alpha",
+    "training.lokr_full_rank",
     "training.resolution",
     "training.optimizer",
     "training.weight_dtype",
