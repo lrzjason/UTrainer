@@ -267,6 +267,11 @@ behaviors injected by the adapter. Per batch:</p>
 <td>factorization scale <code>alpha/rank</code>, decomposition factor</td>
 </tr>
 <tr>
+<td><code>lokr_full_rank</code></td>
+<td><code>false</code> (default)</td>
+<td>musubi-compatible full-rank LoKr: full-matrix W1/W2, rank/alpha overridden to the 9999 sentinel → scale = 1.0 (checkpoint alpha = 9999)</td>
+</tr>
+<tr>
 <td><code>lora_rank</code> / <code>lora_alpha</code></td>
 <td>8 / 8</td>
 <td>PEFT LoRA on the frozen base (when not using LoKR)</td>

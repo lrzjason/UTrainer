@@ -393,7 +393,7 @@ hook_manager.maybe_run(step, trainer=trainer, config=config)
 
 - 白名单制（as-built，D12"默认拒绝"）：精确白名单 +
   `losses[i].weight/use_weighting/enabled` 正则放行；结构类（batch_size、分辨率、
-  lora_rank）与一切未知键拒绝并提示需 suspend+重启；
+  lora_rank、lokr_full_rank）与一切未知键拒绝并提示需 suspend+重启；
 - **拒绝语义（as-built，D12）**：部分拒绝时已放行键照常生效并写 task_config_kv，
   hook 标 done 且 result 含 rejected 段；全部被拒才标 failed；
 - **apply_live 热生效点（as-built）**：放行的键立即写入运行中 trainer 的对应对象

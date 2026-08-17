@@ -55,7 +55,7 @@ as-built 补充（KI-12/13/19，010 轮）：
 ## 热改白名单（engine/hot_keys.py）
 
 - 允许：`training.learning_rate`、各 loss 权重、`use_weighting` 等开关、log/save 间隔；
-- 拒绝：batch_size、分辨率、lora_rank 等结构参数（返回错误提示需 suspend+重启）。
+- 拒绝：batch_size、分辨率、lora_rank、lokr_full_rank 等结构参数（返回错误提示需 suspend+重启）。
 
 ## wandb 连续性
 

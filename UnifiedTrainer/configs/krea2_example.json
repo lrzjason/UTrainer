@@ -62,6 +62,7 @@
         "lora_rank": 64,
         "lokr_alpha": 1.0,
         "lokr_factor": -1,
+        "lokr_full_rank": false,
         "lokr_model_type": "krea2",
         "lokr_target_modules": null,
         "include_suffix": true,
