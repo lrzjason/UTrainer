@@ -612,6 +612,10 @@ class Krea2Adapter(BaseModelAdapter):
         }
 
     def decode_latent(self, vae: nn.Module, latent: torch.Tensor) -> Any:
+        # Cast to the VAE's dtype/device — cached latents arrive as fp32 while
+        # the validation VAE is bf16; a mismatch raises "Input type (float) and
+        # bias type (BFloat16) should be the same" in the conv bias add.
+        latent = latent.to(device=vae.device, dtype=vae.dtype)
         # Denormalize using T2ITrainer-calibrated constants (inverse of encode_image).
         latents_mean = torch.tensor(
             Krea2Adapter._T2I_LATENTS_MEAN, device=latent.device, dtype=latent.dtype

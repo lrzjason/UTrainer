@@ -358,10 +358,11 @@ def main():
     block_swap = config.get("training", {}).get("block_swap", 0)  # 0=disabled
     # offload_base_weights=true (default): BouncingOffloader keeps frozen torchao
     # base weights on CPU (pinned) and streams them H2D per forward/backward.
-    # Set false to keep the whole quantized model on GPU — avoids the H2D
-    # bottleneck entirely when VRAM is sufficient (~13GB for fp8 krea2) or when
-    # the host PCIe link is degraded (slow H2D makes offloaded steps 10-20x slower).
+    # offload_percent (default 1.0) = fraction of Linear layers to bounce to CPU
+    # (1.0 = all offloaded, 0.0 = none). Partial offload (< 1.0) keeps the rest
+    # of the weights on GPU, trading VRAM against H2D transfer time.
     offload_base_weights = config.get("training", {}).get("offload_base_weights", True)
+    offload_percent = float(config.get("training", {}).get("offload_percent", 1.0))
     offload_vae = config.get("training", {}).get("offload_vae", True)
     offload_text_encoder = config.get("training", {}).get("offload_text_encoder", True)
 
@@ -488,13 +489,16 @@ def main():
         if not os.path.exists(empty_embedding_path):
             return False, f"empty embedding missing ({adapter.name})"
 
-        # Spot-check: verify a few random datarows have both latent .pt
-        # AND embedding .npz files on disk.  Catches partial cache corruption.
+        # Cache file check: verify EVERY datarow has its latent .pt AND
+        # embedding .npz files on disk.  A 3-sample spot-check missed a
+        # partially-deleted cache (145 missing .npz), which crashed training
+        # mid-epoch with "encoder_hidden_states missing"; the full check is
+        # a few thousand os.path.exists calls, so it is cheap at startup and
+        # makes the incremental rebuild (missing files only) reliable.
         try:
             train_rows = cache_mgr.load_train_index()
             if train_rows:
-                _sample_rows = random.sample(train_rows, min(3, len(train_rows)))
-                for row in _sample_rows:
+                for row in train_rows:
                     jp = row.get("json_path", "")
                     if not jp or not os.path.exists(jp):
                         return False, f"per-sample JSON missing: {jp}"
@@ -854,7 +858,7 @@ def main():
     # saves ~6GB VRAM for torchao_float8 models.
     if quantize_mode.startswith("torchao_") and offload_base_weights:
         from UnifiedTrainer.utils.bouncing_offloader import BouncingOffloader
-        bouncing_offloader = BouncingOffloader(device)
+        bouncing_offloader = BouncingOffloader(device, offload_percent=offload_percent)
         unmanaged = bouncing_offloader.attach(transformer)
         bouncing_offloader.move_unmanaged_to_device(unmanaged)
         gc.collect()
@@ -1032,6 +1036,11 @@ def main():
     if trainer.accelerator is not None:
         device = trainer.accelerator.device
         trainer.device = device
+
+    # torch.compile the transformer (opt-in via training.compile: true).
+    # Must run AFTER accelerator.prepare and LoKR hook attachment so the
+    # compiled graph covers the final model. No-op when compile is false.
+    trainer.setup_compile()
 
     # Baseline VRAM before training loop
     if torch.cuda.is_available():
@@ -1508,7 +1517,7 @@ def main():
                                 wandb_log = {"val_loss": val_loss_val, "epoch": epoch}
                                 for name, val in val_result.get("val_loss_breakdown", {}).items():
                                     wandb_log[f"val_loss/{name}"] = val
-                                cb._wandb.log(wandb_log)
+                                cb._wandb.log(wandb_log, step=trainer.step)
                             # TensorBoard
                             if hasattr(cb, '_writer') and cb._writer:
                                 cb._writer.add_scalar("val/loss", val_loss_val, trainer.step)
