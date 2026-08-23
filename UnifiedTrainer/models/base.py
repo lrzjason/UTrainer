@@ -378,7 +378,8 @@ class BaseModelAdapter(ABC):
         Default: logit-normal distribution (sigma = sigmoid(N(0,1))).
         Config ``timestep_shift_mode: "sigma"`` switches to uniform sigma
         over [0.001, 1.0] via the shared :func:`sample_sigma_uniform` helper
-        (musubi-aligned; krea2 defaults to it, other adapters opt in).
+        (musubi-aligned; opt-in — krea2 defaults to its own "flow_shift"
+        mode, other adapters may opt in).
         Override per-model for custom distributions (e.g. Krea2 mu-shift).
 
         Args:

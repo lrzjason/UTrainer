@@ -122,9 +122,15 @@ class Krea2Adapter(BaseModelAdapter):
         self.suffix_mask: Optional[torch.Tensor] = None
 
         # Timestep shift mode for training-time sigma sampling:
+        #   "flow_shift"       — fixed-s logit-normal: σ = sigmoid(N(ln s, scale)),
+        #                        resolution-independent. Exactly reproduces musubi
+        #                        `--timestep_sampling shift --discrete_flow_shift s`
+        #                        (identity: sigmoid(z + ln s) ≡ s·t/(1+(s−1)·t)).
+        #                        DEFAULT (s = self.flow_shift, default 2.5 = the
+        #                        musubi krea2 docs recommended value @1024²).
         #   "sigma"            — uniform σ ∈ [0.001, 1] (musubi timestep_sampling=
         #                        sigma recipe: u ~ U[0,1), t = floor(u*1000)+1,
-        #                        σ = t/1000). DEFAULT — musubi-aligned.
+        #                        σ = t/1000) — musubi parser bare default.
         #   "comfy_fixed"      — logit-normal μ=1.15 at every resolution, exactly
         #                        matching ComfyUI inference (supported_models.py
         #                        Krea2 sampling_settings shift=1.15).
@@ -133,11 +139,15 @@ class Krea2Adapter(BaseModelAdapter):
         #                        pretraining distribution (ai-toolkit /
         #                        T2ITrainer convention).
         # All cover sigma ∈ (0,1]; only the sampling density differs.
-        self.timestep_shift_mode: str = config.get("timestep_shift_mode", "sigma")
-        if self.timestep_shift_mode not in ("sigma", "comfy_fixed", "pretrain_dynamic"):
+        self.timestep_shift_mode: str = config.get("timestep_shift_mode", "flow_shift")
+        # musubi `--discrete_flow_shift` (s above) and `--sigmoid_scale`
+        # (logit-normal std; 1.0 in all musubi krea2 examples).
+        self.flow_shift: float = float(config.get("flow_shift", 2.5))
+        self.sigmoid_scale: float = float(config.get("sigmoid_scale", 1.0))
+        if self.timestep_shift_mode not in ("sigma", "comfy_fixed", "pretrain_dynamic", "flow_shift"):
             raise ValueError(
                 f"Unknown timestep_shift_mode '{self.timestep_shift_mode}'. "
-                "Expected 'sigma', 'comfy_fixed' or 'pretrain_dynamic'."
+                "Expected 'sigma', 'comfy_fixed', 'pretrain_dynamic' or 'flow_shift'."
             )
 
         # Target grid dimensions cached from prepare_model_input — used by unpack_prediction.
@@ -868,9 +878,12 @@ class Krea2Adapter(BaseModelAdapter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample timesteps for flow-matching, honoring timestep_shift_mode.
 
+        - "flow_shift": fixed-s logit-normal σ = sigmoid(N(ln s, sigmoid_scale)),
+          resolution-independent — musubi `--timestep_sampling shift
+          --discrete_flow_shift s` recipe. DEFAULT (s = self.flow_shift = 2.5).
         - "sigma": uniform σ ∈ [0.001, 1] — the musubi timestep_sampling=sigma
           recipe (u ~ U[0,1), integer timestep = floor(u*1000)+1 ∈ [1, 1000], σ = t/1000).
-          Resolution-independent; DEFAULT.
+          Resolution-independent.
         - "comfy_fixed": logit-normal σ = sigmoid(N(1.15, 1)) at every resolution.
         - "pretrain_dynamic": logit-normal with mu interpolated 0.5→1.15 over
           256→6400 image tokens (pretraining distribution).
@@ -880,9 +893,9 @@ class Krea2Adapter(BaseModelAdapter):
         """
         n = self.KREA2_SCHEDULER_CONFIG["num_train_timesteps"]
 
-        # Uniform σ ∈ [0.001, 1] — musubi-aligned (resolution-independent).
+        # Uniform σ ∈ [0.001, 1] — musubi sigma-mode recipe (resolution-independent).
         # Shared helper in models/base.py; other adapters honor the same
-        # timestep_shift_mode config key (opt-in there, default here).
+        # timestep_shift_mode config key (opt-in there).
         if self.timestep_shift_mode == "sigma":
             return sample_sigma_uniform(
                 batch_size,
@@ -890,6 +903,15 @@ class Krea2Adapter(BaseModelAdapter):
                 dtype,
                 num_timesteps=self.KREA2_SCHEDULER_CONFIG["num_train_timesteps"],
             )
+
+        # Fixed-s shift — musubi `shift` recipe, resolution-independent (needs no
+        # latent dims). By the identity sigmoid(z + ln s) ≡ s·t/(1+(s−1)·t), this
+        # equals musubi's "sigmoid(N(0,1)) then Möbius-shift by s" transform.
+        if self.timestep_shift_mode == "flow_shift":
+            mu = math.log(self.flow_shift)
+            u = torch.normal(mean=mu, std=self.sigmoid_scale, size=(batch_size,), device=device)
+            sigmas = torch.sigmoid(u).clamp(1e-5, 1.0 - 1e-5).to(dtype=dtype)
+            return sigmas * n, sigmas
 
         if latent_height is None or latent_width is None:
             # Fallback to base logit-normal (mu=0) if no shape info available
@@ -906,8 +928,8 @@ class Krea2Adapter(BaseModelAdapter):
         else:
             mu = self._krea2_calculate_shift(image_seq_len)
 
-        # Logit-normal: u ~ N(mu, 1), sigma = sigmoid(u)
-        u = torch.normal(mean=mu, std=1.0, size=(batch_size,), device=device)
+        # Logit-normal: u ~ N(mu, sigmoid_scale), sigma = sigmoid(u)
+        u = torch.normal(mean=mu, std=self.sigmoid_scale, size=(batch_size,), device=device)
         sigmas = torch.sigmoid(u).clamp(1e-5, 1.0 - 1e-5).to(dtype=dtype)
         selected_timesteps = sigmas * n
 
@@ -930,11 +952,23 @@ class Krea2Adapter(BaseModelAdapter):
         """
         embeddings = batch.get("embeddings")
         if not embeddings:
+            logger.error(
+                "[embed-cache][train] batch has NO 'embeddings' — encoder_hidden_states will be None. "
+                "This usually means the per-sample caption was not cached (empty captions dict or a "
+                "missing text source). Check cache_builder output for '[embed-cache][build] ... SKIP' "
+                "lines. batch keys: %s", list(batch.keys()),
+            )
             return None
 
         prompt_embeds = []
         for emb in embeddings:
             if emb is None:
+                logger.error(
+                    "[embed-cache][train] one embedding in the batch is None "
+                    "(caption embedding not cached) — encoder_hidden_states will be None. "
+                    "Triggered by the batch_config: %s. Check the per-sample json captions.",
+                    batch.get("batch_configs"),
+                )
                 return None
             pe = emb["prompt_embed"] if isinstance(emb, dict) else emb
             if isinstance(pe, np.ndarray):

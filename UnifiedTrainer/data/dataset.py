@@ -274,16 +274,40 @@ class UnifiedDataset(Dataset):
 
         # Load caption embedding
         embedding = None
+        npz_path = ""  # init: may stay "" when captions dict is empty
         captions = sample.get("captions", {})
         if caption_key and caption_key in captions:
             npz_path = captions[caption_key].get("npz_path")
             if npz_path:
                 embedding = self.embedding_cache.load(npz_path)
+            elif logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"[embed-cache] sample={os.path.basename(json_path)} "
+                    f"caption_key={caption_key!r} HAS entry but npz_path is empty"
+                )
         elif captions:
             first_caption = next(iter(captions.values()))
             npz_path = first_caption.get("npz_path")
             if npz_path:
                 embedding = self.embedding_cache.load(npz_path)
+        else:
+            logger.warning(
+                f"[embed-cache] sample={os.path.basename(json_path)} "
+                f"caption_key={caption_key!r} has NO captions dict at all "
+                f"-> embedding will be None (encoder_hidden_states / val reuse will fail). "
+                f"Cached JSON found at: {json_path}"
+            )
+
+        # Surface a None embedding with the concrete npz path, so a missing /
+        # corrupt cached text embedding is immediately identifiable (was a
+        # silent None that showed up only as "Krea2 requires encoder_hidden_states").
+        if embedding is None:
+            src = npz_path if npz_path else "<no npz_path>"
+            logger.warning(
+                f"[embed-cache] sample={os.path.basename(json_path)} "
+                f"caption_key={caption_key!r} embedding is None (npz_path={src}). "
+                f"json_path={json_path}. Check the caption was encoded (source text exists)."
+            )
 
         # Apply reference_dropout — per-sample only when batches are size 1.
         # With batch_size > 1, dropping refs for one sample desyncs the batch
@@ -301,6 +325,24 @@ class UnifiedDataset(Dataset):
             )
 
 
+        # Collect caption source file paths (for val-image-gen to copy the
+        # caption file). The path follows the caption_config extension
+        # (.txt / .tags / .i2cf ...), so it is not hardcoded to .txt.
+        # Only expose paths we can also resolve statically; the primary caption
+        # (resolved caption_key, else the first) is what matters for val gen.
+        caption_text_paths = []
+        if captions:
+            for ck in (caption_key and [caption_key] or list(captions.keys())):
+                tp = captions.get(ck, {}).get("text_path")
+                if tp:
+                    caption_text_paths.append(tp)
+            if not caption_text_paths:
+                for ck, cdata in captions.items():
+                    tp = cdata.get("text_path")
+                    if tp:
+                        caption_text_paths.append(tp)
+                        break
+
         return {
             "group_id": os.path.splitext(os.path.basename(json_path))[0],
             "latents": latents,
@@ -314,6 +356,7 @@ class UnifiedDataset(Dataset):
             },
             "image_configs": sample.get("image_configs", {}),
             "bucket": sample.get("bucket", datarow.get("bucket", "")),
+            "caption_text_paths": caption_text_paths,
         }
 
 
@@ -335,6 +378,7 @@ def collate_fn(batch: list) -> dict:
         "image_configs": [b["image_configs"] for b in batch],
         "buckets": [b["bucket"] for b in batch],
         "batch_configs": [b["batch_config"] for b in batch],
+        "caption_text_paths": [b.get("caption_text_paths", []) for b in batch],
     }
 
     # Stack latents by role

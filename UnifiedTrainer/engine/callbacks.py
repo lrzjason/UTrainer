@@ -67,7 +67,8 @@ class WandBCallback(Callback):
     Logs:
        - Per-step: loss, learning_rate
        - Per-epoch: epoch_loss
-       - Per-checkpoint: artifact upload
+       - Per-checkpoint: step marker only — model files (.safetensors) are
+         NEVER uploaded to wandb storage (storage policy quota)
        - On train end: finish run
 
     Config:
@@ -106,6 +107,21 @@ class WandBCallback(Callback):
 
     def on_train_start(self, trainer: Any) -> None:
         self._init_wandb()
+        if self._wandb:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_name = torch.cuda.get_device_name(0)
+                    gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                    self._wandb.log({
+                        "system/gpu_name": gpu_name,
+                        "system/gpu_total_gb": gpu_total_gb,
+                        "system/vram_allocated_gb": torch.cuda.memory_allocated() / 1024**3,
+                        "system/vram_reserved_gb": torch.cuda.memory_reserved() / 1024**3,
+                        "system/vram_peak_gb": torch.cuda.max_memory_allocated() / 1024**3,
+                    }, step=0)
+            except Exception:
+                pass
 
     def on_step_end(self, step: int, loss: float, trainer: Any) -> None:
         if self._wandb:
@@ -118,6 +134,15 @@ class WandBCallback(Callback):
             breakdown = getattr(trainer, "last_loss_breakdown", {})
             for loss_name, loss_val in breakdown.items():
                 log_dict[f"loss/{loss_name}"] = loss_val
+            # Log GPU VRAM usage (allocated / reserved / peak) per step.
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    log_dict["system/vram_allocated_gb"] = torch.cuda.memory_allocated() / 1024**3
+                    log_dict["system/vram_reserved_gb"] = torch.cuda.memory_reserved() / 1024**3
+                    log_dict["system/vram_peak_gb"] = torch.cuda.max_memory_allocated() / 1024**3
+            except Exception:
+                pass
             self._wandb.log(log_dict, step=step)
 
     def on_epoch_end(self, epoch: int, avg_loss: float, trainer: Any) -> None:
@@ -125,15 +150,27 @@ class WandBCallback(Callback):
             self._wandb.log({"epoch_loss": avg_loss, "epoch": epoch}, step=getattr(trainer, "step", 0))
 
     def on_checkpoint(self, step: int, path: str, trainer: Any) -> None:
+        """Record a checkpoint marker in wandb WITHOUT uploading the model file.
+
+        The .safetensors checkpoint stays local-only: uploading it as a wandb
+        Artifact would count against the project's storage quota (wandb
+        enforced storage policy), so we log a lightweight scalar marker
+        instead. The file path itself is never sent.
+        """
         if self._wandb:
-            artifact = self._wandb.Artifact(
-                name=f"checkpoint-{step}", type="model"
-            )
-            artifact.add_file(path)
-            self._wandb.log_artifact(artifact)
+            self._wandb.log({"checkpoint/step": step}, step=step)
 
     def on_train_end(self, trainer: Any) -> None:
         if self._wandb:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self._wandb.log({
+                        "system/vram_final_allocated_gb": torch.cuda.memory_allocated() / 1024**3,
+                        "system/vram_peak_gb": torch.cuda.max_memory_allocated() / 1024**3,
+                    }, step=getattr(trainer, "step", 0))
+            except Exception:
+                pass
             self._wandb.finish()
 
 

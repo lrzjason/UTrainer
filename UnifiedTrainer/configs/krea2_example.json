@@ -10,7 +10,8 @@
 
     "reference_conditioning": false,
     "multimodal_reference": false,
-    "timestep_shift_mode": "sigma",
+    "timestep_shift_mode": "flow_shift",
+    "flow_shift": 2.5,
 
     "data": {
         "cache_dir": "cache/krea2_example_cache",

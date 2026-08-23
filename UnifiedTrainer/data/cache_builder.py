@@ -317,8 +317,15 @@ class CacheBuilder:
             return True
         if img_cfg.suffix.lower() == ext:
             return True
-        base = os.path.splitext(filename)[0]
-        return find_index_from_right(base, img_cfg.suffix) > 0
+        # Suffix must be a whole "_{suffix}." token (marker followed by the
+        # extension separator). This prevents "_d" from matching inside "_dc" —
+        # rfind("_d") matches the `_d` prefix of `_dc`, mis-bucketing DC images
+        # into the D pool and so mis-naming cap_d_inst npz as *_dc_cap_d_inst.npz.
+        # Matching exactly "_{suffix}." (e.g. "_d." vs "_dc.") makes the boundary
+        # precise. Suffix already carries its leading underscore (e.g. "_d"),
+        # so we test "<suffix>." directly. Variants _t/_d/_cf/_f1/_f2/_dc all
+        # match their own "_X." form.
+        return f"{img_cfg.suffix}." in filename
 
     def _construct_image_pairs(self) -> List[dict]:
         """Scan the dataset directory and construct image pairs by base name.
@@ -739,6 +746,24 @@ class CacheBuilder:
             "npz_path": npz_path,
             "content": content,
         }
+
+        # Build-time diagnostic: surface exactly which (caption_key -> npz_path)
+        # is being (or NOT being) encoded.  A missing source text / empty content
+        # here is the root cause of the later "Krea2 requires encoder_hidden_states"
+        # error, so log it plainly (filename + reason).
+        _src_exists = os.path.exists(text_path)
+        _log = logger.info
+        _missing = not _src_exists or not content
+        if _missing:
+            _log = logger.warning
+        _log(
+            f"[embed-cache][build] sample={os.path.basename(pair.get('mapping_key') or filename)} "
+            f"cap_key={cap_key!r} npz={os.path.basename(npz_path)} "
+            f"text={os.path.basename(text_path) if text_path else '<none>'} "
+            f"text_exists={_src_exists} content_len={len(content)} "
+            f"-> {'ENCODE' if (text_encoder is not None and tokenizer is not None and content) else 'SKIP'} "
+            f"({'missing/empty source text' if _missing else 'ok'})"
+        )
 
         # Encode with text encoder if available
         force_reencode = recreate or recreate_embeddings

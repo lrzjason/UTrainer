@@ -416,8 +416,22 @@ class Trainer:
 
         # Prepare LyCORIS network separately (owns adapter params for LoKR)
         if self.lycoris_net is not None:
+            # DIAG: transformer param devices BEFORE lycoris prepare
+            try:
+                _g0 = sum(p.numel()*p.element_size() for p in self.transformer.parameters() if p.is_cuda)/1024**3
+                _c0 = sum(p.numel()*p.element_size() for p in self.transformer.parameters() if not p.is_cuda)/1024**3
+                logger.info(f"[DIAG-PREP] before lycoris prepare: transformer GPU={_g0:.2f}GB CPU={_c0:.2f}GB")
+            except Exception as _e:
+                logger.warning(f"[DIAG-PREP] before failed: {_e}")
             self.lycoris_net = self.accelerator.prepare(self.lycoris_net)
             logger.info("Accelerator: lycoris_net prepared")
+            # DIAG: AFTER lycoris prepare
+            try:
+                _g1 = sum(p.numel()*p.element_size() for p in self.transformer.parameters() if p.is_cuda)/1024**3
+                _c1 = sum(p.numel()*p.element_size() for p in self.transformer.parameters() if not p.is_cuda)/1024**3
+                logger.info(f"[DIAG-PREP] after lycoris prepare: transformer GPU={_g1:.2f}GB CPU={_c1:.2f}GB")
+            except Exception as _e:
+                logger.warning(f"[DIAG-PREP] after failed: {_e}")
 
     def _get_base_model(self) -> nn.Module:
         """Unwrap PEFT / Accelerate layers to reach the raw diffusers model.
@@ -618,6 +632,23 @@ class Trainer:
                 self.step, pre_forward_fn=_pre_forward,
             )
             sigmas_b = sigmas.view(-1, *(1,) * (target_latents[0].ndim - 1)) if target_latents[0].ndim >= 2 else sigmas
+
+            # ── DIAG: after noise-selector exploration (K forwards) ──
+            try:
+                if not getattr(self, "_diag_after_xm", False) and torch.cuda.is_available():
+                    self._diag_after_xm = True
+                    _alloc = torch.cuda.memory_allocated() / 1024**3
+                    _resv = torch.cuda.memory_reserved() / 1024**3
+                    _peak = torch.cuda.max_memory_allocated() / 1024**3
+                    # base params on GPU?
+                    _gpu = sum(p.numel() * p.element_size() for p in self.transformer.parameters() if p.is_cuda) / 1024**3
+                    _cpu = sum(p.numel() * p.element_size() for p in self.transformer.parameters() if not p.is_cuda) / 1024**3
+                    logger.info(
+                        f"[DIAG-AFTER-XM] alloc={_alloc:.2f}G resv={_resv:.2f}G peak={_peak:.2f}G "
+                        f"transformer GPU={_gpu:.2f}GB CPU={_cpu:.2f}GB"
+                    )
+            except Exception as _e2:
+                logger.warning(f"[DIAG-AFTER-XM] failed: {_e2}")
 
             # ── Flow matching interpolation ──────────────────────────
             # One noisy latent per target.
@@ -856,6 +887,38 @@ class Trainer:
                     f"groups={_step_group_ids} "
                     f"vram={_vram_alloc:.1f}G_alloc/{_vram_reserved:.1f}G_reserved"
                 )
+                # ── DIAG: one-shot CUDA memory breakdown (first logged step) ──
+                if not getattr(self, "_diag_dumped", False) and torch.cuda.is_available():
+                    try:
+                        self._diag_dumped = True
+                        st = torch.cuda.memory_stats()
+                        logger.info(
+                            f"[DIAG-CUDA] alloc={_vram_alloc:.1f}G reserved={_vram_reserved:.1f}G "
+                            f"segments={st.get('num_allocated_segments', '?')} "
+                            f"reserved_blocks={st.get('number_of_cuda_malloc_calls', '?')} "
+                            f"large_4M={st.get('large_allocated_blocks', '?')}"
+                        )
+                        # param device 统计（关键：base weights 在 GPU 还是 CPU）
+                        gpu_bytes = 0; cpu_bytes = 0
+                        for m_name, m in [("transformer", self.transformer)]:
+                            for p in m.parameters():
+                                if p.is_cuda:
+                                    gpu_bytes += p.numel() * p.element_size()
+                                else:
+                                    cpu_bytes += p.numel() * p.element_size()
+                        lyr_gpu = 0; lyr_cpu = 0
+                        if self.lycoris_net is not None:
+                            for p in self.lycoris_net.parameters():
+                                if p.is_cuda:
+                                    lyr_gpu += p.numel() * p.element_size()
+                                else:
+                                    lyr_cpu += p.numel() * p.element_size()
+                        logger.info(
+                            f"[DIAG-PARAM] transformer GPU={gpu_bytes/1024**3:.2f}GB CPU={cpu_bytes/1024**3:.2f}GB | "
+                            f"lycoris GPU={lyr_gpu/1024**3:.2f}GB CPU={lyr_cpu/1024**3:.2f}GB"
+                        )
+                    except Exception as _de:
+                        logger.warning(f"[DIAG] failed: {_de}")
 
             # Step counting: with accelerator, only increment on sync.
             # Progress bar advances only on effective (optimizer) steps.
@@ -1251,6 +1314,13 @@ class Trainer:
                                 # Video artifacts are mp4 path strings (or lists
                                 # of them) produced by decode_validation_video;
                                 # images are PIL objects saved as .png.
+                                # Determine target-reference size (for aligning
+                                # the generated output resolution to it).
+                                _target_size = None
+                                for _rp in ref_pils:
+                                    if _rp is not None and hasattr(_rp, "size"):
+                                        _target_size = _rp.size
+                                        break
                                 for ti, gen_pil in enumerate(gen_pils):
                                     if isinstance(gen_pil, str):
                                         saved_paths.append(gen_pil)
@@ -1269,6 +1339,13 @@ class Trainer:
                                         img_output_dir,
                                         f"{self.save_name}_val_epoch{epoch}_{sample_idx}{suffix}.png",
                                     )
+                                    # Align generated resolution to the target
+                                    # reference image size (if they differ).
+                                    if _target_size is not None and gen_pil.size != _target_size:
+                                        gen_pil = gen_pil.resize(_target_size)
+                                        logger.info(
+                                            f"Resized val gen {ti} to target size {_target_size}"
+                                        )
                                     gen_pil.save(gen_path)
                                     saved_paths.append(gen_path)
                                     logger.info(f"Saved validation image: {gen_path}")
@@ -1293,6 +1370,31 @@ class Trainer:
                                             )
                                             ref_cond_pil.save(ref_path)
                                             logger.info(f"Saved reference image: {ref_path}")
+
+                                # Copy the source caption file next to the val
+                                # image (if available in the batch). The source
+                                # path follows the caption_config ext (could be
+                                # .txt / .tags / .i2cf ...), so preserve it.
+                                try:
+                                    _caption_paths = batch.get("caption_text_paths") or []
+                                    _cap_path = None
+                                    if isinstance(_caption_paths, list):
+                                        if _caption_paths and isinstance(_caption_paths[0], list):
+                                            # collated: one list per batch item
+                                            _cap_path = _caption_paths[sub_idx][0] if _caption_paths[sub_idx] else None
+                                        else:
+                                            _cap_path = _caption_paths[0] if _caption_paths else None
+                                    if _cap_path and os.path.isfile(_cap_path):
+                                        import shutil
+                                        _cap_ext = os.path.splitext(_cap_path)[1] or ".txt"
+                                        _cp_txt = os.path.join(
+                                            img_output_dir,
+                                            f"{self.save_name}_val_epoch{epoch}_{sample_idx}_caption{_cap_ext}",
+                                        )
+                                        shutil.copy2(_cap_path, _cp_txt)
+                                        logger.info(f"Saved caption file: {_cp_txt}")
+                                except Exception as _e:
+                                    logger.warning(f"Failed to copy caption file: {_e}")
                         except Exception as e:
                             logger.warning(
                                 f"Image generation failed for sample {sample_idx}: {e}"

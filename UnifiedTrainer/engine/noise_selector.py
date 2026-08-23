@@ -6,37 +6,64 @@ The training loop delegates noise and sigma sampling to a NoiseSelector:
 Default: RandomNoiseSelector (standard random sampling, zero overhead).
 Explorative: ExplorativeNoiseSelector (best-of-K noise exploration with
 stop-gradient forwards — VRAM identical to standard training).
-Explorative Improved: ExplorativeImprovedNoiseSelector (best-of-K noise
-exploration with per-sigma-bucket ``global_min_loss`` baselines and min-rule
-early stopping — see md/xm_improved_search.md §4/§5).
+XMS: ExplorativeSequentialNoiseSelector (type "explorative_sequential";
+best-of-K with within-round sequential early stopping — TARGET/EI/streak
+rules. ALL stopping evidence is computed from candidates observed in the
+current round; the only cross-round state is per-sigma-bucket sigma_hat
+(EWMA of within-round candidate-loss std) plus visit counts).
 
 Config:
     "training": {
         "noise_selector": {
-            "type": "explorative_improved", // "random" (default) | "explorative" | "explorative_improved"
+            "type": "explorative",  // "random" (default) | "explorative"
             "K_cond": 4,             // noise candidates for text-conditioned batches
             "K_uncond": 1,           // caption-dropped (uncond) batches: no exploration (empirically little gain)
             "warmup_steps": 0,       // K=1 for first N steps (0 = explore from step 1)
             "schedule": "constant",  // "constant" | "linear_decay" | "cosine"
             "log_stats": true,       // expose xm/* stats to callbacks
-            "num_buckets": 20,       // per-sigma-bucket count for global_min_loss baselines
-            "bucket_mode": "log",    // "linear" | "log" sigma bucketing
-            "sigma_min": 0.001,      // sigma floor for the log bucket mapping
-            "ema_alpha": 0.1,        // EMA smoothing for per-bucket baseline: g_b ← (1-α)·g_b + α·L_min
-            "init_k": 0,             // first-hit candidate budget for uninitialized buckets (0 = disabled; e.g. 100 when K=10)
-            "combo_norm": false,     // normalize loss by per-combo scale before the sigma baseline (md/xm_combo_normalization.md)
         }
     }
 
-Reference: md/explorative_implementation.md, md/xm_improved_implementation.md
+    // XMS: sequential best-of-K with within-round early stopping
+    "training": {
+        "noise_selector": {
+            "type": "explorative_sequential",
+            "K_cond": 4,             // candidates per text-conditioned batch
+            "K_uncond": 4,           // candidates per caption-dropped batch
+            "warmup_steps": 0,       // K=1 for first N steps
+            "schedule": "constant",  // "constant" | "linear_decay" | "cosine"
+            "log_stats": true,
+            "stop_rule": "target",   // "target" | "ei" | "streak" | "none"
+            "gamma": 0.8,            // target rule: stop when mu_hat - best >= gamma * alpha(K) * sigma_eff
+            "kappa": 0.05,           // ei rule: stop when EI of one more draw < kappa * sigma_eff
+            "streak_s": 3,           // streak rule: consecutive candidates failing to improve best
+            "m_min": 2,              // min candidates observed before any stop check
+            "p_raw": 0.15,           // prob. to reinject a purely random candidate (anti-degeneracy)
+            "sigma_floor_frac": 0.001,  // sigma_eff floor as fraction of |mu_hat|
+                                        // (keep small: high-loss rounds inflate the
+                                        // threshold and force full exploration)
+            "sigma_ewma": 0.01,      // EWMA alpha for sigma_hat (0 < alpha <= 1)
+            "sigma_mix": 0.5,        // blend cross-round sigma_hat with within-round stdev:
+                                     // 1.0 = pure cross-round, 0.0 = pure within-round,
+                                     // 0.5 = hybrid (tight rounds stop early, tail kept)
+            "mu_estimator": "loo",   // "loo" (exclude incumbent, winner's-curse guard) | "mean"
+            "per_sample_winner": false,  // B>1: each sample takes its own best candidate's noise
+            "num_buckets": 20,       // log-scaled sigma buckets
+            "sigma_min": 0.001,      // sigma floor for bucket mapping
+        }
+    }
+
+Reference: md/explorative_implementation.md; XMS design:
+.tmp/ref_xms/xm_exploration_research.md
 """
 from __future__ import annotations
 
 import logging
 import math
-import zlib
+import random
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional
+from statistics import NormalDist, stdev
+from typing import Any, Callable, List, Optional
 
 import torch
 import torch.nn as nn
@@ -45,22 +72,56 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
-def _combo_key_from_batch(batch: dict) -> str:
-    """Canonical training-combination id from the batch's resolved batch_config.
+# ── XMS math helpers ──────────────────────────────────────────────────────
 
-    One batch_config == one combo (target × caption × reference). Missing
-    fields fall back to "?" / "none" so keys stay stable across samples.
-    Used by the improved selector's per-combo loss-scale normalization
-    (md/xm_combo_normalization.md).
+
+_NDIST = NormalDist()
+_ALPHA_CACHE: dict = {}
+
+
+def alpha_of_m(m: int) -> float:
+    """alpha_m = -E[min of m iid N(0,1)] (expected best-of-m gain, in sigma units).
+
+    E[min of m] = m * int_0^1 Phi^-1(u) (1-u)^(m-1) du; alpha_m = -that.
+    Values: 1->0, 2->0.564, 3->0.846, 5->1.163, 10->1.539, 20->1.867, 50->2.249.
+    Asymptotic ~ sqrt(2 ln m) (Hall 1979).
     """
-    bc_list = batch.get("batch_configs", []) if isinstance(batch, dict) else []
-    bc = bc_list[0] if bc_list else None
-    if isinstance(bc, dict):
-        target = bc.get("target_config", "?")
-        caption = bc.get("caption_config", "?")
-        reference = bc.get("reference_config") or "none"
-        return f"{target}|{caption}|{reference}"
-    return "__unknown__"
+    m = int(m)
+    if m <= 1:
+        return 0.0
+    if m in _ALPHA_CACHE:
+        return _ALPHA_CACHE[m]
+    n = 20000
+    acc = 0.0
+    for i in range(n):
+        u = (i + 0.5) / n
+        acc += _NDIST.inv_cdf(u) * (1.0 - u) ** (m - 1)
+    val = -(m * acc / n)
+    _ALPHA_CACHE[m] = val
+    return val
+
+
+def _pdf(z: float) -> float:
+    return math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+
+
+def _cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def ei_one_draw(best: float, mu: float, sig: float) -> float:
+    """E[(best - X)^+] for X~N(mu, sig^2) = sig * (z*Phi(z) + phi(z)), z=(best-mu)/sig.
+
+    Closed form of the expected improvement of evaluating one more candidate
+    against the incumbent best. Sanity: z=0 -> 0.399*sig; z=-1 -> 0.083*sig;
+    z=-3 -> 0.0013*sig. Guard: z < -8 (deep tail) -> 0; sig <= 0 -> 0.
+    """
+    if sig <= 0.0:
+        return 0.0
+    z = (best - mu) / sig
+    if z < -8.0:
+        return 0.0
+    return sig * (z * _cdf(z) + _pdf(z))
 
 
 # ── Abstract base ────────────────────────────────────────────────────────
@@ -248,6 +309,43 @@ class ExplorativeNoiseSelector(NoiseSelector):
             if loss_val > worst_loss:
                 worst_loss = loss_val
 
+            # DIAG: per-candidate footprint (first run only) — shows if the
+            # fp8->bf16 materialized weights accumulate across K forwards.
+            if k < 3 and getattr(self, "_diag_xm_k", True):
+                try:
+                    self._diag_xm_k = False
+                    import torch as _t
+                    _a = _t.cuda.memory_allocated() / 1024**3
+                    _r = _t.cuda.memory_reserved() / 1024**3
+                    _p = _t.cuda.max_memory_allocated() / 1024**3
+                    # batch 关键张量
+                    _bt = ""
+                    try:
+                        _nos = noises_k[0] if isinstance(noises_k, list) else noises_k
+                        _bt = f"noise_shape={tuple(_nos.shape)} "
+                    except Exception:
+                        pass
+                    try:
+                        _tl0 = target_latents[0]
+                        _bt += f"tgt={tuple(_tl0.shape)}@{_tl0.device.type} "
+                    except Exception:
+                        pass
+                    try:
+                        _embs = batch.get("embeddings")
+                        if _embs and _embs[0] is not None:
+                            _pe = _embs[0].get("prompt_embed") if isinstance(_embs[0], dict) else _embs[0]
+                            import numpy as _np
+                            if isinstance(_pe, _np.ndarray):
+                                _bt += f"emb_shape={_pe.shape} "
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"[DIAG-XM-K] k={k} after_forward alloc={_a:.2f}G "
+                        f"resv={_r:.2f}G peak={_p:.2f}G {_bt}"
+                    )
+                except Exception as _de:
+                    logger.warning(f"[DIAG-XM-K] failed: {_de}")
+
             # Immediate release — no accumulation across K iterations
             del pred_k, unpacked_k, input_k, noisy_k, noises_k
 
@@ -342,96 +440,145 @@ class ExplorativeNoiseSelector(NoiseSelector):
             return base_K
 
 
-# ── Explorative Improved: per-sigma-bucket min-rule early stopping ───────
+# ── XMS: sequential best-of-K with within-round early stopping ─────────────
 
 
-class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
-    """Best-of-K noise exploration with per-sigma-bucket min-rule early stopping.
+class ExplorativeSequentialNoiseSelector(ExplorativeNoiseSelector):
+    """XMS: best-of-K noise exploration with within-round sequential stopping.
 
-    Extends ExplorativeNoiseSelector with adaptive early stopping
-    (md/xm_improved_search.md §4/§5): the sigma range is split into
-    ``num_buckets`` per-timestep buckets; each bucket independently tracks a
-    ``global_min_loss`` baseline — the typical full-K best loss observed in that
-    bucket (EMA update). Within a round, candidates are sampled one by
-    one; as soon as the running min loss reaches the bucket baseline
-    (min-rule), exploration stops early.
-
-    Only the min-rule + per-bucket variant is implemented (the gap rule and
-    single-tracker variants were rejected by simulation — see the research doc).
-
-    ``init_k`` (first-hit exploration): an uninitialized bucket (g_b == 0)
-    runs ``init_k`` candidates on its very first hit to seed a high-quality
-    baseline instead of the normal K. This happens once per bucket — after
-    adoption the baseline is non-zero, so the bucket reverts to normal K —
-    and since g_b == 0 the min-rule can never fire, the init round always
-    runs the full ``init_k`` budget (never stops early). ``init_k=0``
-    disables the feature.
+    Design (research: .tmp/ref_xms/xm_exploration_research.md, §5):
+      1. ALL stopping evidence is WITHIN the round: mu_hat is estimated from
+         the candidates observed so far in this round (leave-one-out: excludes
+         the incumbent best to avoid winner's curse). The only cross-round
+         state is per-sigma-bucket sigma_hat (EWMA of within-round candidate
+         loss std) plus visit counts. NO cross-round absolute loss levels,
+         NO global_min_loss, NO dead zones, NO combo normalization.
+      2. Stop rules (checked after each candidate, m = candidates so far):
+           target: mu_hat_loo - best >= gamma * alpha(K) * sigma_eff
+           ei:     ei_one_draw(best, mu_hat, sigma_eff) < kappa * sigma_eff
+           streak: s consecutive candidates failing to improve best
+           none:   always run full K
+         m_min floor (default 2): only check rules when m >= m_min.
+         sigma_eff = max(sigma_hat[b], sigma_floor_frac * abs(mu_hat)).
+         First visit to a bucket (sigma_hat[b] is None): run FULL K
+         (calibration, no stop checks), then set sigma_hat[b] = stdev(observed).
+      3. Guards: p_raw probability of reinjecting a purely random candidate
+         (anti-degeneracy; keeps the unselected noise distribution in the
+         gradient stream). sigma_hat EWMA alpha = sigma_ewma (default 0.01).
     """
 
     def __init__(self, config: dict):
-        super().__init__(config)
-
+        super().__init__(config)  # inherits K_cond/K_uncond/warmup/schedule/log_stats
+        self.stop_rule: str = config.get("stop_rule", "target")
+        if self.stop_rule not in ("target", "ei", "streak", "none"):
+            raise ValueError(
+                f"stop_rule must be one of target/ei/streak/none, got {self.stop_rule!r}"
+            )
+        self.gamma: float = float(config.get("gamma", 0.8))
+        self.kappa: float = float(config.get("kappa", 0.05))
+        self.streak_s: int = int(config.get("streak_s", 3))
+        # m_min floor: mu_hat needs >= 2 observed losses to be meaningful.
+        self.m_min: int = max(2, int(config.get("m_min", 2)))
+        self.p_raw: float = float(config.get("p_raw", 0.15))
+        self.sigma_floor_frac: float = float(config.get("sigma_floor_frac", 0.005))
+        self.sigma_ewma: float = float(config.get("sigma_ewma", 0.01))
+        if not (0.0 < self.sigma_ewma <= 1.0):
+            raise ValueError(
+                f"sigma_ewma must satisfy 0 < sigma_ewma <= 1, got {self.sigma_ewma!r}"
+            )
+        # sigma_mix: blend cross-round sigma_hat with the within-round stdev.
+        #   sigma_eff = sigma_mix * sigma_hat + (1 - sigma_mix) * stdev(observed)
+        # 1.0 = pure cross-round EWMA (original); 0.0 = pure within-round;
+        # 0.5 = hybrid (default): within-round component lets tight rounds stop
+        # early, cross-round component guards against single-round stdev noise
+        # (avoids premature stops that miss tail winners).
+        self.sigma_mix: float = float(config.get("sigma_mix", 0.5))
+        if not (0.0 <= self.sigma_mix <= 1.0):
+            raise ValueError(
+                f"sigma_mix must satisfy 0 <= sigma_mix <= 1, got {self.sigma_mix!r}"
+            )
+        self.mu_estimator: str = config.get("mu_estimator", "loo")
+        if self.mu_estimator not in ("loo", "mean"):
+            raise ValueError(
+                f"mu_estimator must be 'loo' or 'mean', got {self.mu_estimator!r}"
+            )
+        self.per_sample_winner: bool = bool(config.get("per_sample_winner", False))
         self.num_buckets: int = int(config.get("num_buckets", 20))
-        self.bucket_mode: str = config.get("bucket_mode", "log")
-        if self.bucket_mode not in ("linear", "log"):
-            raise ValueError(
-                f"Unsupported bucket_mode {self.bucket_mode!r}; "
-                "expected 'linear' or 'log'"
-            )
-        if self.num_buckets < 1:
-            raise ValueError(
-                f"num_buckets must be >= 1, got {self.num_buckets}"
-            )
         self.sigma_min: float = float(config.get("sigma_min", 1e-3))
-        self.ema_alpha: float = float(config.get("ema_alpha", 0.1))
-        if not (0.0 < self.ema_alpha <= 1.0):
-            raise ValueError(f"ema_alpha must be in (0, 1], got {self.ema_alpha}")
-        self.init_k: int = int(config.get("init_k", 0))
-        if self.init_k < 0:
-            raise ValueError(f"init_k must be >= 0, got {self.init_k}")
-        self.combo_norm: bool = bool(config.get("combo_norm", False))
 
-        # Per-bucket baselines: global_min_loss[b] = typical full-K best loss
-        # observed in bucket b. 0.0 = uninitialized → first round always runs
-        # the full K and adopts the observed best (never stops).
-        self.global_min_loss: List[float] = [0.0] * self.num_buckets
+        # Cross-round state: ONLY per-bucket sigma_hat (stable scale) + counts.
+        self.sigma_hat: List[Optional[float]] = [None] * self.num_buckets
+        self.visit_count: List[int] = [0] * self.num_buckets
         self.total_candidates: int = 0
-        self.total_stopped_early: int = 0
-        # Per-combo raw-loss scale EMA (only populated when combo_norm is on).
-        self.combo_mu: Dict[str, float] = {}
+        self.total_rounds: int = 0
+        self.total_stopped: int = 0
+        self.total_p_raw: int = 0
 
         logger.info(
-            f"ExplorativeImprovedNoiseSelector: K_cond={self.K_cond}, "
-            f"K_uncond={self.K_uncond}, warmup={self.warmup_steps}, "
-            f"schedule={self.schedule}, num_buckets={self.num_buckets}, "
-            f"bucket_mode={self.bucket_mode}, sigma_min={self.sigma_min}, "
-            f"ema_alpha={self.ema_alpha}, init_k={self.init_k}, "
-            f"combo_norm={self.combo_norm}"
+            f"ExplorativeSequentialNoiseSelector: stop_rule={self.stop_rule}, "
+            f"gamma={self.gamma}, kappa={self.kappa}, streak_s={self.streak_s}, "
+            f"m_min={self.m_min}, p_raw={self.p_raw}, "
+            f"sigma_floor_frac={self.sigma_floor_frac}, sigma_ewma={self.sigma_ewma}, "
+            f"sigma_mix={self.sigma_mix}, "
+            f"mu_estimator={self.mu_estimator}, per_sample_winner={self.per_sample_winner}, "
+            f"num_buckets={self.num_buckets}, sigma_min={self.sigma_min}"
         )
 
-    # ── Bucket mapping ────────────────────────────────────────────────
+    # ── Internal helpers ────────────────────────────────────────────────
 
     def _bucket_for_sigma(self, sigma: float) -> int:
-        """Map a sigma value to its per-timestep bucket index (0..num_buckets-1).
+        """Log-scaled bucket index (same mapping the old bucket-min selector used).
 
-        linear: u = clamp(sigma, 0, 1); b = min(B-1, floor(u * B))
-        log:    u spreads log(sigma) evenly across [sigma_min, 1]
-                (u = 0 for sigma <= sigma_min, u = 1 for sigma = 1)
+        u = clamp((log(max(sigma, sigma_min)) - log(sigma_min)) / (-log(sigma_min)), 0, 1);
+        b = min(B-1, int(u * B)).
         """
-        if self.bucket_mode == "linear":
-            u = min(1.0, max(0.0, sigma))
-        else:  # "log" — validated in __init__
-            u = min(
-                1.0,
-                max(
-                    0.0,
-                    (math.log(max(sigma, self.sigma_min)) - math.log(self.sigma_min))
-                    / (-math.log(self.sigma_min)),
-                ),
-            )
+        s = max(float(sigma), self.sigma_min)
+        u = (math.log(s) - math.log(self.sigma_min)) / (-math.log(self.sigma_min))
+        u = max(0.0, min(1.0, u))
         return min(self.num_buckets - 1, int(u * self.num_buckets))
 
-    # ── Selection with early stopping ─────────────────────────────────
+    def _mu_hat(self, observed: List[float], best: float) -> float:
+        """Within-round mean estimate.
+
+        "loo" (default) excludes the incumbent best (winner's-curse guard,
+        Efron 2011): including the selected min biases mu_hat downward, and the
+        stop-triggering event is exactly a low-mu round. Falls back to the plain
+        mean when there is only one observation or mu_estimator="mean".
+        """
+        if self.mu_estimator == "mean" or len(observed) <= 1:
+            return sum(observed) / len(observed)
+        return (sum(observed) - best) / (len(observed) - 1)
+
+    @staticmethod
+    def _eval_velocity_mse_per_sample(
+        unpacked: List[torch.Tensor],
+        noises: List[torch.Tensor],
+        target_latents: List[torch.Tensor],
+        velocity_sign: str = "standard",
+    ) -> torch.Tensor:
+        """Per-sample flow-matching velocity MSE vector [B].
+
+        Same velocity convention as _eval_velocity_mse, but returns one loss
+        per sample (mean over targets of the per-position MSE averaged over
+        non-batch dims). Used to assemble the per_sample_winner noise.
+        """
+        if velocity_sign not in ("standard", "data_ward"):
+            raise ValueError(
+                f"Unsupported velocity_sign {velocity_sign!r}; "
+                "expected 'standard' or 'data_ward'"
+            )
+        B = target_latents[0].shape[0]
+        total = torch.zeros(B, device=target_latents[0].device)
+        for unpacked_i, noise_i, target_i in zip(unpacked, noises, target_latents):
+            if velocity_sign == "data_ward":
+                velocity_target = target_i - noise_i
+            else:
+                velocity_target = noise_i - target_i
+            per_pos = (unpacked_i.float() - velocity_target.float()) ** 2
+            total = total + per_pos.flatten(1).mean(dim=1)
+        return total / len(target_latents)
+
+    # ── Main selection loop ──────────────────────────────────────────────
 
     def select(
         self,
@@ -457,8 +604,8 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
         )
 
         if K <= 1:
-            # Warmup or schedule decayed to 1 → standard random noise.
-            # NO baseline update on this path (random path must stay neutral).
+            # Warmup or schedule decayed to 1 → standard random noise, no state
+            # updates (same minimal stats as the parent's warmup path).
             noises = [torch.randn_like(tl) for tl in target_latents]
             if self.log_stats:
                 self.last_stats = {
@@ -466,50 +613,33 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
                     "xm/uncond": float(is_uncond),
                 }
                 self.last_log_line = (
-                    f"[XM-IMP] step={step} K=1 "
+                    f"[XMS] step={step} K=1 "
                     f"mode={'uncond' if is_uncond else 'cond'} — random noise"
                 )
             return noises, sigmas, timesteps
 
-        # ── Bucket + baseline for this round's sigma ────────────────────
-        # batch > 1: bucket from the FIRST sample's sigma — all candidates in
-        # a round share the same sampled sigma (md/xm_improved_search.md §7).
-        sigmas_b = sigmas.view(-1, *(1,) * (target_latents[0].ndim - 1)) if target_latents[0].ndim >= 2 else sigmas
         b = self._bucket_for_sigma(sigmas.flatten()[0].item())
-        g_b = self.global_min_loss[b]
+        sig_hat = self.sigma_hat[b]
+        first_visit = sig_hat is None
+        alpha_K = alpha_of_m(K)
 
-        # ── init round (first-hit exploration) ───────────────────────────
-        # Uninitialized bucket (g_b == 0): first hit runs init_k candidates
-        # to seed a high-quality baseline. g_b == 0 → the min-rule can
-        # never fire, so the init round always runs the full init_k budget.
-        # After adoption the baseline is non-zero → normal K for this bucket.
-        loop_K = self.init_k if (g_b == 0 and self.init_k > 0) else K
-        init_round = loop_K != K
+        sigmas_b = (
+            sigmas.view(-1, *(1,) * (target_latents[0].ndim - 1))
+            if target_latents[0].ndim >= 2
+            else sigmas
+        )
+        velocity_sign = getattr(adapter, "velocity_sign", "standard")
 
-        # ── Combo identity + per-combo loss scale (combo_norm) ───────────
-        # loss ≈ mu[combo] × h[sigma] (md/xm_combo_normalization.md): the
-        # sigma baseline below tracks h on the NORMALIZED loss, so early-stop
-        # is comparable across training combinations.
-        combo_key = _combo_key_from_batch(batch) if self.combo_norm else ""
-        mu_pre = self.combo_mu.get(combo_key) if self.combo_norm else None
+        observed: List[float] = []
+        best = float("inf")
+        best_noise = None
+        best_k = -1
+        ps_best = None    # [B] per-sample best losses (per_sample_winner mode)
+        ps_noise = None   # list of per-target [B, ...] per-sample winner noise
+        used_rule = "full"
 
-        # Early-stop threshold (pre-round values). combo_norm scales the
-        # sigma baseline by the combo's loss scale; a combo's first round
-        # (mu unknown) has no threshold → full-K exploration to seed mu.
-        if self.combo_norm:
-            thresh = (mu_pre * g_b) if (mu_pre is not None and g_b > 0) else None
-        else:
-            thresh = g_b if g_b > 0 else None
-
-        best_loss = float("inf")
-        worst_loss = float("-inf")
-        best_noises = None
-        best_k_idx = -1
-        all_losses: List[float] = []
-        stopped_early = False
-
-        # ── Phase 1: Explore K noise candidates (no_grad, no activations) ──
-        for i in range(loop_K):
+        # ── Phase 1: sequential exploration with within-round stop checks ──
+        for k in range(K):
             noises_k = [torch.randn_like(tl) for tl in target_latents]
             noisy_k = [
                 (1.0 - sigmas_b) * tl + sigmas_b * n
@@ -528,164 +658,192 @@ class ExplorativeImprovedNoiseSelector(ExplorativeNoiseSelector):
                     unpacked_k,
                     noises_k,
                     target_latents,
-                    velocity_sign=getattr(adapter, "velocity_sign", "standard"),
+                    velocity_sign=velocity_sign,
                 )
+                if self.per_sample_winner:
+                    loss_vec = self._eval_velocity_mse_per_sample(
+                        unpacked_k,
+                        noises_k,
+                        target_latents,
+                        velocity_sign=velocity_sign,
+                    )
 
             loss_val = loss_k.item()
-            all_losses.append(loss_val)
+            observed.append(loss_val)
+            if loss_val < best:
+                best = loss_val
+                best_noise = [n.clone() for n in noises_k]
+                best_k = k
 
-            if loss_val < best_loss:
-                best_loss = loss_val
-                best_noises = [n.clone() for n in noises_k]
-                best_k_idx = i
-            if loss_val > worst_loss:
-                worst_loss = loss_val
-
-            # Min-rule early stop: stop as soon as the running min reaches
-            # the (normalized) bucket baseline — no minimum-candidate floor.
-            #   - threshold available (baseline initialized; combo scale known)
-            #   - running min <= threshold (only a GOOD candidate triggers it)
-            if thresh is not None and best_loss <= thresh:
-                stopped_early = True
-                del pred_k, unpacked_k, input_k, noisy_k, noises_k
-                break
+            if self.per_sample_winner:
+                # Per-sample winner bookkeeping: each sample tracks its own
+                # best candidate (reuses the [B] loss vector, 0 extra forwards).
+                if ps_best is None:
+                    ps_best = loss_vec.clone()
+                    ps_noise = [n.clone() for n in noises_k]
+                else:
+                    mask = loss_vec < ps_best
+                    if bool(mask.any()):
+                        ps_best = ps_best.masked_scatter(mask, loss_vec[mask])
+                        for t in range(len(noises_k)):
+                            ps_noise[t][mask] = noises_k[t][mask]
 
             # Immediate release — no accumulation across K iterations
             del pred_k, unpacked_k, input_k, noisy_k, noises_k
-
-        # ── Bookkeeping after the round ────────────────────────────────
-        # i + 1 == number of candidates actually evaluated (full run: K).
-        self.total_candidates += (i + 1)
-        # Per-combo loss-scale EMA (raw loss) — absorbs combo difficulty when
-        # combo_norm is on (md/xm_combo_normalization.md).
-        if self.combo_norm:
-            if mu_pre is None:
-                # First round for this combo: adopt its best as the scale.
-                self.combo_mu[combo_key] = best_loss
-                mu_now = best_loss
-                l_norm = 1.0
+            if self.per_sample_winner:
+                del loss_vec, loss_k
             else:
-                self.combo_mu[combo_key] = (
-                    (1.0 - self.ema_alpha) * mu_pre + self.ema_alpha * best_loss
-                )
-                mu_now = mu_pre
-                l_norm = best_loss / mu_pre
+                del loss_k
+
+            m = len(observed)
+            if first_visit:
+                continue  # calibration round: full K, no stop checks
+            if m < self.m_min or m >= K:
+                continue
+            if sig_hat is None or sig_hat <= 0.0:
+                break  # no usable scale evidence: stop at the m_min floor
+            mu_hat = self._mu_hat(observed, best)
+            # sigma_mix: blend cross-round sigma_hat with within-round stdev.
+            # Within-round component lets tight rounds stop early; cross-round
+            # component guards against single-round stdev noise (premature
+            # stops that miss tail winners). First-visit (sig_hat None) and
+            # sigma_mix=0 fall back to pure within-round scale.
+            within_sd = stdev(observed) if len(observed) >= 2 else 0.0
+            if self.sigma_mix <= 0.0 or sig_hat is None:
+                scale = within_sd
+            else:
+                scale = self.sigma_mix * sig_hat + (1.0 - self.sigma_mix) * within_sd
+            sig_eff = max(scale, self.sigma_floor_frac * abs(mu_hat))
+            if sig_eff <= 0.0:
+                continue  # safety: keep exploring when scale is degenerate
+            if self.stop_rule == "target":
+                if mu_hat - best >= self.gamma * alpha_K * sig_eff:
+                    used_rule = "target"
+                    break
+            elif self.stop_rule == "ei":
+                if ei_one_draw(best, mu_hat, sig_eff) < self.kappa * sig_eff:
+                    used_rule = "ei"
+                    break
+            elif self.stop_rule == "streak":
+                # Distribution-free: count trailing candidates that failed to
+                # set a strictly-new running best.
+                run_best = float("inf")
+                bests = []
+                for lv in observed:
+                    run_best = min(run_best, lv)
+                    bests.append(run_best)
+                streak = 0
+                for i in range(len(observed) - 1, -1, -1):
+                    if observed[i] <= bests[i]:
+                        break
+                    streak += 1
+                if streak >= self.streak_s:
+                    used_rule = "streak"
+                    break
+            # stop_rule == "none": never stop early
+
+        m = len(observed)
+
+        # ── Cross-round update: ONLY sigma_hat (stable scale) + counters ──
+        if m >= 2:
+            sd = stdev(observed)
+            if self.sigma_hat[b] is None:
+                self.sigma_hat[b] = sd
+            else:
+                a = self.sigma_ewma
+                self.sigma_hat[b] = (1.0 - a) * self.sigma_hat[b] + a * sd
+        self.visit_count[b] += 1
+        self.total_candidates += m
+        self.total_rounds += 1
+        if used_rule != "full":
+            self.total_stopped += 1
+
+        # ── Phase 2: winner assembly ──
+        if self.per_sample_winner and ps_noise is not None:
+            winner = ps_noise
+            ps_used = 1
         else:
-            mu_now = None
-            l_norm = best_loss
-        # EMA baseline update (no ratchet): g_b tracks the bucket's *typical*
-        # normalized best, not its historical minimum.
-        #   - first hit (g_b == 0): adopt l_norm directly.
-        #   - otherwise: g_b ← (1-α)·g_b + α·l_norm.
-        if g_b == 0:
-            self.global_min_loss[b] = l_norm
-        else:
-            self.global_min_loss[b] = (
-                (1.0 - self.ema_alpha) * g_b + self.ema_alpha * l_norm
-            )
-        if stopped_early:
-            self.total_stopped_early += 1
+            winner = best_noise
+            ps_used = 0
+
+        # p_raw guard: reinject a purely random candidate with probability p_raw
+        p_raw_used = 0
+        if self.p_raw > 0.0 and random.random() < self.p_raw:
+            winner = [torch.randn_like(tl) for tl in target_latents]
+            self.total_p_raw += 1
+            p_raw_used = 1
 
         # ── Record exploration statistics ──
         if self.log_stats:
-            import statistics
-            mean_loss = sum(all_losses) / len(all_losses)
+            mu_hat = self._mu_hat(observed, best)
             self.last_stats = {
-                "xm/K_effective": i + 1,
+                "xm/K_effective": m,
                 "xm/uncond": float(is_uncond),
-                "xm/best_k": best_k_idx,
-                "xm/loss_best": best_loss,
-                "xm/loss_worst": worst_loss,
-                "xm/loss_mean": mean_loss,
-                "xm/gap": worst_loss - best_loss,
-                "xm/loss_std": statistics.stdev(all_losses) if len(all_losses) > 1 else 0.0,
+                "xm/best_k": best_k,
+                "xm/loss_best": best,
+                "xm/loss_worst": max(observed),
+                "xm/loss_mean": sum(observed) / m,
+                "xm/gap": max(observed) - min(observed),
+                "xm/loss_std": stdev(observed) if m > 1 else 0.0,
+                "xm/mu_hat": mu_hat,
+                "xm/sigma_hat": self.sigma_hat[b] if self.sigma_hat[b] is not None else 0.0,
+                "xm/stop_rule": used_rule,
                 "xm/bucket": b,
-                "xm/baseline": self.global_min_loss[b],
-                "xm/stopped_early": 1.0 if stopped_early else 0.0,
-                "xm/init_round": 1.0 if init_round else 0.0,
+                "xm/first_visit": 1 if first_visit else 0,
+                "xm/p_raw": p_raw_used,
+                "xm/total_candidates": self.total_candidates,
+                "xm/total_rounds": self.total_rounds,
+                "xm/total_stopped": self.total_stopped,
+                "xm/total_p_raw": self.total_p_raw,
+                "xm/per_sample_winner": ps_used,
             }
-            if self.combo_norm:
-                self.last_stats["xm/loss_norm"] = l_norm
-                self.last_stats["xm/combo_mu"] = mu_now
-                self.last_stats["xm/combo_id"] = (
-                    zlib.crc32(combo_key.encode("utf-8")) & 0x7FFFFFFF
-                )
-            # Terminal line stays minimal (K, best_k, gap, min, thr); the
-            # full breakdown lives in last_stats → wandb (loss/xm/*).
-            # thr = the raw-unit threshold min is compared against
-            # (combo_norm: mu[combo] × g_b; otherwise g_b). "-" = no
-            # comparison this round (init round or combo first round).
-            thr_str = f"{thresh:.4f}" if thresh is not None else "-"
             self.last_log_line = (
-                f"[XM-IMP] step={step} K={i + 1}/{loop_K} "
-                f"best_k={best_k_idx} "
-                f"gap={worst_loss - best_loss:.4f} min={best_loss:.4f} "
-                f"max={worst_loss:.4f} "
-                f"thr={thr_str}"
+                f"[XMS] step={step} K={m}/{K} rule={used_rule} "
+                f"best_k={best_k} best={best:.4f} "
+                f"gap={max(observed) - min(observed):.4f}"
             )
 
-        # ── Phase 2: Return winning noise (sigma unchanged) ──
-        return best_noises, sigmas, timesteps
+        return winner, sigmas, timesteps
 
-    # ── State persistence (checkpoint extra_state) ────────────────────
+    # ── Checkpoint state (only scale + counters — never absolute losses) ──
 
     def state_dict(self) -> dict:
-        """Serializable selector state (baselines + counters) for checkpoints."""
         return {
-            "version": 2,
-            "global_min_loss": list(self.global_min_loss),
+            "version": 1,
+            "sigma_hat": [None if v is None else float(v) for v in self.sigma_hat],
+            "visit_count": list(self.visit_count),
             "total_candidates": self.total_candidates,
-            "total_stopped_early": self.total_stopped_early,
-            "combo_mu": dict(self.combo_mu),
+            "total_rounds": self.total_rounds,
+            "total_stopped": self.total_stopped,
+            "total_p_raw": self.total_p_raw,
         }
 
     def load_state_dict(self, state: dict) -> None:
-        """Restore baselines + counters from a state_dict.
+        """Restore cross-round state, tolerating missing keys / wrong types.
 
-        Missing keys (including absent "version") fall back to defaults — no
-        exception. If the saved baseline list length differs from num_buckets
-        (bucket count changed between runs), the shared prefix is kept and the
-        missing tail re-initialized to 0.0 (first-round adoptions re-run there).
+        sigma_hat is restored only when its list length equals num_buckets
+        (otherwise the current state is kept and a warning is logged);
+        visit_count is padded to num_buckets; counters come from state.get().
         """
         if not isinstance(state, dict):
-            logger.warning(
-                f"load_state_dict: expected dict, got {type(state).__name__}; "
-                "keeping current state"
-            )
             return
+        sh = state.get("sigma_hat", [])
+        if isinstance(sh, (list, tuple)) and len(sh) == self.num_buckets:
+            self.sigma_hat = [None if v is None else float(v) for v in sh]
+        elif sh:
+            logger.warning(
+                f"ExplorativeSequentialNoiseSelector: sigma_hat has length "
+                f"{len(sh)} != num_buckets {self.num_buckets}; keeping current"
+            )
+        vc = state.get("visit_count", [])
+        if isinstance(vc, (list, tuple)):
+            self.visit_count = [int(v) for v in vc]
+            if len(self.visit_count) < self.num_buckets:
+                self.visit_count += [0] * (self.num_buckets - len(self.visit_count))
         self.total_candidates = int(state.get("total_candidates", 0))
-        self.total_stopped_early = int(state.get("total_stopped_early", 0))
-
-        state_list = state.get("global_min_loss", [])
-        if not isinstance(state_list, (list, tuple)):
-            logger.warning(
-                "load_state_dict: 'global_min_loss' is not a list/tuple; "
-                "re-initializing baselines to 0.0"
-            )
-            state_list = []
-        if len(state_list) != self.num_buckets:
-            keep = min(len(state_list), self.num_buckets)
-            logger.warning(
-                f"load_state_dict: saved global_min_loss length "
-                f"{len(state_list)} != num_buckets {self.num_buckets}; "
-                f"keeping first {keep} entries, re-initializing the rest"
-            )
-            self.global_min_loss = (
-                [float(v) for v in state_list[:keep]]
-                + [0.0] * (self.num_buckets - keep)
-            )
-        else:
-            self.global_min_loss = [float(v) for v in state_list]
-
-        combo_mu = state.get("combo_mu", {})
-        if isinstance(combo_mu, dict):
-            self.combo_mu = {str(k): float(v) for k, v in combo_mu.items()}
-        else:
-            logger.warning(
-                "load_state_dict: 'combo_mu' is not a dict; "
-                "re-initializing combo scales to empty"
-            )
-            self.combo_mu = {}
+        self.total_rounds = int(state.get("total_rounds", 0))
+        self.total_stopped = int(state.get("total_stopped", 0))
+        self.total_p_raw = int(state.get("total_p_raw", 0))
 
 
 # ── Factory ──────────────────────────────────────────────────────────────
@@ -703,8 +861,8 @@ def build_noise_selector(config: dict) -> NoiseSelector:
 
     if selector_type == "explorative":
         return ExplorativeNoiseSelector(ns_cfg)
-    elif selector_type == "explorative_improved":
-        return ExplorativeImprovedNoiseSelector(ns_cfg)
+    elif selector_type == "explorative_sequential":
+        return ExplorativeSequentialNoiseSelector(ns_cfg)
     elif selector_type == "random":
         return RandomNoiseSelector()
     else:

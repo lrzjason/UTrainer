@@ -23,6 +23,12 @@ import os
 # scenario that causes OOM even when there should be enough free memory.
 # Note: PYTORCH_CUDA_ALLOC_CONF is deprecated in newer PyTorch; use
 # PYTORCH_ALLOC_CONF. Set both for backward compatibility.
+# 2026-08-23: with expandable_segments=False, the caching allocator's
+# segments cannot grow; the Krea2 LoKR backward's fp8 dequantize allocations
+# (300-800 MB each) then fail to find a contiguous block after the varying
+# batch shapes fragment the pool (OOM at ~25.8G alloc / 4.6G reserved-but-
+# unallocated / 128MB free). The 0817 config that previously ran for 9000+
+# steps on the same 32GB card used expandable_segments=True. Keep it True.
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -149,6 +155,90 @@ def _is_rank0() -> bool:
         return int(os.environ.get("RANK", "0")) == 0
     except ValueError:
         return True
+
+
+def _save_checkpoint_on_exception(trainer, lycoris_net, config, output_dir,
+                                  save_name, network_type, exception):
+    """Save recoverable state on an exception/interrupt mid-training.
+
+    Writes the current LoKR/LoRA weights PLUS the full training state
+    (optimizer, scheduler, step, epoch, RNG, noise_selector) as a matching
+    {save_name}_epoch{N}.safetensors / {save_name}_epoch{N}_training_state.pt
+    pair, so a later run can be continued from the exact point of failure via
+    ``--resume-full``. This prevents multi-hour runs (e.g. a 48GB run) from
+    being wasted when a mid-epoch OOM or Ctrl-C kills the process.
+
+    Returns True on success, False otherwise (never raises — safe inside
+    an ``except`` handler).
+    """
+    logger.error(
+        f"Training interrupted by {type(exception).__name__}: {exception}. "
+        f"Saving recoverable checkpoint at step={getattr(trainer, 'step', '?')}, "
+        f"epoch={getattr(trainer, 'epoch', '?')}..."
+    )
+    try:
+        import torch
+        from pathlib import Path
+        from UnifiedTrainer.engine.checkpoint import CheckpointManager
+
+        os.makedirs(output_dir, exist_ok=True)
+        ckpt_mgr = CheckpointManager(output_dir, save_name)
+
+        # 1) Save adapter weights (LoKR or LoRA)
+        weight_path = None
+        if network_type == "lokr" and lycoris_net is not None:
+            weight_path = ckpt_mgr.save_lokr(
+                lycoris_net, trainer.step, trainer.epoch, config, is_final=False
+            )
+        else:
+            # LoRA path: save adapter weights only via PEFT save_pretrained-style
+            # into a dedicated interrupted dir (kept simple & safe).
+            from pathlib import Path as _P
+            lora_dir = Path(output_dir) / f"{save_name}_interrupted_lora"
+            lora_dir.mkdir(parents=True, exist_ok=True)
+            trainer.transformer.save_pretrained(str(lora_dir))
+            weight_path = lora_dir
+        logger.info(f"  interrupted weights saved: {weight_path}")
+
+        # 2) Save full training state (optimizer + scheduler + RNG + step/epoch).
+        #    Use epoch_idx=trainer.epoch so the state filename matches the
+        #    weight filename produced by save_lokr above ({save_name}_epoch{N}.safetensors
+        #    -> {save_name}_epoch{N}_training_state.pt), which is what
+        #    CheckpointManager.get_training_state_path / --resume-full expect.
+        if trainer.optimizer is not None:
+            extra = (
+                {"noise_selector": trainer.noise_selector.state_dict()}
+                if hasattr(trainer.noise_selector, "state_dict")
+                else None
+            )
+            state_path = ckpt_mgr.save_training_state(
+                optimizer=trainer.optimizer,
+                lr_scheduler=trainer.lr_scheduler,
+                step=trainer.step,
+                epoch=trainer.epoch,
+                epoch_idx=trainer.epoch,
+                config=config,
+                is_final=False,
+                extra_state=extra,
+            )
+            logger.info(f"  interrupted training state saved: {state_path}")
+        else:
+            logger.warning("  interrupted training state NOT saved: optimizer is None")
+
+        # 3) Flush if a CUDA OOM left the allocator in a bad state.
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        logger.info(
+            "Recoverable checkpoint written. To resume from the interrupted "
+            "point, run with --resume-full <path_to_the_saved_epoch{save_name}N.safetensors> "
+            "so its matching <stem>_training_state.pt is loaded."
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save recoverable checkpoint on interrupt: {e}")
+        return False
 
 
 def main():
@@ -1042,11 +1132,20 @@ def main():
     # compiled graph covers the final model. No-op when compile is false.
     trainer.setup_compile()
 
-    # Baseline VRAM before training loop
+    # Baseline VRAM before training loop (include GPU identity + total capacity)
     if torch.cuda.is_available():
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        except Exception:
+            gpu_name = "unknown"
+            gpu_total_gb = 0.0
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
-        logger.info(f"VRAM baseline before training: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
+        logger.info(
+            f"GPU: {gpu_name} ({gpu_total_gb:.1f}GB total). "
+            f"VRAM baseline before training: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved"
+        )
 
     # ── Setup callbacks (reporter: tensorboard / wandb) ─────────
     reporter_cfg = config.get("reporter", {})
@@ -1444,106 +1543,120 @@ def main():
     # rebuild the original full-horizon curve and fast-forward to
     # trainer.step, which reproduces the correct LR without the old state.
 
-    for epoch in range(trainer.epoch, num_epochs):
-        if trainer.max_steps != -1 and trainer.step >= trainer.max_steps:
-            break
+    try:
+        for epoch in range(trainer.epoch, num_epochs):
+            if trainer.max_steps != -1 and trainer.step >= trainer.max_steps:
+                break
 
-        result = trainer.train_epoch(epoch, dataloader)
-        logger.info(f"Epoch {epoch}: avg_loss={result['loss']:.6f}")
+            result = trainer.train_epoch(epoch, dataloader)
+            logger.info(f"Epoch {epoch}: avg_loss={result['loss']:.6f}")
 
-        # ── Per-epoch output directory ───────────────────────────────
-        output_dir = config.get("output", {}).get("dir", "output")
-        save_name = config.get("output", {}).get("save_name", "lora")
-        epoch_dir = os.path.join(output_dir, f"{save_name}-{epoch}")
-        os.makedirs(epoch_dir, exist_ok=True)
+            # ── Per-epoch output directory ───────────────────────────────
+            output_dir = config.get("output", {}).get("dir", "output")
+            save_name = config.get("output", {}).get("save_name", "lora")
+            epoch_dir = os.path.join(output_dir, f"{save_name}-{epoch}")
+            os.makedirs(epoch_dir, exist_ok=True)
 
-        # ── Save checkpoint + ComfyUI conversion FIRST ───────────────
-        if trainer.should_save_checkpoint(epoch):
-            from UnifiedTrainer.engine.checkpoint import CheckpointManager
+            # ── Save checkpoint + ComfyUI conversion FIRST ───────────────
+            if trainer.should_save_checkpoint(epoch):
+                from UnifiedTrainer.engine.checkpoint import CheckpointManager
 
-            ckpt_mgr = CheckpointManager(epoch_dir, save_name)
-            if network_type == "lokr" and lycoris_net is not None:
-                path = ckpt_mgr.save_lokr(
-                    lycoris_net, trainer.step, epoch, config
-                )
-            else:
-                path = ckpt_mgr.save_lora(
-                    trainer.transformer, trainer.step, epoch, config
-                )
-            logger.info(f"Checkpoint saved: {path}")
-            # Save full training state for exact resume (--resume-full)
-            if trainer.optimizer is not None:
-                extra = (
-                    {"noise_selector": trainer.noise_selector.state_dict()}
-                    if hasattr(trainer.noise_selector, "state_dict")
-                    else None
-                )
-                state_path = ckpt_mgr.save_training_state(
-                    optimizer=trainer.optimizer,
-                    lr_scheduler=trainer.lr_scheduler,
-                    step=trainer.step,
-                    epoch=epoch,
-                    epoch_idx=epoch,
-                    config=config,
-                    extra_state=extra,
-                )
-                logger.info(f"Training state saved: {state_path} (step={trainer.step}, epoch={epoch})")
-            else:
-                logger.warning(f"Training state NOT saved: trainer.optimizer is None!")
-            trainer.callbacks.on_checkpoint(trainer.step, str(path), trainer)
-
-        # ── Validation loss (controlled RNG, no gradient) ─────────────
-        val_every = val_cfg.get("val_every_epoch", 1)
-        if epoch % val_every == 0 or epoch == num_epochs - 1:
-            if val_dataloader is not None:
-                val_result = trainer.validate_epoch(epoch, val_dataloader)
-                if val_result.get("val_loss") is not None:
-                    val_loss_val = val_result['val_loss']
-                    logger.info(
-                        f"Epoch {epoch}: val_loss={val_loss_val:.6f}"
+                ckpt_mgr = CheckpointManager(epoch_dir, save_name)
+                if network_type == "lokr" and lycoris_net is not None:
+                    path = ckpt_mgr.save_lokr(
+                        lycoris_net, trainer.step, epoch, config
                     )
-                    # Always log per-loss val breakdown to the text log
-                    _vb = val_result.get("val_loss_breakdown", {})
-                    if _vb:
-                        _vb_str = ", ".join(
-                            f"{name}={val:.6f}" for name, val in _vb.items()
+                else:
+                    path = ckpt_mgr.save_lora(
+                        trainer.transformer, trainer.step, epoch, config
+                    )
+                logger.info(f"Checkpoint saved: {path}")
+                # Save full training state for exact resume (--resume-full)
+                if trainer.optimizer is not None:
+                    extra = (
+                        {"noise_selector": trainer.noise_selector.state_dict()}
+                        if hasattr(trainer.noise_selector, "state_dict")
+                        else None
+                    )
+                    state_path = ckpt_mgr.save_training_state(
+                        optimizer=trainer.optimizer,
+                        lr_scheduler=trainer.lr_scheduler,
+                        step=trainer.step,
+                        epoch=epoch,
+                        epoch_idx=epoch,
+                        config=config,
+                        extra_state=extra,
+                    )
+                    logger.info(f"Training state saved: {state_path} (step={trainer.step}, epoch={epoch})")
+                else:
+                    logger.warning(f"Training state NOT saved: trainer.optimizer is None!")
+                trainer.callbacks.on_checkpoint(trainer.step, str(path), trainer)
+
+            # ── Validation loss (controlled RNG, no gradient) ─────────────
+            val_every = val_cfg.get("val_every_epoch", 1)
+            if epoch % val_every == 0 or epoch == num_epochs - 1:
+                if val_dataloader is not None:
+                    val_result = trainer.validate_epoch(epoch, val_dataloader)
+                    if val_result.get("val_loss") is not None:
+                        val_loss_val = val_result['val_loss']
+                        logger.info(
+                            f"Epoch {epoch}: val_loss={val_loss_val:.6f}"
                         )
-                        logger.info(f"Epoch {epoch}: val_loss_breakdown: {_vb_str}")
-                    # Log val_loss + per-loss breakdown to active reporters
-                    if trainer.callbacks.callbacks:
-                        for cb in trainer.callbacks.callbacks:
-                            # WandB
-                            if hasattr(cb, '_wandb') and cb._wandb:
-                                wandb_log = {"val_loss": val_loss_val, "epoch": epoch}
-                                for name, val in val_result.get("val_loss_breakdown", {}).items():
-                                    wandb_log[f"val_loss/{name}"] = val
-                                cb._wandb.log(wandb_log, step=trainer.step)
-                            # TensorBoard
-                            if hasattr(cb, '_writer') and cb._writer:
-                                cb._writer.add_scalar("val/loss", val_loss_val, trainer.step)
-                                for name, val in val_result.get("val_loss_breakdown", {}).items():
-                                    cb._writer.add_scalar(f"val/loss_{name}", val, trainer.step)
+                        # Always log per-loss val breakdown to the text log
+                        _vb = val_result.get("val_loss_breakdown", {})
+                        if _vb:
+                            _vb_str = ", ".join(
+                                f"{name}={val:.6f}" for name, val in _vb.items()
+                            )
+                            logger.info(f"Epoch {epoch}: val_loss_breakdown: {_vb_str}")
+                        # Log val_loss + per-loss breakdown to active reporters
+                        if trainer.callbacks.callbacks:
+                            for cb in trainer.callbacks.callbacks:
+                                # WandB
+                                if hasattr(cb, '_wandb') and cb._wandb:
+                                    wandb_log = {"val_loss": val_loss_val, "epoch": epoch}
+                                    for name, val in val_result.get("val_loss_breakdown", {}).items():
+                                        wandb_log[f"val_loss/{name}"] = val
+                                    cb._wandb.log(wandb_log, step=trainer.step)
+                                # TensorBoard
+                                if hasattr(cb, '_writer') and cb._writer:
+                                    cb._writer.add_scalar("val/loss", val_loss_val, trainer.step)
+                                    for name, val in val_result.get("val_loss_breakdown", {}).items():
+                                        cb._writer.add_scalar(f"val/loss_{name}", val, trainer.step)
 
-            # ── Generate validation images into per-epoch dir ──────────
-            if val_cfg.get("generate_images", False):
-                # Reload VAE on CPU for latent decoding (trainer handles GPU transfer)
-                logger.info("Reloading VAE for validation image generation...")
-                val_vae = adapter.load_vae(vae_path, weight_dtype).to("cpu")
-                trainer.vae = val_vae
+                # ── Generate validation images into per-epoch dir ──────────
+                if val_cfg.get("generate_images", False):
+                    # Reload VAE on CPU for latent decoding (trainer handles GPU transfer)
+                    logger.info("Reloading VAE for validation image generation...")
+                    val_vae = adapter.load_vae(vae_path, weight_dtype).to("cpu")
+                    trainer.vae = val_vae
 
-                trainer.epoch_output_dir = epoch_dir
-                img_paths = trainer.generate_validation_images(epoch, val_dataloader)
-                if img_paths:
-                    logger.info(
-                        f"Epoch {epoch}: generated {len(img_paths)} validation images"
-                    )
+                    trainer.epoch_output_dir = epoch_dir
+                    img_paths = trainer.generate_validation_images(epoch, val_dataloader)
+                    if img_paths:
+                        logger.info(
+                            f"Epoch {epoch}: generated {len(img_paths)} validation images"
+                        )
 
-                # Delete VAE after validation to free memory
-                del val_vae
-                trainer.vae = None
-                gc.collect()
-                torch.cuda.empty_cache()
-                logger.info("VAE deleted after validation")
+                    # Delete VAE after validation to free memory
+                    del val_vae
+                    trainer.vae = None
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    logger.info("VAE deleted after validation")
+
+    except (Exception, KeyboardInterrupt) as _exc:
+        # 捕获任何中断（OOM/Ctrl-C/异常），保存可续训状态，避免浪费数小时的训练进度。
+        if _is_rank0():
+            _saved = _save_checkpoint_on_exception(
+                trainer, lycoris_net, config, output_dir, save_name, network_type, _exc)
+        else:
+            logger.info(
+                f"Training interrupted by {type(_exc).__name__} on non-rank-0 "
+                f"(rank 0 will save the recoverable checkpoint)."
+            )
+        # 重新抛出，让外层/调度器感知训练确实失败了。
+        raise
 
     # Save final into root output dir
     from UnifiedTrainer.engine.checkpoint import CheckpointManager
