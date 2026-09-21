@@ -20,6 +20,7 @@ import random
 from collections import defaultdict
 from typing import Any, Iterator, List, Optional
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
@@ -246,18 +247,49 @@ class UnifiedDataset(Dataset):
 
         # Load target latents
         latents = {}
+        target_latent_paths = {}
         targets = sample.get("targets", {})
         if target_key and target_key in targets:
             entry = targets[target_key]
             latent_path = entry.get("latent_path")
             if latent_path:
                 latents[target_key] = self._runtime_latent(self.cache.load_latent(latent_path))
+                target_latent_paths[target_key] = latent_path
         else:
             for role, entry in targets.items():
                 if isinstance(entry, dict):
                     latent_path = entry.get("latent_path")
                     if latent_path:
                         latents[role] = self._runtime_latent(self.cache.load_latent(latent_path))
+                        target_latent_paths[role] = latent_path
+
+        # Load PFM target features next to the latent npz. Two layouts:
+        #   - legacy single-encoder "feats" key (φ(I_orig), cache-build time)
+        #   - precached multi-entry layout (decoded mode):
+        #     feat_{e} = (L, C, h, w) fp16 grids, pix_{e} = (C, h, w) fp16
+        #     pixels, plus metadata markers ("target"/"layout" strings,
+        #     "scale"/"tile" scalars) that MUST NOT be loaded as tensors.
+        # Only for TARGET roles; a missing file is NOT an error here — the
+        # pfm loss fails loud only when its config actually asks for
+        # target_source='original' (or a precache promised features).
+        pfm_feats = {}
+        for role, lp in target_latent_paths.items():
+            pp = lp.replace(".npz", "_pfm.npz")
+            if os.path.exists(pp):
+                try:
+                    with np.load(pp) as data:
+                        if "feats" in data:
+                            pfm_feats[role] = torch.from_numpy(data["feats"])
+                        else:
+                            feats_dict = {
+                                k: torch.from_numpy(data[k])
+                                for k in data.files
+                                if k not in ("target", "layout", "scale", "tile")
+                            }
+                            if feats_dict:
+                                pfm_feats[role] = feats_dict
+                except Exception as e:
+                    logger.warning(f"Corrupt pfm feature file {pp}: {e}")
 
         # Load reference latents
         references = sample.get("references", {})
@@ -346,6 +378,7 @@ class UnifiedDataset(Dataset):
         return {
             "group_id": os.path.splitext(os.path.basename(json_path))[0],
             "latents": latents,
+            "pfm_feats": pfm_feats,
             "embedding": embedding,
             "batch_config": {
                 "target_config": target_key,
@@ -374,12 +407,33 @@ def collate_fn(batch: list) -> dict:
     result = {
         "group_ids": [b["group_id"] for b in batch],
         "latents": {},
+        "pfm_feats": {},
         "embeddings": [b["embedding"] for b in batch],
         "image_configs": [b["image_configs"] for b in batch],
         "buckets": [b["bucket"] for b in batch],
         "batch_configs": [b["batch_config"] for b in batch],
         "caption_text_paths": [b.get("caption_text_paths", []) for b in batch],
     }
+
+    # Stack PFM target features by role: tensor layout (L, C, h, w) ->
+    # (B, L, C, h, w); precached dict layout stacks per key (B, ...).
+    # Roles absent from every sample simply stay empty.
+    pfm_roles = set()
+    for b in batch:
+        pfm_roles.update(b.get("pfm_feats", {}).keys())
+    for role in pfm_roles:
+        values = [b["pfm_feats"][role] for b in batch if role in b.get("pfm_feats", {})]
+        if values:
+            if isinstance(values[0], dict):
+                # Only keys present in EVERY sample of the batch — a partial
+                # stack would misalign with batch indices downstream.
+                keys0 = [k for k in values[0] if all(k in v for v in values)]
+                result["pfm_feats"][role] = {
+                    k: torch.stack([v[k] for v in values])
+                    for k in keys0
+                }
+            else:
+                result["pfm_feats"][role] = torch.stack(values)
 
     # Stack latents by role
     all_roles = set()

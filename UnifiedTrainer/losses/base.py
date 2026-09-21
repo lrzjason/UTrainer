@@ -42,6 +42,15 @@ class LossContext:
     # Derived (filled by trainer before loss computation)
     x0_hat: Optional[torch.Tensor] = None  # predicted clean latent = noise - model_pred
 
+    # Second (empty-prompt / unconditional) velocity prediction, same shape
+    # as model_pred.  Filled by the trainer when any configured loss sets
+    # ``needs_uncond_forward = True`` (e.g. guide_flow_matching — the
+    # DC-Gen corrected objective for guidance-distilled models needs the
+    # distilled model's own output under the empty condition).  None when no
+    # loss requested it.  Gradient flows through BOTH predictions: both are
+    # outputs of the same network being trained.
+    model_pred_uncond: Optional[torch.Tensor] = None
+
     # Reference / condition latent (e.g. depth map latent for depth-conditioned training).
     # Filled by the trainer when the batch contains a reference latent.
     reference_latent: Optional[torch.Tensor] = None

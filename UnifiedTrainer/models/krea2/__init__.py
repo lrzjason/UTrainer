@@ -87,7 +87,20 @@ _PROMPT_TEMPLATE_PREFIX = (
 _PROMPT_TEMPLATE_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
 _PROMPT_TEMPLATE_START_IDX = 34  # token count of _PROMPT_TEMPLATE_PREFIX
 _PROMPT_TEMPLATE_NUM_SUFFIX_TOKENS: int = 5  # "<|im_end|>\n<|im_start|>assistant\n"
-_DEFAULT_MAX_SEQ_LEN = 512
+# Caption token budget for the TEXT-ONLY path (multimodal captions are never
+# truncated — they follow ComfyUI, which has no cap at all).
+#
+# Why 1024 and not the historical 512: ComfyUI feeds Krea 2 an UNTRUNCATED
+# prompt (its tokenizer defaults to max_length=99999999, pad_to_max_length=
+# False — comfy/text_encoders/qwen3vl.py), and the model has no text-length
+# limit to begin with: every text token sits at RoPE position (0,0,0)
+# (see prepare_position_ids), so length never enters the positional encoding.
+# The old 512 was "T2ITrainer parity" and silently discarded the tail of long
+# captions, i.e. training saw less text than inference does. 1024 keeps the
+# sequence cost negligible at 1024px (image tokens ≈ 8k) while matching what
+# inference actually conditions on. Override per run with
+# training.text_max_length (alias: top-level text_max_length).
+_DEFAULT_MAX_SEQ_LEN = 1024
 _IMG_PLACEHOLDER = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
 
 
@@ -107,6 +120,21 @@ class Krea2Adapter(BaseModelAdapter):
 
         # Multimodal reference: pass reference image to Qwen3VL text encoder.
         self.multimodal_reference: bool = config.get("multimodal_reference", False)
+
+        # Caption token budget for the text-only encode path (ComfyUI feeds
+        # untruncated prompts, so this exists to keep training aligned with
+        # inference rather than to satisfy any model limit).
+        _training_cfg = config.get("training", {}) or {}
+        self.text_max_length: int = int(
+            config.get(
+                "text_max_length",
+                _training_cfg.get("text_max_length", _DEFAULT_MAX_SEQ_LEN),
+            )
+        )
+        if self.text_max_length < 64:
+            raise ValueError(
+                f"krea2: text_max_length must be >= 64, got {self.text_max_length!r}"
+            )
 
 
 
@@ -472,11 +500,12 @@ class Krea2Adapter(BaseModelAdapter):
         if is_multimodal:
             proc_kwargs.update(images=refs, do_rescale=False)
         else:
-            # T2ITrainer parity: do NOT pad to max_length.
+            # Text-only path: truncate at the configured budget (default 1024,
+            # override with training.text_max_length). Do NOT pad to max_length.
             proc_kwargs.update(
                 truncation=True,
                 max_length=(
-                    _DEFAULT_MAX_SEQ_LEN
+                    self.text_max_length
                     + _PROMPT_TEMPLATE_START_IDX
                     + _PROMPT_TEMPLATE_NUM_SUFFIX_TOKENS
                 ),
@@ -643,6 +672,122 @@ class Krea2Adapter(BaseModelAdapter):
         if image.ndim == 5:
             image = image.squeeze(2)
         return image
+
+    def decode_latent_differentiable(
+        self, vae: nn.Module, latent: torch.Tensor, tile_size: int = 0
+    ) -> Any:
+        # Same math as decode_latent (T2I mean/std denormalization + 5D decode),
+        # but WITHOUT the torch.no_grad() guard: losses/pfm.py backprops from
+        # pixel space through the VAE decoder into x0_hat -> model_pred.
+        latent = latent.to(device=vae.device, dtype=vae.dtype)
+        latents_mean = torch.tensor(
+            Krea2Adapter._T2I_LATENTS_MEAN, device=latent.device, dtype=latent.dtype
+        ).view(1, -1, 1, 1)
+        latents_std = torch.tensor(
+            Krea2Adapter._T2I_LATENTS_STD, device=latent.device, dtype=latent.dtype
+        ).view(1, -1, 1, 1)
+        latent = latent * latents_std + latents_mean
+        squeeze_frame = latent.ndim == 4
+        if squeeze_frame:
+            latent = latent.unsqueeze(2)
+
+        # Spatial tiling: peak decoder activation memory stays at ONE tile
+        # (each tile decodes under torch.utils.checkpoint) instead of the
+        # full image — full-res 1024-class decodes fit where they otherwise
+        # OOM. Triggered only when the image actually exceeds one tile.
+        comp = int(getattr(vae.config, "spatial_compression_ratio", 8) or 8)
+        tile_px = int(tile_size or 0)
+        if tile_px >= 256 and (
+            latent.shape[-2] * comp > tile_px or latent.shape[-1] * comp > tile_px
+        ):
+            image = self._tiled_decode_differentiable(vae, latent, tile_px, comp)
+        else:
+            image = vae.decode(latent).sample
+
+        if squeeze_frame and image.ndim == 5:
+            image = image.squeeze(2)
+        return image
+
+    def _tiled_decode_differentiable(
+        self,
+        vae: nn.Module,
+        latent5d: torch.Tensor,
+        tile_px: int,
+        comp: int,
+    ) -> torch.Tensor:
+        """Gradient-safe spatial VAE tiling (training-grade).
+
+        The SPLIT ARITHMETIC mirrors diffusers'
+        ``AutoencoderKLQwenImage._tiled_decode`` (local diffusers checkout,
+        Apache-2.0): latent tiles of ``tile_px // comp`` with 12.5% latent
+        overlap and a linear feather across the seam. The EXECUTION is
+        deliberately different — diffusers' path is inference-grade and
+        unsuitable for backward:
+          * every tile decodes under ``torch.utils.checkpoint`` — forward
+            frees each tile's activations, backward recomputes one tile at a
+            time, so peak memory = one tile (diffusers keeps ALL tiles'
+            activations → no saving under grad);
+          * blending is out-of-place weighted accumulation with precomputed
+            ramps (diffusers' ``blend_v/h`` write INTO decoder outputs
+            in-place — a version-counter hazard under autograd).
+        ``vae.decode`` resets its streaming feat-cache on entry/exit, so the
+        checkpointed recompute in backward is deterministic.
+        """
+        import torch.utils.checkpoint as _ckpt
+
+        b, c, t, hl, wl = latent5d.shape
+        tile_lat = max(1, tile_px // comp)
+        overlap_lat = max(1, tile_lat // 8)  # 64 px feather at the 512 default
+        stride_lat = tile_lat - overlap_lat
+        blend_px = overlap_lat * comp
+
+        def _decode_one(tile: torch.Tensor) -> torch.Tensor:
+            return vae.decode(tile).sample
+
+        # Tile origins on the stride grid, clamped so the last row/column
+        # hugs the edge (same set-of-origins trick as diffusers' range loop).
+        ys = sorted({min(i, max(0, hl - tile_lat)) for i in range(0, hl, stride_lat)})
+        xs = sorted({min(j, max(0, wl - tile_lat)) for j in range(0, wl, stride_lat)})
+
+        dev, dt = latent5d.device, latent5d.dtype
+
+        def _axis_w(edge0: bool, edge1: bool, n: int) -> torch.Tensor:
+            """1D weight: fade in over the seam when a tile has a
+            predecessor, fade out when it has a successor. Ramps are
+            complementary (sum with the neighbour is constant) — the final
+            normalize makes any constant offset irrelevant."""
+            w = torch.ones(n, device=dev, dtype=torch.float32)
+            if edge0:  # predecessor tile above/left → fade in
+                w[:blend_px] = torch.arange(blend_px, device=dev, dtype=torch.float32) / blend_px
+            if edge1:  # successor tile below/right → fade out
+                w[n - blend_px:] = torch.flip(
+                    torch.arange(blend_px, device=dev, dtype=torch.float32), (0,)
+                ) / blend_px
+            return w
+
+        # Tile OUTPUTS are tiny (3ch pixels, ~4 MB fp32 each) — only decoder
+        # ACTIVATIONS are checkpoint-freed, so collecting outputs is cheap.
+        acc: torch.Tensor | None = None
+        wsum: torch.Tensor | None = None
+        for y in ys:
+            for x in xs:
+                tile = latent5d[:, :, :, y : y + tile_lat, x : x + tile_lat]
+                px = _ckpt.checkpoint(_decode_one, tile, use_reentrant=False).float()
+                if acc is None:
+                    acc = torch.zeros(
+                        (b, px.shape[1], t, hl * comp, wl * comp),
+                        device=dev, dtype=torch.float32,
+                    )
+                    with torch.no_grad():
+                        wsum = torch.zeros_like(acc)
+                wy = _axis_w(y > 0, (y + tile_lat) < hl, px.shape[-2])
+                wx = _axis_w(x > 0, (x + tile_lat) < wl, px.shape[-1])
+                w2d = wy[:, None] * wx[None, :]
+                acc[:, :, :, y * comp : y * comp + px.shape[-2], x * comp : x * comp + px.shape[-1]] += (
+                    px * w2d
+                )
+                wsum[:, :, :, y * comp : y * comp + px.shape[-2], x * comp : x * comp + px.shape[-1]] += w2d
+        return (acc / wsum.clamp_min(1e-6)).to(dt)
 
     # ── Latent packing ─────────────────────────────────────────────────
 

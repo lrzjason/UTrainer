@@ -82,6 +82,8 @@
         "quantize": "torchao_float8",
         "block_swap": 0,
         "offload_vae": true,
+        "vae_on_device": false,
+        "vae_load_mode": "reload",
         "offload_text_encoder": true,
         "compile": false,
         "noise_selector": {

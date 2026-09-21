@@ -300,6 +300,36 @@ class BaseModelAdapter(ABC):
         """Decode a latent back to image space."""
         ...
 
+    def decode_latent_differentiable(
+        self, vae: nn.Module, latent: torch.Tensor, tile_size: int = 0
+    ) -> Any:
+        """Decode a latent to pixel space WITH gradient (for perceptual losses).
+
+        Unlike :meth:`decode_latent` — which may wrap itself in
+        ``torch.no_grad()`` — this hook must keep the autograd graph intact so
+        losses like ``losses/pfm.py`` (Perceptual Flow Matching) can backprop
+        from pixel/feature space into the model prediction. Adapters whose
+        decode involves latent denormalization MUST replicate their
+        ``decode_latent`` math here without the no_grad guard (see
+        ``Krea2Adapter`` for the reference implementation).
+
+        ``tile_size`` (pixel edge of one decode tile, 0 = off): when the
+        decoded image exceeds it, the adapter MAY decode in overlapping
+        spatial tiles under ``torch.utils.checkpoint`` so peak activation
+        memory stays at one tile instead of the full image. The seam
+        behavior must be identical for the grad and no-grad branches of a
+        loss (pred/target decode through the same code path).
+
+        Not abstract: only adapters that host perceptual losses need it; the
+        default raises so a missing override fails loudly with a clear
+        message instead of silently returning a grad-free tensor.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement decode_latent_differentiable(). "
+            "Perceptual losses (pfm) require a gradient-enabled decode — add an "
+            "adapter override replicating decode_latent() without torch.no_grad()."
+        )
+
     # ── Pipeline ──────────────────────────────────────────────────────
 
     def build_pipeline(self, components: dict) -> Any:

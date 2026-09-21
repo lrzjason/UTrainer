@@ -76,6 +76,7 @@ class CacheBuilder:
         cache_dir: str,
         adapter: Any,
         dataset_name: str = "default",
+        pfm_encode_fn: Optional[Any] = None,
     ):
         self.ds_config = dataset_config
         self.dataset_name = dataset_name
@@ -84,6 +85,71 @@ class CacheBuilder:
             train_data_dir=dataset_config.train_data_dir,
         )
         self.adapter = adapter
+        # Optional EUPE feature precompute for PFM's original-pixel target
+        # (φ(I_orig)): callable pixels01 (B,3,H,W) [0,1] -> (L,B,C,h,w)
+        # fp32. Injected by train.py only when a pfm loss runs with
+        # target_source='original' — zero cost otherwise.
+        self.pfm_encode_fn = pfm_encode_fn
+
+    def _save_pfm_feats(self, pfm_path: str, frames: torch.Tensor) -> None:
+        """Precompute φ(I_orig) features for PFM's original-pixel target.
+
+        ``frames``: (B, C, T, H, W) in [0, 1] — the exact tensor the latent
+        was encoded from, so features and latents always describe the same
+        pixels. Stored fp16 as (L, C, h, w) next to the latent npz. Image
+        media only (video frames are skipped); silently a no-op when no
+        encode fn was injected.
+        """
+        if self.pfm_encode_fn is None or frames.shape[2] != 1:
+            return
+        pixels01 = frames[:, :, 0]  # (B, C, H, W)
+        feats = self.pfm_encode_fn(pixels01)  # (L, B, C, h, w) fp32
+        arr = feats.detach().to(torch.float16).cpu().numpy()
+        np.savez(pfm_path, feats=arr)
+
+    def _backfill_pfm_feats(self, sample: dict) -> None:
+        """Backfill missing φ(I_orig) features for an already-cached sample.
+
+        The per-sample JSON records each target's latent_path and the
+        original media path — re-derive the feature file from the latter
+        via the deterministic resize path. Resolution is recovered from the
+        latent filename convention (``{basename}_{resolution}.npz``).
+        """
+        for t_entry in sample.get("targets", {}).values():
+            if not isinstance(t_entry, dict):
+                continue
+            if t_entry.get("media") == "video":
+                continue  # pfm features are image-only
+            lp = t_entry.get("latent_path", "")
+            if not lp.endswith(".npz"):
+                continue
+            pfm_path = lp.replace(".npz", "_pfm.npz")
+            if os.path.exists(pfm_path):
+                continue
+            media_path = t_entry.get("original_image_path") or t_entry.get(
+                "image_path"
+            )
+            if not media_path or not os.path.exists(media_path):
+                logger.warning(
+                    f"pfm backfill: source image missing for {lp!r}"
+                )
+                continue
+            try:
+                resolution = int(
+                    os.path.splitext(os.path.basename(lp))[0].rsplit("_", 1)[1]
+                )
+            except (ValueError, IndexError):
+                resolution = self.ds_config.resolution
+            try:
+                frames = load_image_frames(
+                    media_path,
+                    resolution=resolution,
+                    divisibility=self.adapter.bucket_divisibility,
+                    resolution_config=self.adapter.resolution_config,
+                )
+                self._save_pfm_feats(pfm_path, frames)
+            except Exception as e:
+                logger.warning(f"pfm backfill failed for {media_path}: {e}")
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -166,6 +232,12 @@ class CacheBuilder:
                     except OSError:
                         pass
                 else:
+                    # PFM original-target backfill: the per-sample JSON
+                    # exists, so _encode_media never runs for this sample —
+                    # backfill missing φ(I_orig) feature files directly from
+                    # the recorded source image (no VAE involved).
+                    if self.pfm_encode_fn is not None:
+                        self._backfill_pfm_feats(sample)
                     datarows.append({
                         "json_path": str(json_file),
                         "bucket": sample.get("bucket", ""),
@@ -577,6 +649,7 @@ class CacheBuilder:
 
         resized_path = os.path.join(cache_dir, f"{basename}_{resolution}.webp")
         latent_path = os.path.join(cache_dir, f"{basename}_{resolution}.npz")
+        pfm_path = latent_path.replace(".npz", "_pfm.npz")
 
         # ── Cache hit: skip re-encoding when the sample is already cached ──
         # Images additionally require the resized webp (legacy layout); an
@@ -604,6 +677,22 @@ class CacheBuilder:
                         # 复用第一次 load 的 latent_hit 算 H/W 与 num_frames，
                         # 不再二次 load（缓存命中时避免双重磁盘 I/O）。
                         num_frames = int(latent_hit.shape[1])
+                    # PFM feature backfill: latent exists but φ(I_orig)
+                    # features were never written (cache predates the pfm
+                    # original-target mode) — recompute from the original
+                    # media via the deterministic resize path. No VAE needed.
+                    if (
+                        media == "image"
+                        and self.pfm_encode_fn is not None
+                        and not os.path.exists(pfm_path)
+                    ):
+                        frames_b = load_image_frames(
+                            media_path,
+                            resolution=resolution,
+                            divisibility=self.adapter.bucket_divisibility,
+                            resolution_config=self.adapter.resolution_config,
+                        )
+                        self._save_pfm_feats(pfm_path, frames_b)
                     return {
                         "image_path": resized_path if media == "image" else None,
                         "original_image_path": media_path,
@@ -663,6 +752,7 @@ class CacheBuilder:
                     f"got shape {tuple(latent.shape)}"
                 )
             self.cache.save_latent_npz(latent_path, latent)
+            self._save_pfm_feats(pfm_path, frames)
         else:
             # Placeholder latent (no VAE available) — same (C,T,H,W) convention.
             scale = self.adapter.vae_scale_factor

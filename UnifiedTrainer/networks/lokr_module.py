@@ -15,7 +15,17 @@ Architecture:
 
 Compatible with BouncingOffloader (uses forward hooks, no monkey-patch conflict).
 Reference: ai-toolkit/toolkit/models/lokr.py, md/lokr_implementation/new_lokr_implementation_plan.md
+
+Target-pattern presets (_MODEL_PATTERNS, selected via LokrConfig.model_type):
+    krea2        -> None (attach to ALL Linear modules; musubi-aligned)
+    qwen         -> _QWEN_PATTERNS         (Qwen-Image, models/qwen_image)
+    qwen21       -> _QWEN21_PATTERNS      (Qwen-Image 2.1, models/qwen_image21)
+    flux         -> _FLUX_PATTERNS
+    flux2_klein  -> _FLUX2_KLEIN_PATTERNS
+    minimax_h3   -> _H3_PATTERNS
+An unknown model_type falls back to _KREA2_PATTERNS (block-internal Linears).
 """
+
 from __future__ import annotations
 
 import fnmatch
@@ -161,10 +171,25 @@ _FLUX2_KLEIN_PATTERNS = [
     "*proj_out",
 ]
 
+# Qwen-Image 2.1 (models/qwen_image21/transformer_qwenimage21.py):
+# single-stream blocks only — attn.to_q/k/v/out.0 plus the SwiGLU img_mlp
+# (proj/gate_layer/out). img_in / modulation.1 / norm_out.linear / proj_out /
+# txt_in.* stay opt-in via explicit lokr_target_modules.
+_QWEN21_PATTERNS = [
+    "*transformer_blocks.*.attn.to_k",
+    "*transformer_blocks.*.attn.to_q",
+    "*transformer_blocks.*.attn.to_v",
+    "*transformer_blocks.*.attn.to_out.0",
+    "*transformer_blocks.*.img_mlp.proj",
+    "*transformer_blocks.*.img_mlp.gate_layer",
+    "*transformer_blocks.*.img_mlp.out",
+]
+
 _MODEL_PATTERNS = {
     # None → attach to ALL Linear modules (musubi-aligned: KREA2_TARGET_REPLACE_MODULES=None)
     "krea2": None,
     "qwen": _QWEN_PATTERNS,
+    "qwen21": _QWEN21_PATTERNS,
     "flux": _FLUX_PATTERNS,
     "flux2_klein": _FLUX2_KLEIN_PATTERNS,
     "minimax_h3": _H3_PATTERNS,
@@ -301,6 +326,18 @@ class LokrLayer(nn.Module):
         # Flatten to 2D for matmul: [B, in_features]
         if x.dim() > 2:
             x = x.reshape(-1, self.in_features)
+
+        # Dtype-safe entry: LoKR params are fp32 (trainable-param convention),
+        # but the base model may feed bf16 activations — e.g. NF4 runs WITHOUT
+        # accelerate's autocast wrapper (the block_swap path skips model
+        # prepare). Compute the delta in the param dtype; the caller's hook
+        # casts the result back to the base output dtype.
+        param_dtype = (
+            self.lokr_w1.dtype if self.use_w1 else self.lokr_w1_a.dtype
+        )
+        if x.dtype != param_dtype:
+            x = x.to(param_dtype)
+
         batch = x.shape[0]
 
         # Reshape input: [B, in1, in2]

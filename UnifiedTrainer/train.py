@@ -49,6 +49,15 @@ except ImportError:  # pragma: no cover - tqdm ships with huggingface_hub
 # Ensure the package is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ── huggingface_hub compatibility shim ─────────────────────────────────
+# The editable diffusers checkout needs five symbols that huggingface_hub
+# 1.22.0 no longer exposes, so `import diffusers` fails outright and every
+# model adapter becomes unimportable. Must run before any adapter import.
+# See UnifiedTrainer/hub_compat.py. No-op on a matching huggingface_hub.
+from UnifiedTrainer import hub_compat as _hub_compat  # noqa: E402
+
+_hub_compat.install()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -498,6 +507,46 @@ def main():
     config.setdefault("training", {})["mixed_precision"] = mixed_precision
     logger.info(f"Mixed precision: {mixed_precision} (weight_dtype={weight_dtype_str})")
 
+    # ── Hard VRAM ceiling — block the shared-memory fallback ───────────
+    # On Windows the driver silently backs allocations that overflow the
+    # card's dedicated VRAM with "shared GPU memory" (a slice of system RAM),
+    # so an over-budget run does not raise OOM — it just falls off a cliff to
+    # PCIe speeds, which is worse than failing loudly. Capping the caching
+    # allocator to a fraction of the DEDICATED pool forces a real
+    # torch.OutOfMemoryError at the configured ceiling instead.
+    #
+    # torch reports exactly the dedicated pool here (props.total_memory =
+    # 15.90 GiB on a 16 GB card, shared memory not included), so the fraction
+    # is taken against that. `training.vram_limit_gb` sets the ceiling in GiB;
+    # 0/unset disables the cap.
+    vram_limit_gb = float(config.get("training", {}).get("vram_limit_gb", 0) or 0)
+    if torch.cuda.is_available():
+        _props = torch.cuda.get_device_properties(0)
+        _total_gib = _props.total_memory / 1024**3
+        if vram_limit_gb > 0:
+            if vram_limit_gb >= _total_gib:
+                logger.warning(
+                    f"training.vram_limit_gb={vram_limit_gb} >= device total "
+                    f"{_total_gib:.2f} GiB — no cap applied"
+                )
+            else:
+                torch.cuda.set_per_process_memory_fraction(
+                    vram_limit_gb / _total_gib, 0
+                )
+                logger.info(
+                    f"VRAM ceiling: {vram_limit_gb:.2f} GiB of "
+                    f"{_total_gib:.2f} GiB dedicated "
+                    f"(fraction {vram_limit_gb / _total_gib:.3f}); "
+                    f"exceeding it raises OOM instead of spilling into "
+                    f"shared GPU memory"
+                )
+        else:
+            logger.info(
+                f"VRAM ceiling: none (device dedicated pool {_total_gib:.2f} GiB). "
+                f"Set training.vram_limit_gb to fail fast instead of spilling "
+                f"into shared GPU memory."
+            )
+
     model_path = config.get("model_path", "")
     transformer_path = config.get(
         "transformer_path",
@@ -535,6 +584,23 @@ def main():
 
     # Suffix embedding control (matches training.include_suffix in config)
     include_suffix = config.get("training", {}).get("include_suffix", True)
+
+    # ── PFM original-pixel target detection ────────────────────────────
+    # When a pfm loss runs with target_source='original', φ(I_orig) features
+    # are precomputed at cache-build time and the cache validity check
+    # additionally requires the per-sample feature files to exist.
+    _pfm_params = next(
+        (
+            (l.get("params") or {})
+            for l in (config.get("losses") or [])
+            if l.get("type") == "pfm"
+        ),
+        None,
+    )
+    _pfm_original = bool(
+        _pfm_params
+        and _pfm_params.get("target_source", "decoded") == "original"
+    )
 
     # ── Cache validity check (aligned with T2ITrainer: single decision point,
     #     no separate post-build "verify" pass) ───────────────────────────
@@ -605,6 +671,16 @@ def main():
                             lp = entry.get("latent_path", "")
                             if lp and not os.path.exists(lp):
                                 return False, f"latent file missing: {lp}"
+                            # PFM original-target: features must sit next to
+                            # the TARGET latents (references don't need them).
+                            if (
+                                _pfm_original
+                                and section == "targets"
+                                and lp
+                            ):
+                                pp = lp.replace(".npz", "_pfm.npz")
+                                if not os.path.exists(pp):
+                                    return False, f"pfm feature file missing: {pp}"
                     # Check embedding files
                     for _ckey, cap_entry in sample.get("captions", {}).items():
                         if not isinstance(cap_entry, dict):
@@ -732,7 +808,21 @@ def main():
         all_datarows = []
         for ds_idx, ds_cfg in enumerate(dataset_configs):
             ds_name = ds_cfg.train_data_dir or f"dataset_{ds_idx}"
-            builder = CacheBuilder(ds_cfg, cache_dir, adapter, dataset_name=ds_name)
+            _pfm_fn = None
+            if _pfm_original and _pfm_params:
+                from UnifiedTrainer.utils.perceptual_encoder import (
+                    build_eupe_encode_fn,
+                )
+
+                _pfm_fn = build_eupe_encode_fn(_pfm_params, device)
+                logger.info("PFM: φ(I_orig) feature precompute enabled (cache build)")
+            builder = CacheBuilder(
+                ds_cfg,
+                cache_dir,
+                adapter,
+                dataset_name=ds_name,
+                pfm_encode_fn=_pfm_fn,
+            )
             ds_datarows = builder.build(
                 vae=vae,
                 text_encoder=text_encoder,
@@ -777,6 +867,27 @@ def main():
         text_encoder = None
         logger.info(f"Cache valid, reusing {cache_dir}")
         logger.info("Cache components not loaded (will reload for validation)")
+
+    # ── Pre-flight: guide_flow_matching (DC-Gen Eq. 10) needs the cached
+    #    empty-prompt embedding for its per-step unconditional forward ──
+    # The cache builder creates it from adapter.encode_text(''), but a
+    # text-encoder-less build (encoder path wrong / load failed) leaves it
+    # missing — fail fast here with an actionable message instead of dying
+    # on the first training step inside _build_uncond_batch.
+    if any(getattr(l, "needs_uncond_forward", False) for l in losses):
+        if not os.path.exists(empty_embedding_path):
+            logger.error(
+                f"guide_flow_matching requires the empty-prompt embedding at "
+                f"{empty_embedding_path}, but it does not exist. The cache "
+                f"builder creates it via adapter.encode_text('') — verify "
+                f"text_encoder_path is set and loads, or rebuild the cache "
+                f"(recreate_cache: true)."
+            )
+            sys.exit(1)
+        logger.info(
+            f"guide_flow_matching: empty-prompt embedding found at "
+            f"{empty_embedding_path} (per-step unconditional forward enabled)"
+        )
 
     # ── Phase 2: Load training components (transformer + LoRA) ──
     logger.info("=== Phase 2: Training components (transformer + LoRA) ===")
@@ -1045,12 +1156,60 @@ def main():
                 base_model.enable_block_swap(block_swap, device)
                 logger.info(f"Block swap enabled: {block_swap} blocks")
 
+    # ── Shared VAE component (single instance for every consumer) ─────
+    # 若 config 中存在使用 VAE 的组件（声明 requires_vae 的 loss 如 pfm、
+    # 或 validation.generate_images），创建统一的 VAEManager。加载时机由
+    # training.vae_load_mode 决定，默认值随场景（resolve_default_load_mode）：
+    #   配了 requires_vae loss（如 pfm）→ 默认 "lazy"：首次使用才读盘、
+    #     之后常驻 RAM，避免每步训练都重新加载
+    #   仅 val image gen → 默认 "reload"：与旧管线一致，用完完全卸载
+    # 显式指定 "eager"/"lazy"/"reload" 时永远覆盖默认值。
+    # GPU 驻留由 training.vae_on_device 决定（仅 eager/lazy 生效）：
+    #   false（默认）= 需要时转移到 GPU，用完搬回 RAM
+    #   true         = 整个训练期间常驻 GPU
+    from UnifiedTrainer.engine.vae_manager import (
+        VAEManager,
+        resolve_default_load_mode,
+    )
+
+    losses_need_vae = any(getattr(l, "requires_vae", False) for l in losses)
+    val_wants_images = bool(
+        config.get("validation", {}).get("generate_images", False)
+    )
+    vae_manager = None
+    if vae_path and (losses_need_vae or val_wants_images):
+        training_cfg = config.get("training", {})
+        vae_on_device = training_cfg.get("vae_on_device", False)
+        default_load_mode = resolve_default_load_mode(losses_need_vae)
+        vae_load_mode = str(
+            training_cfg.get("vae_load_mode", default_load_mode)
+        ).lower()
+        if vae_load_mode not in ("eager", "lazy", "reload"):
+            raise ValueError(
+                f"training.vae_load_mode must be 'eager', 'lazy' or 'reload', "
+                f"got {vae_load_mode!r}"
+            )
+        vae_manager = VAEManager(
+            adapter,
+            vae_path,
+            dtype=weight_dtype,
+            on_device=vae_on_device,
+            load_mode=vae_load_mode,
+        )
+        vae_manager.load()
+        logger.info(
+            f"VAE manager ready (load_mode={vae_load_mode}, "
+            f"vae_on_device={vae_on_device})"
+        )
+    else:
+        logger.info("No VAE-consuming component configured; VAE not loaded")
+
     # ── Create trainer ──────────────────────────────────────────
     from UnifiedTrainer.engine.trainer import Trainer
 
     trainer = Trainer(
         config, adapter=adapter, losses=losses,
-        transformer=transformer, vae=None,
+        transformer=transformer, vae_manager=vae_manager,
         lycoris_net=lycoris_net,
     )
     trainer.text_encoder = None  # not needed during training (cached embeddings)
@@ -1288,17 +1447,19 @@ def main():
                 # Fall through to LoRA-only path below
                 is_full_resume = False
         if not is_full_resume and resume_ckpt:
-            # LoRA-only: restore global step/epoch from checkpoint metadata for
-            # continuous WandB x-axis and progress tracking. Optimizer/scheduler
-            # start fresh (expected for LoRA-only resume).
+            # LoRA-only resume: load the adapter WEIGHTS only, then start a
+            # FRESH run from step 0 / epoch 0. Optimizer, scheduler, RNG and
+            # the epoch/step counters all begin from scratch — `full: false`
+            # is a "weights-only initialization", not a continuation.
             saved_step = meta.get("step", 0)
             saved_epoch = meta.get("epoch", -1)
-            trainer.step = saved_step
-            trainer.epoch = saved_epoch + 1 if saved_epoch >= 0 else 0
+            trainer.step = 0
+            trainer.epoch = 0
             logger.info(
-                f"LoRA-only resume: weights loaded, "
-                f"global step={trainer.step}, epoch={trainer.epoch} "
-                f"(optimizer/scheduler restarted from scratch)"
+                f"LoRA-only resume: weights loaded (source metadata "
+                f"step={saved_step}, epoch={saved_epoch}), "
+                f"training restarts fresh at step=0, epoch=0 "
+                f"(optimizer/scheduler/RNG restarted from scratch)"
             )
 
     # ── Create dataset & dataloader ────────────────────────────
@@ -1362,6 +1523,56 @@ def main():
         if full_datarows:
             cache_mgr.save_train_index(full_datarows)
             logger.info(f"Index rebuilt (no val split): {len(full_datarows)} datarows")
+
+    # ── PFM target-feature precache (before training; NO cache recreate) ──
+    # decoded-mode pfm's target branch φ(D(x0)) is deterministic per cached
+    # latent (latents immutable, encoders frozen). With pfm.precache=true the
+    # features are computed ONCE here and persisted as {basename}_{res}_pfm.npz
+    # next to the latents, so training serves the target branch from files
+    # instead of re-decoding/re-encoding every epoch. The cache itself is not
+    # recreated: no recreate flags, no per-sample JSON/index rewrite — only
+    # additive pfm feature files.
+    if _pfm_params and _pfm_params.get("precache", False):
+        from UnifiedTrainer.losses.pfm import PerceptualFlowMatchingLoss
+
+        _pfm_loss = next(
+            (l for l in losses if isinstance(l, PerceptualFlowMatchingLoss)),
+            None,
+        )
+        if _pfm_loss is None:
+            raise RuntimeError(
+                "pfm precache: no PerceptualFlowMatchingLoss in configured losses"
+            )
+        # Only the roles the trainer actually consumes as learning_target —
+        # the union of batch_configs[*].target_config across every dataset.
+        # Caches carrying alternative target roles (e.g. T/D/CF/DC) must not
+        # write unused feature files for the non-training roles.
+        _pfm_target_keys = set()
+        for _ds_cfg in dataset_configs:
+            for _bc in getattr(_ds_cfg, "batch_configs", []) or []:
+                _tk = getattr(_bc, "target_config", None)
+                if _tk:
+                    _pfm_target_keys.add(_tk)
+        if not _pfm_target_keys:
+            _pfm_target_keys = None
+        _pre_rows = list(cache_mgr.load_train_index()) + list(
+            cache_mgr.load_val_index()
+        )
+        _seen = set()
+        _uniq = []
+        for _r in _pre_rows:
+            _p = _r.get("json_path")
+            if _p not in _seen:
+                _seen.add(_p)
+                _uniq.append(_r)
+        logger.info(
+            f"PFM precache: {len(_uniq)} unique samples (train+val), "
+            f"target roles {sorted(_pfm_target_keys) if _pfm_target_keys else 'ALL'} "
+            "— computing missing φ(D(x0)) features before training"
+        )
+        _pfm_loss.precache_targets(
+            _uniq, cache_mgr, adapter, device, target_keys=_pfm_target_keys
+        )
 
     dataset = UnifiedDataset(
         adapter=adapter,
@@ -1626,24 +1837,16 @@ def main():
 
                 # ── Generate validation images into per-epoch dir ──────────
                 if val_cfg.get("generate_images", False):
-                    # Reload VAE on CPU for latent decoding (trainer handles GPU transfer)
-                    logger.info("Reloading VAE for validation image generation...")
-                    val_vae = adapter.load_vae(vae_path, weight_dtype).to("cpu")
-                    trainer.vae = val_vae
-
+                    # 共享 VAE（vae_manager）：acquire/release 在
+                    # generate_validation_images 内部完成，不再每轮重新加载。
                     trainer.epoch_output_dir = epoch_dir
                     img_paths = trainer.generate_validation_images(epoch, val_dataloader)
                     if img_paths:
                         logger.info(
                             f"Epoch {epoch}: generated {len(img_paths)} validation images"
                         )
-
-                    # Delete VAE after validation to free memory
-                    del val_vae
-                    trainer.vae = None
                     gc.collect()
                     torch.cuda.empty_cache()
-                    logger.info("VAE deleted after validation")
 
     except (Exception, KeyboardInterrupt) as _exc:
         # 捕获任何中断（OOM/Ctrl-C/异常），保存可续训状态，避免浪费数小时的训练进度。

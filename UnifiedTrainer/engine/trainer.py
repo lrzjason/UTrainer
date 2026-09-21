@@ -65,14 +65,25 @@ class Trainer:
         adapter: Any = None,
         losses: Optional[List[BaseLoss]] = None,
         transformer: Optional[nn.Module] = None,
-        vae: Optional[nn.Module] = None,
+        vae_manager: Optional[Any] = None,
         lycoris_net: Optional[nn.Module] = None,
     ):
         self.config = config
         self.adapter = adapter
         self.losses = losses or []
         self.transformer = transformer
-        self.vae = vae
+        # 统一 VAE 组件：所有可能用到 VAE 的过程（pfm 解码、验证采样、
+        # regenerator …）共用 vae_manager 持有的同一个实例。VAE 在训练循环
+        # 开始前由 train.py 加载进 RAM；GPU 驻留由 training.vae_on_device
+        # 决定（false=需要时转移，true=常驻）。
+        self.vae_manager = vae_manager
+        # 需要 VAE 的 loss（如 pfm）从 manager 借用同一实例。
+        for _loss in self.losses:
+            if getattr(_loss, "requires_vae", False):
+                _loss.vae_manager = vae_manager
+        # 生成验证图像期间的瞬时借用（generate_validation_images 内部
+        # acquire/release），供深层 decode 方法读取；训练循环中始终为 None。
+        self.vae = None
         self.lycoris_net = lycoris_net  # LyCORIS network (LoKR) or None (LoRA)
 
         # Training params
@@ -694,9 +705,24 @@ class Trainer:
             )
             # Skip autocast when mixed_precision is bf16 — the model is already
             # bf16, so autocast adds overhead and causes layer_norm dtype warnings.
+            # EXCEPTION — block_swap + nf4/int8: trainer skips accelerator.prepare()
+            # for the model in that mode (ModelOffloader hook conflict), so NOTHING
+            # wraps the forward in autocast. The quantized base keeps fp32 stragglers
+            # (norms/embedders), which then reach SDPA in fp32 and die with
+            # "No available kernel" (cuDNN needs half/bfloat16). Re-enable autocast
+            # for exactly that path; bf16 matmuls under autocast match what the
+            # prepare()-wrapped (non-block-swap) runs already did.
+            _model_prepared = not (
+                quantize_mode in ("nf4", "int8")
+                and self.config.get("training", {}).get("block_swap", 0) > 0
+            )
             use_autocast = (
                 self.accelerator is not None
-                and self.mixed_precision not in ("bf16", "no", None)
+                and self.mixed_precision not in ("no", None)
+                and (
+                    self.mixed_precision != "bf16"
+                    or not _model_prepared
+                )
             )
             autocast_ctx = (
                 self.accelerator.autocast()
@@ -709,6 +735,50 @@ class Trainer:
                 with autocast_ctx:
                     model_pred = self.transformer(**model_input)
                 unpacked = self.adapter.unpack_prediction(model_pred)
+
+                # ── Unconditional forward (guidance-corrected losses) ──
+                # Losses with needs_uncond_forward=True (guide_flow_matching —
+                # the DC-Gen corrected objective, Eq. 10) need the distilled
+                # model's own output under the empty prompt:
+                # v_eta(z_t, c_hat, t).  Same noisy latents, same sigmas —
+                # only the text embedding is swapped for the cached empty one
+                # (adapter contract: no image slots -> reference latents drop
+                # out, matching the CFG uncond branch).  Gradient flows
+                # through BOTH forwards — both are the trained network.
+                # Caption dropout already made the conditional pass
+                # unconditional when it fired (identical empty embedding), so
+                # reuse that prediction instead of paying a second forward.
+                uncond_unpacked = None
+                if any(
+                    getattr(l, "needs_uncond_forward", False)
+                    for l in self.losses
+                ):
+                    if batch.get("_caption_dropped"):
+                        uncond_unpacked = unpacked
+                    else:
+                        uncond_batch = self._build_uncond_batch(
+                            batch, device, compute_dtype
+                        )
+                        model_input_uncond = self.adapter.prepare_model_input(
+                            uncond_batch, noisy_latents, sigmas
+                        )
+                        with autocast_ctx:
+                            model_pred_uncond = self.transformer(
+                                **model_input_uncond
+                            )
+                        uncond_unpacked = self.adapter.unpack_prediction(
+                            model_pred_uncond
+                        )
+                        del model_pred_uncond
+                    if uncond_unpacked is not None and len(
+                        uncond_unpacked
+                    ) != len(unpacked):
+                        raise RuntimeError(
+                            f"guide_flow_matching: uncond prediction count "
+                            f"({len(uncond_unpacked)}) != cond prediction "
+                            f"count ({len(unpacked)}) — adapter contract "
+                            "violation in unpack_prediction."
+                        )
 
                 _t3 = _time.perf_counter()
 
@@ -727,6 +797,14 @@ class Trainer:
                     batch, latents, resolved_bc
                 )
 
+                # PFM original-pixel target features, keyed by target role:
+                # batch["pfm_feats"][key] is (B, L, C, h, w) fp16 (built by
+                # the dataset from the cache-build-time φ(I_orig) files).
+                pfm_feats_by_key = batch.get("pfm_feats") or {}
+                _target_keys_for_feats = list(
+                    self._resolve_target_keys(resolved_bc) or []
+                )
+
                 for i, (noise_i, unpacked_i, target_i) in enumerate(
                     zip(noises, unpacked, target_latents)
                 ):
@@ -734,6 +812,37 @@ class Trainer:
                     # 同源：standard v = noise - x0 → x0_hat = noise - v；
                     # data_ward v = x0 - noise → x0_hat = noise + v）
                     x0_hat = self.adapter.compute_x0_hat(noise_i, unpacked_i)
+
+                    # Resolve this target's φ(I_orig) features (if any):
+                    # preferred = explicit target key; fallback = single-entry
+                    # dict (single-target configs).
+                    feats_i = None
+                    if pfm_feats_by_key:
+                        _fk = (
+                            _target_keys_for_feats[i]
+                            if i < len(_target_keys_for_feats)
+                            and _target_keys_for_feats[i] in pfm_feats_by_key
+                            else (
+                                next(iter(pfm_feats_by_key))
+                                if len(pfm_feats_by_key) == 1
+                                else None
+                            )
+                        )
+                        if _fk is not None:
+                            _fb = pfm_feats_by_key[_fk]
+                            if isinstance(_fb, dict):
+                                # Precached multi-entry layout: per-key stacked
+                                # (B, ...) tensors -> this sample's tensors
+                                # (feat_{e}: (L, C, h, w); pix_{e}: (C, h, w)).
+                                feats_i = {
+                                    k: (v[i] if v.shape[0] > 1 else v[0])
+                                    for k, v in _fb.items()
+                                }
+                            else:
+                                _feats = _fb[i] if _fb.shape[0] > 1 else _fb[0]
+                                # Dataset features carry the builder's singleton
+                                # batch slot: (L, 1, C, h, w) -> (L, C, h, w).
+                                feats_i = _feats[:, 0] if _feats.dim() == 5 else _feats
 
                     loss_ctx = LossContext(
                         model_pred=unpacked_i,
@@ -744,6 +853,15 @@ class Trainer:
                         reference_latent=reference_latent,
                         loss_mask=batch.get("loss_mask"),
                         adapter=self.adapter,
+                        model_pred_uncond=(
+                            uncond_unpacked[i]
+                            if uncond_unpacked is not None
+                            and i < len(uncond_unpacked)
+                            else None
+                        ),
+                        extra=(
+                            {"pfm_feats": feats_i} if feats_i is not None else {}
+                        ),
                     )
 
                     for loss_module in self.losses:
@@ -753,6 +871,17 @@ class Trainer:
                             loss_breakdown.get(loss_module.name, 0.0)
                             + loss_val.item()
                         )
+                        # Component telemetry (e.g. pfm main/tone/freq):
+                        # merged into the SAME dict so components get the
+                        # identical /num_targets normalisation and reach
+                        # wandb as loss/<module>/<component>.
+                        for _ck, _cv in getattr(
+                            loss_module, "last_components", {}
+                        ).items():
+                            _bk = f"{loss_module.name}/{_ck}"
+                            loss_breakdown[_bk] = (
+                                loss_breakdown.get(_bk, 0.0) + _cv
+                            )
 
                 # Normalise so loss magnitude is independent of target count.
                 for k in loss_breakdown:
@@ -766,10 +895,63 @@ class Trainer:
                     self.last_loss_breakdown.update(self.noise_selector.last_stats)
 
                 # ── Backward ───────────────────────────────────────────
-                if self.accelerator is not None:
-                    self.accelerator.backward(total_loss)
+                # Non-finite loss guard: a single bad step (e.g. perceptual
+                # losses exploding at high sigma) would otherwise backprop
+                # NaN/Inf into the weights — and once the optimizer state is
+                # poisoned, EVERY later step is NaN. Skip backward + update
+                # but keep the normal per-step bookkeeping; max_grad_norm
+                # cannot save this (clip(nan) == nan).
+                nonfinite_loss = not torch.isfinite(total_loss)
+                # Circuit breaker (two triggers):
+                #   1. 20 consecutive non-finite losses — hard divergence.
+                #   2. >=10 non-finite within the last 25 steps — chronic
+                #      instability. (A purely consecutive counter is too
+                #      weak: an objective that NaNs every other sample
+                #      resets it forever while producing nothing.)
+                # Either way, abort instead of grinding NaN for hours.
+                if nonfinite_loss:
+                    self._consec_nonfinite = (
+                        getattr(self, "_consec_nonfinite", 0) + 1
+                    )
+                    if not hasattr(self, "_nonfinite_hist"):
+                        from collections import deque as _dq
+
+                        self._nonfinite_hist = _dq(maxlen=25)
+                    self._nonfinite_hist.append(1)
                 else:
-                    total_loss.backward()
+                    self._consec_nonfinite = 0
+                    if hasattr(self, "_nonfinite_hist"):
+                        self._nonfinite_hist.append(0)
+                _nan_rate = (
+                    sum(self._nonfinite_hist)
+                    if hasattr(self, "_nonfinite_hist")
+                    else 0
+                )
+                if self._consec_nonfinite >= 20 or _nan_rate >= 10:
+                    raise RuntimeError(
+                        f"step {self.step}: non-finite losses chronic "
+                        f"(consecutive={self._consec_nonfinite}, "
+                        f"rate={_nan_rate}/25) — training is diverged, "
+                        "aborting"
+                    )
+                if nonfinite_loss:
+                    logger.warning(
+                        f"step {self.step}: non-finite loss "
+                        f"({loss_breakdown}) — skipping optimizer step"
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    # Hygiene: the failed forward peaked the allocator's
+                    # reserved pool (inf activations). On Windows WDDM a
+                    # bloated reserve is never handed back and every later
+                    # step stalls for minutes — release it immediately.
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                if not nonfinite_loss:
+                    if self.accelerator is not None:
+                        self.accelerator.backward(total_loss)
+                    else:
+                        total_loss.backward()
 
                 _t4 = _time.perf_counter()
 
@@ -792,8 +974,38 @@ class Trainer:
                 if hasattr(self.adapter, '_target_grids'):
                     self.adapter._target_grids = None
 
+                # ── Gradient finiteness guard ──────────────────────────
+                # A finite loss can still backprop inf/nan grads in bf16
+                # (raw-L2 perceptual losses overflow easily through the VAE
+                # decode graph). clip_grad_norm_ with a non-finite total norm
+                # computes a nan scale factor that poisons EVERY grad, and
+                # optimizer.step() then applies them — killing the weights
+                # permanently (all later losses nan). Check before clip.
+                if not nonfinite_loss:
+                    _grad_params = [
+                        p
+                        for p in self.transformer.parameters()
+                        if p.requires_grad and p.grad is not None
+                    ]
+                    if _grad_params:
+                        _total_norm = torch.norm(
+                            torch.stack(
+                                [p.grad.detach().float().norm(2) for p in _grad_params]
+                            ),
+                            2,
+                        )
+                        if not torch.isfinite(_total_norm):
+                            logger.warning(
+                                f"step {self.step}: non-finite grad norm "
+                                f"({_total_norm.item()}) — skipping optimizer step"
+                            )
+                            nonfinite_loss = True  # reuse the skip path below
+                            self.optimizer.zero_grad(set_to_none=True)
+
                 # ── Gradient clipping + optimizer step ─────────────────
-                if self.accelerator is not None:
+                if nonfinite_loss:
+                    pass  # skip update; bookkeeping below still runs
+                elif self.accelerator is not None:
                     # With accelerator, step/zero_grad are called every
                     # iteration but accumulate() makes them no-ops on
                     # non-sync steps.
@@ -988,6 +1200,73 @@ class Trainer:
 
     # ── Validation ────────────────────────────────────────────────────
 
+    def _forward_autocast_ctx(self):
+        """Autocast context for transformer forwards OUTSIDE the training step
+        (validation loss, validation image sampling).
+
+        Mirrors the train-step decision (see train_epoch): on the
+        block_swap + nf4/int8 path the model is NOT passed through
+        accelerator.prepare(), so nothing else wraps forwards in autocast and
+        fp32 stragglers (norms/embedders) reach SDPA in fp32 — cuDNN rejects
+        fp32 with "No available kernel". Elsewhere, prepare() (or the plain
+        bf16-cast model) already handles dtype, so stay in nullcontext.
+        """
+        quantize_mode = self.config.get("training", {}).get("quantize", "none")
+        if (
+            self.accelerator is not None
+            and quantize_mode in ("nf4", "int8")
+            and self.config.get("training", {}).get("block_swap", 0) > 0
+            and self.mixed_precision not in ("no", None)
+        ):
+            return self.accelerator.autocast()
+        return nullcontext()
+
+    def _resolve_val_loss_modules(self):
+        """Loss modules that compute val_loss.
+
+        Defaults to the training losses themselves. `validation.loss_types`
+        (e.g. ["flow_matching"]) overrides — a pfm-trained run reports its
+        val metric in fm-MSE space so the number is directly comparable with
+        the fm baseline run. Freshly built modules receive
+        `validation.loss_params` (e.g. {"use_weighting": false} to match the
+        baseline config's flow_matching params).
+        """
+        if getattr(self, "_val_loss_modules", None) is not None:
+            return self._val_loss_modules
+        modules = list(self.losses)
+        loss_types = self.config.get("validation", {}).get("loss_types")
+        if loss_types:
+            loss_params = (
+                self.config.get("validation", {}).get("loss_params", {}) or {}
+            )
+            modules = []
+            for t in loss_types:
+                existing = next(
+                    (
+                        l
+                        for l in self.losses
+                        if getattr(l, "name", "") == t
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    modules.append(existing)
+                    continue
+                module = LossRegistry.get(t)(weight=1.0, **loss_params)
+                if hasattr(module, "to"):
+                    # pfm-style losses build their encoder lazily inside
+                    # .to(device, dtype) — must happen before the first use.
+                    module.to(self.device, torch.bfloat16)
+                if getattr(module, "requires_vae", False):
+                    module.vae_manager = self.vae_manager
+                modules.append(module)
+            logger.info(
+                "val_loss modules overridden by validation.loss_types: "
+                f"{[getattr(m, 'name', type(m).__name__) for m in modules]}"
+            )
+        self._val_loss_modules = modules
+        return modules
+
     def validate_epoch(
         self,
         epoch: int,
@@ -1036,6 +1315,7 @@ class Trainer:
         # its per-target-averaged value); divided by num_batches at the end so
         # the breakdown is a true mean and sums to avg_val_loss.
         val_breakdown = {}
+        val_loss_modules = self._resolve_val_loss_modules()
 
         try:
             with torch.no_grad():
@@ -1093,8 +1373,33 @@ class Trainer:
                     model_input = self.adapter.prepare_model_input(
                         batch, noisy_latents, sigmas
                     )
-                    model_pred = self.transformer(**model_input)
+                    with self._forward_autocast_ctx():
+                        model_pred = self.transformer(**model_input)
                     unpacked = self.adapter.unpack_prediction(model_pred)
+
+                    # Unconditional forward for guidance-corrected losses
+                    # (guide_flow_matching / DC-Gen Eq. 10).  The whole val
+                    # loop already runs under torch.no_grad(), so this second
+                    # forward costs activation memory only, no graph.
+                    uncond_unpacked = None
+                    if any(
+                        getattr(l, "needs_uncond_forward", False)
+                        for l in val_loss_modules
+                    ):
+                        uncond_batch = self._build_uncond_batch(
+                            batch, device, target_latents[0].dtype
+                        )
+                        model_input_uncond = self.adapter.prepare_model_input(
+                            uncond_batch, noisy_latents, sigmas
+                        )
+                        with self._forward_autocast_ctx():
+                            model_pred_uncond = self.transformer(
+                                **model_input_uncond
+                            )
+                        uncond_unpacked = self.adapter.unpack_prediction(
+                            model_pred_uncond
+                        )
+                        del model_pred_uncond
 
                     # ── Unified loss across all targets ──
                     reference_latent = self._get_reference_latent(
@@ -1106,7 +1411,9 @@ class Trainer:
                         dtype=target_latents[0].dtype,
                     )
                     batch_breakdown = {}
-                    for noise_i, unpacked_i, target_i in zip(noises, unpacked, target_latents):
+                    for ti, (noise_i, unpacked_i, target_i) in enumerate(
+                        zip(noises, unpacked, target_latents)
+                    ):
                         # 按 velocity_sign 分发估算干净 latent（与 losses/flow_matching.py 同源）
                         x0_hat = self.adapter.compute_x0_hat(noise_i, unpacked_i)
                         loss_ctx = LossContext(
@@ -1118,8 +1425,14 @@ class Trainer:
                             reference_latent=reference_latent,
                             loss_mask=batch.get("loss_mask"),
                             adapter=self.adapter,
+                            model_pred_uncond=(
+                                uncond_unpacked[ti]
+                                if uncond_unpacked is not None
+                                and ti < len(uncond_unpacked)
+                                else None
+                            ),
                         )
-                        for loss_module in self.losses:
+                        for loss_module in val_loss_modules:
                             loss_val = loss_module(loss_ctx)
                             total = total + loss_val
                             batch_breakdown[loss_module.name] = (
@@ -1258,13 +1571,17 @@ class Trainer:
             f"seed={self.val_seed}, steps={self.val_num_inference_steps}) ---"
         )
 
-        # Move VAE to GPU for decoding if it was offloaded to CPU
-        vae_device = None
-        if self.vae is not None:
-            vae_device = next(self.vae.parameters()).device
-            if vae_device.type == "cpu":
-                self.vae = self.vae.to(self.device)
-                logger.info("VAE moved to GPU for validation decoding")
+        # Acquire the shared VAE on GPU for decoding (manager moves it there
+        # unless vae_on_device=true keeps it resident; release() restores RAM).
+        if self.vae_manager is None:
+            logger.warning(
+                "generate_validation_images: no vae_manager wired — configure a "
+                "VAE-using component or validation.generate_images with a valid "
+                "vae_path. Skipping image generation."
+            )
+            return []
+        self.vae = self.vae_manager.acquire(self.device)
+        logger.info("VAE acquired on GPU for validation decoding")
 
         # VRAM snapshot before generation
         if torch.cuda.is_available():
@@ -1274,12 +1591,53 @@ class Trainer:
                 f"VRAM before val gen: allocated={alloc_before:.2f} GB, peak={peak_before:.2f} GB"
             )
 
-        # Disable block swap during inference -all blocks on GPU for speed
-        # (no gradients -no optimizer state -plenty of VRAM for all blocks)
+        # Park block swap for sampling — UNIFORMLY for both transformer
+        # classes. Class 1 stores `_offloader` and has disable_block_swap;
+        # class 2 (T2ITrainer-compatible) stores `offloader_double` + a
+        # `blocks_to_swap` int and has NO disable_block_swap, so a
+        # hasattr-gated heal silently skipped: after the last training
+        # backward the first `blocks_to_swap` blocks' weights legitimately
+        # sit on CPU (the ping-pong only guarantees backward consumed them),
+        # and the sampling forward then died on a cuda-vs-cpu matmul.
+        # Parking the offloader + zeroing blocks_to_swap makes forward()
+        # skip swap logic entirely; the whole-module .to(device) then heals
+        # placement (module-level .to is the Params4bit-safe path).
         base_model = self._get_base_model()
-        block_swap_was_enabled = hasattr(base_model, "disable_block_swap")
+        _off = getattr(base_model, "_offloader", None)
+        _offd = getattr(base_model, "offloader_double", None)
+        _swap_saved = {
+            "blocks_to_swap": getattr(base_model, "blocks_to_swap", 0),
+            "_offloader": _off,
+            "offloader_double": _offd,
+        }
+        block_swap_was_enabled = (_off is not None) or (_offd is not None)
         if block_swap_was_enabled:
-            base_model.disable_block_swap()
+            if hasattr(base_model, "_offloader"):
+                base_model._offloader = None
+            if hasattr(base_model, "offloader_double"):
+                base_model.offloader_double = None
+            if hasattr(base_model, "blocks_to_swap"):
+                base_model.blocks_to_swap = 0
+            base_model.to(self.device)
+
+        # Diagnostic (one-shot): verify the heal actually placed everything.
+        if torch.cuda.is_available():
+            _cpu = [
+                (n, tuple(p.shape), str(p.dtype))
+                for n, p in base_model.named_parameters()
+                if not p.is_cuda
+            ]
+            _cpu_extra = [
+                (n, tuple(b.shape))
+                for n, b in base_model.named_buffers()
+                if not b.is_cuda
+            ]
+            logger.info(
+                f"[VAL-GEN] after block-swap park: cpu params={len(_cpu)} "
+                f"cpu buffers={len(_cpu_extra)}"
+                + (f" e.g. {_cpu[:5]}" if _cpu else "")
+                + (f" buf e.g. {_cpu_extra[:3]}" if _cpu_extra else "")
+            )
 
         try:
             with torch.no_grad():
@@ -1396,8 +1754,10 @@ class Trainer:
                                 except Exception as _e:
                                     logger.warning(f"Failed to copy caption file: {_e}")
                         except Exception as e:
+                            import traceback
                             logger.warning(
-                                f"Image generation failed for sample {sample_idx}: {e}"
+                                f"Image generation failed for sample {sample_idx}: {e}\n"
+                                f"{traceback.format_exc()}"
                             )
 
                         sample_idx += 1
@@ -1417,14 +1777,30 @@ class Trainer:
             np.random.seed(np_seed)
             torch.backends.cudnn.deterministic = False
 
-            # Re-enable block swap for training
+            # Re-enable block swap for training. Un-park the offloader and
+            # blocks_to_swap; the NEXT training step's _pre_forward
+            # (move_to_device_except_swap_blocks + prepare_block_swap_before_forward)
+            # re-establishes the CPU/GPU ping-pong placement, so no explicit
+            # device reshuffle is needed here.
             if block_swap_was_enabled:
-                base_model.restore_block_swap()
+                _saved = _swap_saved
+                if hasattr(base_model, "_offloader"):
+                    base_model._offloader = _saved["_offloader"]
+                if hasattr(base_model, "offloader_double"):
+                    base_model.offloader_double = _saved["offloader_double"]
+                if hasattr(base_model, "blocks_to_swap"):
+                    base_model.blocks_to_swap = _saved["blocks_to_swap"]
+                # Class 1 keeps its own save/restore bookkeeping consistent.
+                if (
+                    _saved["_offloader"] is not None
+                    and hasattr(base_model, "_saved_offloader")
+                ):
+                    base_model._saved_offloader = None
 
-            # Move VAE back to CPU if it was offloaded
-            if vae_device is not None and vae_device.type == "cpu":
-                self.vae = self.vae.to("cpu")
-                torch.cuda.empty_cache()
+            # Release the shared VAE (back to RAM unless vae_on_device=true)
+            self.vae_manager.release()
+            self.vae = None
+            torch.cuda.empty_cache()
 
             from UnifiedTrainer.utils.flush import flush
             flush()
@@ -1582,16 +1958,20 @@ class Trainer:
                 model_input_cond = self._prepare_model_input(
                     batch, latent_list, sigmas, condition_rows
                 )
+                with self._forward_autocast_ctx():
+                    v_pred_cond = self.transformer(**model_input_cond)
                 v_conds = self.adapter.unpack_prediction(
-                    self.transformer(**model_input_cond)
+                    v_pred_cond
                 )  # list[torch.Tensor]
 
                 # Unconditional forward.
                 model_input_uncond = self._prepare_model_input(
                     uncond_batch, latent_list, sigmas, condition_rows
                 )
+                with self._forward_autocast_ctx():
+                    v_pred_uncond = self.transformer(**model_input_uncond)
                 v_unconds = self.adapter.unpack_prediction(
-                    self.transformer(**model_input_uncond)
+                    v_pred_uncond
                 )  # list[torch.Tensor]
 
                 # Per-target CFG: v_guided[i] = v_uncond[i] + scale * (v_cond[i] - v_uncond[i])
@@ -1603,7 +1983,8 @@ class Trainer:
                 model_input = self._prepare_model_input(
                     batch, latent_list, sigmas, condition_rows
                 )
-                model_pred = self.transformer(**model_input)
+                with self._forward_autocast_ctx():
+                    model_pred = self.transformer(**model_input)
                 velocities = self.adapter.unpack_prediction(model_pred)
                 # velocities is list[torch.Tensor]
 
@@ -1887,11 +2268,23 @@ class Trainer:
     def _build_uncond_batch(
         self, batch: dict, device: torch.device, dtype: torch.dtype
     ) -> dict:
-        """Build an unconditional batch dict for CFG.
+        """Build an unconditional batch dict for CFG / guidance correction.
 
-        Replaces the prompt embeddings in the batch with the cached empty
-        (unconditional) embeddings. All other fields (latents, batch_configs)
-        remain identical to the conditional batch.
+        The uncond condition is composed of TWO SEPARATE parts (krea2-style):
+          1. the cached global empty-text embedding, swapped into
+             ``batch["embeddings"]`` (the mature unconditional text), and
+          2. the reference images, which stay in ``batch["latents"]`` untouched
+             (shared via the shallow copy).
+        The adapter marks the batch with ``_uncond_empty_text`` and synthesizes
+        the references' VLM slot layout over the text-only empty embedding, so
+        the uncond forward keeps the reference conditioning instead of dropping
+        it (the transformer overwrites slot content with the latent rows, so
+        only the slot layout matters).
+
+        Used by:
+        - validation CFG sampling (``val_guidance_scale > 1``),
+        - guide_flow_matching's per-step uncond forward (DC-Gen Eq. 10 —
+          the empty-condition pass of the corrected objective).
         """
         import numpy as np
 
@@ -1903,6 +2296,8 @@ class Trainer:
                 )
             from UnifiedTrainer.data.embedding_cache import EmbeddingCache
             npz = EmbeddingCache.load(self._val_empty_embed_path)
+            uol = npz.get("user_opener_len", -1)
+            uol = int(uol) if uol is not None else -1
             self._val_empty_embed = {
                 "prompt_embed": torch.from_numpy(npz["prompt_embed"]).to(
                     dtype=dtype, device=device
@@ -1910,6 +2305,10 @@ class Trainer:
                 "prompt_embeds_mask": torch.from_numpy(
                     npz["prompt_embeds_mask"]
                 ).to(device=device),
+                # Token offset where ti2i reference slots belong in the
+                # extracted row (recorded by encode_text at cache time;
+                # <=0 on older caches -> adapter falls back to stream head).
+                "user_opener_len": uol if uol > 0 else 0,
             }
 
         # Deep-copy the batch, replacing only the embeddings.
@@ -1926,6 +2325,10 @@ class Trainer:
             }
             for _ in range(n_samples)
         ]
+        uncond_batch["_uncond_empty_text"] = True
+        uncond_batch["_uncond_ref_slot_pos"] = self._val_empty_embed.get(
+            "user_opener_len", 0
+        )
         return uncond_batch
 
     @staticmethod

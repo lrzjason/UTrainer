@@ -1,0 +1,92 @@
+{
+    "model": "qwen_image21",
+    "model_path": "E:/hf_models/Qwen-Image-2.1",
+    "vae_path": "E:/hf_models/Qwen-Image-2.1/vae",
+    "text_encoder_path": "E:/hf_models/Qwen-Image-2.1/text_encoder",
+    "tokenizer_path": "E:/hf_models/Qwen-Image-2.1/tokenizer",
+    "scheduler_path": "E:/hf_models/Qwen-Image-2.1/scheduler",
+    "timestep_shift_mode": "dynamic_shift",
+    "data": {
+        "cache_dir": "cache/qwen_image21_lora",
+        "rebuild_index": false,
+        "dataset_configs": [
+            {
+                "train_data_dir": "E:/images/qwen_image21/train",
+                "resolution": 512,
+                "repeats": 1,
+                "recreate_cache": false,
+                "recreate_latents": false,
+                "recreate_embeddings": false,
+                "image_configs": {
+                    "T": {
+                        "suffix": "_t"
+                    }
+                },
+                "target_configs": {
+                    "T": [
+                        {
+                            "image": "T"
+                        }
+                    ]
+                },
+                "caption_configs": {
+                    "train_T": {
+                        "ext": ".txt",
+                        "image": "T"
+                    }
+                },
+                "batch_configs": [
+                    {
+                        "target_config": "T",
+                        "caption_config": "train_T",
+                        "caption_dropout": 0.1
+                    }
+                ]
+            }
+        ],
+        "num_workers": 0
+    },
+    "losses": [
+        {
+            "type": "flow_matching",
+            "weight": 1
+        }
+    ],
+    "training": {
+        "network_type": "lora",
+        "lora_rank": 16,
+        "lora_alpha": 16,
+        "lora_target_modules": [
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out"
+        ],
+        "batch_size": 1,
+        "learning_rate": 0.0001,
+        "max_steps": -1,
+        "num_epochs": 3,
+        "optimizer": "adamw8bit",
+        "gradient_checkpointing": true,
+        "quantize": "torchao_float8",
+        "max_grad_norm": 1,
+        "lr_scheduler": "constant"
+    },
+    "output": {
+        "dir": "output/qwen_image21_lora",
+        "save_name": "lora",
+        "checkpoint_every": 50
+    },
+    "reporter": {
+        "type": "tensorboard",
+        "port": 6006,
+        "log_dir": null,
+        "log_every": 1
+    },
+    "validation": {
+        "val_every_epoch": 1,
+        "val_seed": 42,
+        "generate_images": true,
+        "resolution": 512
+    }
+}

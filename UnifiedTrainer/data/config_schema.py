@@ -8,8 +8,10 @@ This mirrors T2ITrainer's config structure:
     caption_configs  — named groups defining caption sources (ext, image, reference_list, instruction)
     batch_configs    — combinatorial list tying target + caption + reference + per-entry dropout
 
-All five layers are required — configs must specify target_configs, reference_configs,
-caption_configs, and batch_configs explicitly.
+Four layers are required — configs must specify target_configs, caption_configs, and
+batch_configs explicitly. `reference_configs` is required only when a batch_config
+entry names one via `reference_config`; pure text-to-image configs (no reference
+images) omit it entirely, as the shipped qwen_image21 LoRA/LoKr examples do.
 
 MiniMax-H3 统一媒体管线（D3）扩展：
     - ImageConfig.media: "image" | "video"（默认 "image"）——图像/视频共用同一
@@ -227,14 +229,12 @@ class DatasetConfig:
         for key, entries in raw_target_configs.items():
             target_configs[key] = [TargetEntry.from_dict(e) for e in entries]
 
-        # ── Parse reference_configs (required) ───────────────────────
-        raw_reference_configs = d.get("reference_configs")
-        if not raw_reference_configs:
-            raise ValueError(
-                "reference_configs is required. Define at least one named reference group "
-                "with an 'image' key and 'sample_type' (from_same_name or from_subdir).\n"
-                "Example: \"reference_configs\": {\"train_D\": [{\"image\": \"D\", \"sample_type\": \"from_same_name\"}]}"
-            )
+        # ── Parse reference_configs (optional) ───────────────────────
+        # Only needed for configs that actually consume reference images. A
+        # pure text-to-image config references none, so an empty/absent block
+        # is valid; batch_configs below still hard-fail if an entry names a
+        # reference group that does not exist.
+        raw_reference_configs = d.get("reference_configs") or {}
         reference_configs: Dict[str, List[ReferenceEntry]] = {}
         for key, entries in raw_reference_configs.items():
             reference_configs[key] = [ReferenceEntry.from_dict(e) for e in entries]
