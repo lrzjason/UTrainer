@@ -25,7 +25,7 @@
 | 层 | 实现 | 说明 |
 |----|------|------|
 | schema | `data/config_schema.py` | `ImageConfig.media: "image"\|"video"`（默认 image）+ `DatasetConfig.video_frames/video_fps` 一次加入；validate 规则（video 键只能被同名媒体 target 引用、17n+5 对齐）已落地 |
-| 媒体加载 | `data/video_utils.py` | `load_image_frames(path, size) -> (1,C,1,H,W)`（PIL → 5D）；`load_video_frames(path, num_frames, fps=24) -> (1,C,T,H,W)`（PyAV 逐帧解码、24fps 均匀抽帧、等比缩放+中心裁剪、17n+5 对齐、5–15s 时长校验）；`snap_frames(n)` / `video_latent_num_frames(n)`（包装 PR packing 函数） |
+| 媒体加载 | `data/video_utils.py` | `load_image_frames(path, size, channels=3) -> (1,C,1,H,W)`（PIL → 5D；`channels=4` 时按 RGBA 加载，保留 PNG/WebP alpha——由 `adapter.vae_pixel_channels` 驱动，qwen_image21=4，H3/krea2 等=3 行为逐位不变）；`load_video_frames(path, num_frames, fps=24) -> (1,C,T,H,W)`（PyAV 逐帧解码、24fps 均匀抽帧、等比缩放+中心裁剪、17n+5 对齐、5–15s 时长校验）；`snap_frames(n)` / `video_latent_num_frames(n)`（包装 PR packing 函数） |
 | 缓存 | `cache_builder.py` 单一媒体分发 | 按 `media` 字段分发 → `adapter.encode_video(vae, frames)` → **统一 (C,T,H,W) npz**（图像 = (C,1,H,W)，B 维折叠进 index 样本维度）；每样本 JSON 记录 media/num_frames |
 | dataset/collate/bucket | `dataset.py` | 5D 堆叠与 bucket 逻辑在 P1 以图像样本 (C,1,H,W) 打通并硬化；P2 视频只是 T 变大，代码零改动 |
 | 音频 | — | `media="audio"` 不做；schema validate 直接拒绝（D3/D6） |
@@ -60,6 +60,9 @@
 
 - `encode_video` / `velocity_sign` / `compute_x0_hat` 在 `BaseModelAdapter`
   上有默认实现（图像适配器行为不变）；
+- `vae_pixel_channels`（默认 3）：数据管线按该通道数加载图像媒体——
+  3=RGB（默认，历史行为逐位不变），4=RGBA（qwen_image21：PNG/WebP 真实
+  alpha 直通四通道 VAE，透明训练；见 `md/08` §5.1）。H3 未覆写，保持 3。
 - `decode_validation_video` **刻意不定义为 base 方法**：引擎验证循环用
   `hasattr(self.adapter, "decode_validation_video")` + `latent.ndim == 5 and
   latent.shape[2] > 1` 分发，base 定义会翻转所有图像适配器的 hasattr，

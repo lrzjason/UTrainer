@@ -72,7 +72,8 @@
     "output": {
         "dir": "output/qwen_image21_lokr",
         "save_name": "lokr",
-        "checkpoint_every": 50
+        "save_every_epoch": 1,
+        "save_start_epoch": 0
     },
     "reporter": {
         "type": "tensorboard",

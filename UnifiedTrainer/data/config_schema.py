@@ -153,13 +153,49 @@ class CaptionConfig:
 
 
 @dataclass
+class MaskConfig:
+    """A named edit-mask configuration (6th config layer, optional).
+
+    The mask image is a single-channel PNG the same size as its host image
+    (255 = edited region, 0 = untouched).  At cache-build time it goes
+    through the SAME deterministic bucket crop as the target, then is
+    area-downsampled to the latent grid and stored as an npz next to the
+    sample.  At training time the resolved mask lands in
+    ``LossContext.loss_mask`` so region-weighted losses
+    (e.g. ``masked_flow_matching``) can upweight the edited region.
+
+    The mask grid always matches the TARGET latent (the loss is computed on
+    the target); which variant the sample was built from is a separate
+    concern owned by reference_configs.
+    """
+    key: str
+    image: str                          # key into image_configs (the mask file)
+
+    @classmethod
+    def from_dict(cls, key: str, d: dict) -> "MaskConfig":
+        if "image" not in d:
+            raise ValueError(
+                f"mask_configs['{key}'] requires an 'image' key "
+                f"referencing an image_configs entry (the mask file)."
+            )
+        return cls(key=key, image=d["image"])
+
+
+@dataclass
 class BatchConfig:
     """A single resolved batch_config entry — one training combination."""
     target_config: str                  # key into target_configs
     caption_config: str                 # key into caption_configs
     reference_config: Optional[str] = None  # key into reference_configs
+    mask_config: Optional[str] = None       # key into mask_configs (optional)
     caption_dropout: float = 0.0
     reference_dropout: float = 0.0
+    # Relative sampling weight for this batch_config (single-dataset_config
+    # mode, where dataset-level sample_weight cannot discriminate between
+    # batch_configs). None = all entries equal probability (legacy behaviour);
+    # set it and the dataset samples this entry with probability
+    # weight/sum(weights) at each step.
+    weight: Optional[float] = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "BatchConfig":
@@ -167,8 +203,10 @@ class BatchConfig:
             target_config=d["target_config"],
             caption_config=d.get("caption_config", ""),
             reference_config=d.get("reference_config"),
+            mask_config=d.get("mask_config"),
             caption_dropout=d.get("caption_dropout", 0.0),
             reference_dropout=d.get("reference_dropout", 0.0),
+            weight=d.get("weight"),
         )
 
 
@@ -196,6 +234,7 @@ class DatasetConfig:
     target_configs: Dict[str, List[TargetEntry]] = field(default_factory=dict)
     reference_configs: Dict[str, List[ReferenceEntry]] = field(default_factory=dict)
     caption_configs: Dict[str, CaptionConfig] = field(default_factory=dict)
+    mask_configs: Dict[str, MaskConfig] = field(default_factory=dict)
     batch_configs: List[BatchConfig] = field(default_factory=list)
 
     @classmethod
@@ -251,6 +290,17 @@ class DatasetConfig:
         for key, cfg in raw_caption_configs.items():
             caption_configs[key] = CaptionConfig.from_dict(key, cfg)
 
+        # ── Parse mask_configs (optional — 6th layer) ───────────────
+        # Only needed by configs that want region-weighted losses. A
+        # config that omits it entirely keeps the pre-mask behaviour:
+        # no mask file is resolved, no loss_mask lands in the batch, and
+        # every loss must degrade gracefully (masked_flow_matching
+        # falls back to plain flow matching).
+        raw_mask_configs = d.get("mask_configs") or {}
+        mask_configs: Dict[str, MaskConfig] = {}
+        for key, cfg in raw_mask_configs.items():
+            mask_configs[key] = MaskConfig.from_dict(key, cfg)
+
         # ── Parse batch_configs (required) ───────────────────────────
         raw_batch_configs = d.get("batch_configs")
         if not raw_batch_configs:
@@ -278,6 +328,7 @@ class DatasetConfig:
             target_configs=target_configs,
             reference_configs=reference_configs,
             caption_configs=caption_configs,
+            mask_configs=mask_configs,
             batch_configs=batch_configs,
         )
 
@@ -344,6 +395,26 @@ class DatasetConfig:
                     f"batch_configs[{i}].reference_config='{bc.reference_config}' "
                     f"not found in reference_configs. Available: {list(self.reference_configs.keys())}"
                 )
+            if bc.mask_config and bc.mask_config not in self.mask_configs:
+                raise ValueError(
+                    f"batch_configs[{i}].mask_config='{bc.mask_config}' "
+                    f"not found in mask_configs. Available: {list(self.mask_configs.keys())}"
+                )
+
+        # Validate mask_configs reference valid image_configs keys
+        # (mask files are single-channel PNGs; video media is not a mask)
+        for m_key, m_cfg in self.mask_configs.items():
+            if m_cfg.image not in self.image_configs:
+                raise ValueError(
+                    f"mask_configs['{m_key}'] references image '{m_cfg.image}' "
+                    f"which is not in image_configs. Available: {list(self.image_configs.keys())}"
+                )
+            img_cfg = self.image_configs.get(m_cfg.image)
+            if img_cfg is not None and img_cfg.media == "video":
+                raise ValueError(
+                    f"mask_configs['{m_key}'] references video media image "
+                    f"'{m_cfg.image}'. Masks are single-channel images only."
+                )
 
         # 视频帧数 17n+5 对齐（D3：视频 VAE 分块前提，17 像素帧/块 → 5 latent 帧/块）。
         # 仅含视频媒体的 dataset 才执行——图像-only 配置的 video_frames 无实际用途，
@@ -364,6 +435,7 @@ class DatasetConfig:
             f"{len(self.target_configs)} target_groups, "
             f"{len(self.reference_configs)} reference_groups, "
             f"{len(self.caption_configs)} caption_groups, "
+            f"{len(self.mask_configs)} mask_groups, "
             f"{len(self.batch_configs)} batch_configs"
         )
 

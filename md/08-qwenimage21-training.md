@@ -39,7 +39,7 @@
 
 | 项 | 值 |
 |----|-----|
-| VAE | `diffusers.AutoencoderKLQwenImage21`（通用基础设施导入）：z_dim=64 通道、16× 空间压缩、`latents_mean/latents_std`（64 值，取自 vae.config）归一化、5D (B,C,T,H,W) |
+| VAE | `diffusers.AutoencoderKLQwenImage21`（通用基础设施导入）：z_dim=64 通道、16× 空间压缩、**in/out_channels=4（RGBA，alpha 为真实输入通道）**、`latents_mean/latents_std`（64 值，取自 vae.config）归一化、5D (B,C,T,H,W) |
 | latent | pixel/16；**不 patchify**（`patch_size=1`），token=latent 像素格点，每 token 覆盖 16×16 像素 |
 | 像素对齐 | 必须被 32 整除（pipeline `vae_scale_factor*2`；`bucket_divisibility=32` 覆写） |
 | Transformer | 单流 32 块；inner_dim=4096（32 头×128）；context_in_dim=4096（Qwen3-VL）；mlp_ratio=3（SwiGLU）；axes_dims_rope=(16,56,56)；eps=1e-6；**全块共享一个 `modulation`**（SiLU+Linear→4×dim，无 per-block 调制参数） |
@@ -67,8 +67,9 @@
   双键原因：`cache_builder._encode_caption` 会 `pop("image_token_mask")`，npz 里
   只留 `img_mask`；多模态槽位掩码因此能存活到训练时。`prepare_model_input` 按
   `img_mask` → `image_token_mask` → 全 False（caption dropout / 纯文本）顺序读取。
-- RGBA 参考图对视觉编码器平铺白底（pipeline 同款）；VAE 仍读四通道（本 trainer
-  参考图经 bucket 裁剪，RGB）。
+- RGBA 参考图对视觉编码器平铺白底（pipeline 同款）；VAE 仍读四通道——
+  **目标/参考图经 bucket 裁剪后按 `vae_pixel_channels=4` 以 RGBA 加载**，
+  PNG/WebP 的真实 alpha 一路进 VAE（透明训练，见 §5.1）。
 
 ### 4.2 `prepare_model_input`（联合序列装配）
 
@@ -124,10 +125,23 @@
 - LoRA：PEFT 默认路径。示例 targets `to_q/to_k/to_v/to_out`（子串匹配命中
   `to_out.0`）；`norm_q/norm_k`（RMSNorm）天然不在目标内。每块 4 个 Linear ×
   32 块 = 128 层。
-- LoKr：`lokr_model_type: "qwen21"` → 块内 attn 4 投影 + `img_mlp
-  .proj/.gate_layer/.out`（SwiGLU 命名与 qwen v1 的 `ff.net` / krea2 的
-  `ff.gate` 都不同，预设不可复用）。`img_in/modulation.1/norm_out.linear/
-  proj_out/txt_in.*` 可通过显式 `lokr_target_modules` 选择性加入。
+- LoKr：默认（`lokr_target_modules: null`）对**全部 nn.Linear** 挂 LoKr
+  （krea2 约定推广到所有 model_type；`img_in/modulation.1/norm_out.linear/
+  proj_out/txt_in.*` 也一并包含）。显式 `lokr_target_modules`（fnmatch
+  列表）才缩小范围；`_QWEN21_PATTERNS`（块内 attn 4 投影 + `img_mlp
+  .proj/gate_layer/.out`；SwiGLU 命名与 qwen v1 的 `ff.net` / krea2 的
+  `ff.gate` 都不同，预设不可复用）退化为参考表，需要"仅块内层"时整表复制
+  进 `lokr_target_modules`。
+- **LoKr 默认使用 full rank**（项目约定，自
+  `qwen_image21_cloth_1024_v4` 配置起生效）：`training.lokr_full_rank: true`，
+  等价于 musubi GUI 勾选 full rank——`LokrConfig.__post_init__`
+  （`networks/lokr_module.py:82-88`）把 rank/alpha 覆写为
+  `FULL_RANK_SENTINEL`（9999），W1/W2 双双取全矩阵
+  （`lokr_module.py:267-286`），`scale = alpha/rank = 1.0`，检查点 alpha
+  buffer = 9999，与 musubi full-rank 检查点兼容。副作用：该模式下配置里的
+  `lora_rank/lokr_alpha/lokr_factor` 被忽略（保留仅为兼容 musubi 配置
+  习惯）；全矩阵参数等于目标层全量权重，参数量 / checkpoint 体积 / 显存
+  需求均高于低秩分解，改用低秩需显式设回 `false` 并重新调 rank/alpha。
 - 检查点：LoRA 走 `get_peft_model_state_dict`、LoKr 走 `lycoris_net.save_weights`
   —— 全部通用，无需改动。ComfyUI 副本走通用 krea2 风格键名替换
   （`transformer_blocks→blocks`、`to_q→wq`…）；**注意**：ComfyUI 对 2.1 的键名
@@ -141,6 +155,40 @@ bucket_configs` 不变；adapter 以 `resolution_config`（512/768/1024/1536/204
 五档 bucket，全部 32 整除，脚本断言 0 违规）、`bucket_divisibility=32`、
 `latent_channels=64`、`embedding_dim=4096` 接入。latent 走统一 5D 缓存
 （图像=(C,1,H,W)）；embedding 走 int8+scale npz（bool 掩码原样保留）。
+
+### 5.1 透明图（RGBA）训练——PNG alpha 直通 VAE
+
+2.1 的 VAE 是 **in/out_channels=4 的因果视频 VAE**，官方 pipeline 以
+`img.convert("RGBA")` 喂图（`pipeline_qwenimage21.py:653-663`），alpha 是
+真实输入而非占位。本 trainer 通过 adapter 能力声明打通整条链路（仍零
+schema / 零配置改动）：
+
+- `QwenImage21Adapter.vae_pixel_channels = 4`（base 默认 3）；krea2 等
+  RGB VAE 适配器不受影响（getattr 默认 3，行为逐位不变）。
+- `cache_builder._construct_media` 按该通道数加载图像媒体：
+  `load_image_frames(..., channels=4)` → `PIL.convert("RGBA")` → bucket
+  等比缩放+中心裁剪（PIL 对 RGBA 的 resize 按 alpha 预乘 RGB，与官方
+  pipeline 的 PIL resize 同语义）→ `to_tensor(channels=4)` →
+  `(1, 4, 1, H, W)` float32 [0,1]；alpha 逐像素保留。
+- `to_tensor_universal` 对**全部四通道**做扩散归一化（mean/std 以 0.5
+  补齐 alpha 通道 → 2a−1，[-1,1]）——与 diffusers `VaeImageProcessor.normalize`
+  逐通道 2x−1 完全一致（pipeline 同款输入）。
+- `encode_video`（base 默认实现，T==1）的 PIL 往返对 (H,W,4) uint8 推断出
+  `RGBA` 模式，四通道张量直送 `encode_image`；`encode_image` 仅在输入为
+  3 通道时才补全不透明 alpha（外部调用方兼容路径）。
+- 不透明源（RGB PNG / JPEG / 全 255 alpha）在 3ch 与 4ch 路径下 **RGB
+  逐位相同**（alpha 恒 1.0）——历史缓存的 latent 数值不变。
+- 缓存预览图：4 通道源改存**无损 PNG**（`{base}_{res}.png`，webp 有损会
+  破坏 alpha 边缘）；3 通道源仍为 `{base}_{res}.webp`。注意：qwen21 的
+  旧缓存（alpha≡1.0 的 webp 布局）会被识别为不完整而自动重编码——
+  含真实透明的 PNG 数据集借此自动刷新 latents，无需手动
+  `recreate_latents`；若只想强制全量重建也可显式设置。
+- pfm 的 φ(I_orig) 目标只取 RGB 三通道（`_save_pfm_feats` 已切片
+  `frames[:, :3, 0]`）；caption 参考图喂视觉编码器仍走 RGB（RGBA 平铺
+  白底，pipeline 同款），与透明训练正交。
+- 验证出图：`decode_latent` 输出 4 通道 RGBA，trainer 既有
+  `(image/2+0.5).clamp(0,1)` + `PILImage.fromarray` 路径原样生成 RGBA
+  验证 PNG，零改动。
 
 ## 6. 时间/方向约定
 

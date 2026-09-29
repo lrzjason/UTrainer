@@ -95,9 +95,19 @@ class UnifiedDataset(Dataset):
                     "target_config": bc.target_config,
                     "caption_config": bc.caption_config,
                     "reference_config": bc.reference_config,
+                    "mask_config": bc.mask_config,
                     "caption_dropout": bc.caption_dropout,
                     "reference_dropout": bc.reference_dropout,
+                    "weight": bc.weight,
                 })
+        # Per-batch_config sampling weights: when at least one entry declares a
+        # weight, sample with those relative weights (None entries count as 1.0,
+        # i.e. legacy equal probability among the unweighted ones).
+        _w = [float(bc["weight"]) if bc.get("weight") is not None else 1.0
+              for bc in self.batch_configs]
+        self._bc_weighted = any(
+            bc.get("weight") is not None for bc in self.batch_configs)
+        self._bc_weights = _w
 
         # Per-sample reference signature — lets the batch sampler keep batches
         # homogeneous w.r.t. reference availability.  The model packs reference
@@ -225,9 +235,16 @@ class UnifiedDataset(Dataset):
         with open(json_path, "r", encoding="utf-8") as f:
             sample = json.load(f)
 
-        # T2ITrainer pattern: randomly select 1 batch_config at training time
+        # T2ITrainer pattern: select 1 batch_config at training time.
+        # Equal probability by default; if any entry declares a "weight",
+        # sample by those relative weights instead.
         if self.batch_configs:
-            batch_config = random.choice(self.batch_configs)
+            if self._bc_weighted:
+                batch_config = random.choices(
+                    self.batch_configs, weights=self._bc_weights, k=1
+                )[0]
+            else:
+                batch_config = random.choice(self.batch_configs)
         else:
             batch_config = {}
 
@@ -236,12 +253,14 @@ class UnifiedDataset(Dataset):
             target_key = batch_config["target_config"]
             caption_key = batch_config.get("caption_config", "")
             reference_key = batch_config.get("reference_config")
+            mask_key = batch_config.get("mask_config")
             caption_dropout = batch_config.get("caption_dropout", 0.0)
             reference_dropout = batch_config.get("reference_dropout", 0.0)
         else:
             target_key = None
             caption_key = None
             reference_key = None
+            mask_key = None
             caption_dropout = 0.0
             reference_dropout = 0.0
 
@@ -375,17 +394,36 @@ class UnifiedDataset(Dataset):
                         caption_text_paths.append(tp)
                         break
 
+        # Load edit mask (optional — mask_configs layer).  The mask grid
+        # matches the TARGET latent, so it applies to whatever target this
+        # batch_config trains.  Absent mask → None → the loss degrades to
+        # plain flow matching (t2i / noop views carry no mask on purpose).
+        loss_mask = None
+        if mask_key:
+            entry = (sample.get("loss_mask") or {}).get(mask_key)
+            if isinstance(entry, dict) and entry.get("npz_path"):
+                try:
+                    loss_mask = self.cache.load_latent(entry["npz_path"])
+                except Exception as e:
+                    logger.warning(
+                        f"Could not load mask {entry['npz_path']}: {e}"
+                    )
+                    loss_mask = None
+
         return {
             "group_id": os.path.splitext(os.path.basename(json_path))[0],
             "latents": latents,
             "pfm_feats": pfm_feats,
+            "loss_mask": loss_mask,
             "embedding": embedding,
             "batch_config": {
                 "target_config": target_key,
                 "caption_config": caption_key,
                 "reference_config": reference_key,
+                "mask_config": mask_key,
                 "caption_dropout": caption_dropout,
                 "reference_dropout": reference_dropout,
+                "weight": batch_config.get("weight"),
             },
             "image_configs": sample.get("image_configs", {}),
             "bucket": sample.get("bucket", datarow.get("bucket", "")),
@@ -408,12 +446,27 @@ def collate_fn(batch: list) -> dict:
         "group_ids": [b["group_id"] for b in batch],
         "latents": {},
         "pfm_feats": {},
+        "loss_mask": None,
         "embeddings": [b["embedding"] for b in batch],
         "image_configs": [b["image_configs"] for b in batch],
         "buckets": [b["bucket"] for b in batch],
         "batch_configs": [b["batch_config"] for b in batch],
         "caption_text_paths": [b.get("caption_text_paths", []) for b in batch],
     }
+
+    # Edit masks: stack when EVERY sample has one.  A batch mixing masked
+    # and unmasked samples would silently misalign the weights, so fall back
+    # to None (plain flow matching) and warn once.
+    masks = [b.get("loss_mask") for b in batch]
+    if all(m is not None for m in masks):
+        result["loss_mask"] = torch.stack(masks)
+    elif any(m is not None for m in masks):
+        logger.warning(
+            "batch mixes samples with and without loss_mask "
+            f"({sum(m is not None for m in masks)}/{len(masks)} masked) — "
+            "training this batch WITHOUT mask weighting. Keep mask "
+            "availability consistent within a dataset_config view."
+        )
 
     # Stack PFM target features by role: tensor layout (L, C, h, w) ->
     # (B, L, C, h, w); precached dict layout stacks per key (B, ...).

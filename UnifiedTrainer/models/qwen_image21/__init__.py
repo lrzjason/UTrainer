@@ -38,6 +38,14 @@ Edit path status: implemented end-to-end (multimodal encode_text + VAE
 reference packing in prepare_model_input), but the shipped example configs
 are text-to-image only — T2I is the verified milestone; edit-config examples
 follow once model weights are available.
+
+Transparency (RGBA) training:
+    ``vae_pixel_channels = 4`` — the data pipeline loads source PNG/WebP
+    images as RGBA (``load_image_frames(..., channels=4)``) and feeds the
+    real alpha channel to the 4-channel VAE, matching the official pipeline's
+    ``img.convert("RGBA")`` input.  Opaque sources get alpha=255 and produce
+    bit-identical latents to the historical 3-channel + padded-alpha path.
+    See md/08-qwenimage21-training.md §5.1 for the full chain.
 """
 from __future__ import annotations
 
@@ -364,6 +372,18 @@ class QwenImage21Adapter(BaseModelAdapter):
         return 64
 
     @property
+    def vae_pixel_channels(self) -> int:
+        # 4 = RGBA: the 2.1 VAE is a 4-channel causal video VAE
+        # (vae.config in_channels=4 / out_channels=4) and the official
+        # pipeline feeds it `img.convert("RGBA")` — the alpha channel is a
+        # real input the VAE encodes (transparency training), not padding.
+        # Declaring 4 makes the data pipeline load source PNG/WebP images
+        # as RGBA (transforms.to_tensor channels=4) so real alpha reaches
+        # encode_image; opaque sources simply get alpha=255, byte-identical
+        # to the historical 3-channel + padded-alpha path.
+        return 4
+
+    @property
     def vae_scale_factor(self) -> int:
         return 16
 
@@ -396,11 +416,13 @@ class QwenImage21Adapter(BaseModelAdapter):
             # in_channels=4 / out_channels=4), and the official pipeline feeds it
             # RGBA: `pipeline_qwenimage21.py` does `img.convert("RGBA")` before
             # `image_processor.preprocess(...).unsqueeze(2)` (lines 653-663).
-            # The trainer's media pipeline always decodes to RGB, so a 3-channel
-            # tensor would crash conv_in ("weight of size [96, 4, 3, 3] ...
-            # expected input[...] to have 4 channels, but got 3"). Pad a fully
-            # transparent alpha channel to reproduce the pipeline's RGBA input
-            # exactly — `.convert("RGBA")` also sets alpha to 255, i.e. 1.0.
+            # A 4-channel input carries a REAL alpha channel (PNG/WebP
+            # transparency loaded by the data pipeline via
+            # `vae_pixel_channels=4`) and is fed through unchanged.  A legacy
+            # 3-channel tensor would crash conv_in ("weight of size [96, 4, 3, 3]
+            # ... expected input[...] to have 4 channels, but got 3"), so pad a
+            # fully opaque alpha channel — `.convert("RGBA")` also sets alpha to
+            # 255, i.e. 1.0, reproducing the pipeline's RGBA input exactly.
             if image_tensor.shape[1] == 3:
                 alpha = torch.ones_like(image_tensor[:, :1])
                 image_tensor = torch.cat([image_tensor, alpha], dim=1)

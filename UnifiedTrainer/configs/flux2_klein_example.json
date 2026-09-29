@@ -100,7 +100,8 @@
     "output": {
         "dir": "output/experiment_name",
         "save_name": "flux2_klein_lora",
-        "checkpoint_every": 500
+        "save_every_epoch": 1,
+        "save_start_epoch": 0
     },
 
     "wandb": {

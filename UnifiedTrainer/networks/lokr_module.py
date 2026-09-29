@@ -16,14 +16,17 @@ Architecture:
 Compatible with BouncingOffloader (uses forward hooks, no monkey-patch conflict).
 Reference: ai-toolkit/toolkit/models/lokr.py, md/lokr_implementation/new_lokr_implementation_plan.md
 
-Target-pattern presets (_MODEL_PATTERNS, selected via LokrConfig.model_type):
-    krea2        -> None (attach to ALL Linear modules; musubi-aligned)
+Target selection:
+    lokr_target_modules=null (default) → ALL nn.Linear modules get adapters
+    (musubi krea2 convention, now the default for every model_type).
+    An explicit pattern list restricts targeting via fnmatch; the per-model
+    preset lists below (_MODEL_PATTERNS) are reference-only — copy the list
+    you want into lokr_target_modules to reproduce the old preset behaviour:
     qwen         -> _QWEN_PATTERNS         (Qwen-Image, models/qwen_image)
-    qwen21       -> _QWEN21_PATTERNS      (Qwen-Image 2.1, models/qwen_image21)
+    qwen21       -> _QWEN21_PATTERNS       (Qwen-Image 2.1, models/qwen_image21)
     flux         -> _FLUX_PATTERNS
     flux2_klein  -> _FLUX2_KLEIN_PATTERNS
     minimax_h3   -> _H3_PATTERNS
-An unknown model_type falls back to _KREA2_PATTERNS (block-internal Linears).
 """
 
 from __future__ import annotations
@@ -60,8 +63,11 @@ class LokrConfig:
         alpha: Scaling factor. Effective scale = alpha / rank; in full-W2 mode
         alpha is forced to rank -> scale = 1.0 (musubi-aligned).
         factor: Factorization factor for splitting dimensions (-1 = auto).
-        model_type: Preset selector for target layer patterns.
-        target_modules: Override fnmatch patterns; None uses model_type defaults.
+        model_type: Informational only (musubi-config compatibility).
+            No longer selects target modules — `target_modules` owns that.
+        target_modules: Optional fnmatch patterns restricting which nn.Linear
+            modules get adapters. None (default) = attach to ALL nn.Linear
+            modules (musubi krea2 convention). See the module docstring.
         multiplier: Global multiplier for adapter contribution.
         decompose_both: Also decompose W1 into w1_a @ w1_b (saves params).
         full_rank: Force full-matrix W1 and W2 (musubi `lokr_full_rank: true`).
@@ -173,8 +179,10 @@ _FLUX2_KLEIN_PATTERNS = [
 
 # Qwen-Image 2.1 (models/qwen_image21/transformer_qwenimage21.py):
 # single-stream blocks only — attn.to_q/k/v/out.0 plus the SwiGLU img_mlp
-# (proj/gate_layer/out). img_in / modulation.1 / norm_out.linear / proj_out /
-# txt_in.* stay opt-in via explicit lokr_target_modules.
+# (proj/gate_layer/out). Reference-only preset: by default ALL nn.Linear
+# modules (incl. img_in / modulation.1 / norm_out.linear / proj_out /
+# txt_in.*) are targeted; copy this list into lokr_target_modules to train
+# only the in-block subset.
 _QWEN21_PATTERNS = [
     "*transformer_blocks.*.attn.to_k",
     "*transformer_blocks.*.attn.to_q",
@@ -185,8 +193,11 @@ _QWEN21_PATTERNS = [
     "*transformer_blocks.*.img_mlp.out",
 ]
 
+# Reference-only presets — NOT auto-applied by attach() anymore (lokr_target_modules
+# = null now means ALL nn.Linear modules for every model_type, krea2-style).
+# Copy the list you want into lokr_target_modules to restrict targeting.
 _MODEL_PATTERNS = {
-    # None → attach to ALL Linear modules (musubi-aligned: KREA2_TARGET_REPLACE_MODULES=None)
+    # krea2 has no preset: its null already meant ALL (musubi convention).
     "krea2": None,
     "qwen": _QWEN_PATTERNS,
     "qwen21": _QWEN21_PATTERNS,
@@ -409,10 +420,12 @@ class LokrNetwork(nn.Module):
             self (for chaining).
         """
         patterns = self.config.target_modules
-        if patterns is None:
-            patterns = _MODEL_PATTERNS.get(self.config.model_type, _KREA2_PATTERNS)
-        # patterns=None (krea2 default) → attach to ALL Linear modules,
-        # matching musubi's KREA2_TARGET_REPLACE_MODULES=None behavior.
+        # patterns=None (the default) → attach to ALL nn.Linear modules,
+        # matching musubi's KREA2_TARGET_REPLACE_MODULES=None behavior
+        # (krea2 convention, now the default for every model_type).
+        # To restrict, set lokr_target_modules to explicit fnmatch patterns;
+        # the preset lists below (_MODEL_PATTERNS) are reference-only and can
+        # be copied into the config for that purpose.
 
         # Discover matching Linear modules
         for name, module in model.named_modules():

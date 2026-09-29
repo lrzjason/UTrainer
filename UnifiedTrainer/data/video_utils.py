@@ -5,7 +5,9 @@
 
 本模块在 P1（图像对训练/里程碑 1）一次建成，图像/视频共用，P2（视频训练）
 不重建管线、只激活视频解码：
-  - 图像 loader：load_image_frames  → (1, 3, 1, H, W)（T 维=1，统一 5D 约定）
+  - 图像 loader：load_image_frames  → (1, C, 1, H, W)（T 维=1，统一 5D 约定；
+    C=3 RGB；C=4 RGBA——调用方按 adapter.vae_pixel_channels 传 channels=4，
+    保留 PNG/WebP 透明通道供 Qwen-Image 2.1 四通道 VAE 消费）
   - 视频 loader：load_video_frames  → (1, 3, T, H, W)（PyAV 解码，P2 激活）
   - 帧数对齐：  snap_frames / video_latent_num_frames（包装 diffusers PR #14355
     packing 函数，供缓存与形状断言复用；17n+5 像素帧 → 5n+2 latent 帧）
@@ -65,11 +67,12 @@ def load_image_frames(
     resolution: int,
     divisibility: int,
     resolution_config: dict = None,
+    channels: int = 3,
 ) -> torch.Tensor:
-    """加载一张图像为统一 5D 帧张量 ``(1, 3, 1, H, W)``，float32 [0, 1]。
+    """加载一张图像为统一 5D 帧张量 ``(1, C, 1, H, W)``，float32 [0, 1]。
 
-    处理链：PIL 打开 RGB → ``BucketSystem.find_bucket_for_image`` 定桶 →
-    ``crop_to_bucket`` 等比缩放 + 中心裁剪 → ``transforms.to_tensor``
+    处理链：PIL 打开（RGB 或 RGBA）→ ``BucketSystem.find_bucket_for_image``
+    定桶 → ``crop_to_bucket`` 等比缩放 + 中心裁剪 → ``transforms.to_tensor``
     （float32 [0,1] CHW）→ 展开 T 维（=1）与 B 维，得到 (1, C, 1, H, W)。
     与视频 loader 共用同一 bucket 变换，图像/视频缓存格式一致。
 
@@ -78,13 +81,17 @@ def load_image_frames(
         resolution: bucket 基准分辨率（短边）。
         divisibility: 尺寸整除约束（vae_scale * patch_size）。
         resolution_config: BucketSystem 自定义桶配置（可选）。
+        channels: 3（默认）= RGB，与历史行为一致；4 = RGBA，保留 PNG/WebP
+            的透明通道（Qwen-Image 2.1 的 4 通道 VAE 直接消费 alpha，
+            与官方 pipeline ``convert("RGBA")`` 一致）。bucket 裁剪对 RGBA
+            同样按通道生效，alpha 无损保留。
 
     Returns:
-        (1, 3, 1, H, W) float32 张量，取值 [0, 1]。
+        (1, C, 1, H, W) float32 张量，取值 [0, 1]（C = ``channels``）。
     """
     from PIL import Image
 
-    pil = Image.open(path).convert("RGB")
+    pil = Image.open(path).convert("RGBA" if channels == 4 else "RGB")
     bucket_system = BucketSystem(
         divisibility=divisibility,
         resolution_config=resolution_config,
@@ -93,7 +100,7 @@ def load_image_frames(
     pil = bucket_system.crop_to_bucket(pil, bucket)
 
     # (C, H, W) float32 [0,1] → (C, 1, H, W) → (1, C, 1, H, W)
-    tensor = to_tensor(pil)
+    tensor = to_tensor(pil, channels=channels)
     return tensor.unsqueeze(1).unsqueeze(0)
 
 

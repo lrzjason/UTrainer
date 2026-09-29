@@ -123,6 +123,19 @@ class BaseModelAdapter(ABC):
         return self.vae_scale_factor * self.patch_size
 
     @property
+    def vae_pixel_channels(self) -> int:
+        """Pixel channels the VAE encoder consumes: 3 (RGB) or 4 (RGBA).
+
+        Drives the data pipeline's image loading: the cache builder loads
+        source media with this many channels, so a 4-channel adapter keeps
+        the alpha channel from PNG/WebP files all the way into
+        ``encode_image`` (transparency training).  Adapters whose VAE takes
+        RGB only keep the default 3 and the pipeline behavior is unchanged
+        (``PIL.convert("RGB")``).
+        """
+        return 3
+
+    @property
     def embedding_dim(self) -> int:
         """Text encoder output dimension. Override per model."""
         return 0
@@ -210,6 +223,11 @@ class BaseModelAdapter(ABC):
         call is delegated to ``self.encode_image``.  This keeps every existing
         image adapter's behavior exactly unchanged.
 
+        ``C`` follows ``vae_pixel_channels``: 3 (RGB) or 4 (RGBA — the alpha
+        channel survives the round trip through ``Image.fromarray``, which
+        infers ``RGBA`` mode from an ``(H, W, 4)`` uint8 array, and
+        ``to_tensor_universal`` normalizes every channel to [-1, 1]).
+
         Video-capable adapters (MiniMax-H3, P1.4) override this method for
         ``T > 1`` and return a dict with ``latent`` of shape ``(C, T, H, W)``
         (B already folded) — or ``(1, C, T, H, W)`` which the cache builder
@@ -244,9 +262,10 @@ class BaseModelAdapter(ABC):
             )
 
         # ── T == 1: image path — reconstruct encode_image's input convention ──
-        # frames (1, C, 1, H, W) float32 [0,1] → PIL RGB → to_tensor_universal
-        # (diffusion [-1,1]) → (1, C, H, W) — byte-equivalent to what
-        # cache_builder previously fed encode_image for every existing adapter.
+        # frames (1, C, 1, H, W) float32 [0,1] → PIL (RGB for C=3, RGBA for
+        # C=4) → to_tensor_universal (diffusion [-1,1] on every channel)
+        # → (1, C, H, W) — byte-equivalent to what cache_builder previously
+        # fed encode_image for every existing adapter.
         from PIL import Image
 
         from UnifiedTrainer.data.transforms import to_tensor_universal
@@ -254,6 +273,8 @@ class BaseModelAdapter(ABC):
         arr = (
             frames[0, :, 0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255
         ).round().astype(np.uint8)
+        # (H, W, 3) → RGB, (H, W, 4) → RGBA — PIL infers the mode, so a
+        # 4-channel adapter's alpha reaches the VAE unchanged.
         pil_image = Image.fromarray(arr)
         image_tensor = to_tensor_universal(np.array(pil_image)).unsqueeze(0)
         # Legacy cache pipeline moved the tensor to the VAE device/dtype; the

@@ -9,13 +9,12 @@ Usage in config JSON:
     # lokr_full_rank: musubi-compatible full-rank LoKr. Forces full-matrix
     # W1/W2 and overrides rank/alpha to the 9999 sentinel (scale = 1.0).
 
-`lokr_model_type` presets (or pass `lokr_target_modules` fnmatch patterns):
-    krea2         -> None -> ALL Linear modules (musubi krea2 convention)
-    qwen          -> _QWEN_PATTERNS (qwen_image / qwen_image_edit)
-    flux2_klein   -> _FLUX2_KLEIN_PATTERNS (flux2_klein 4B)
-    flux          -> _FLUX_PATTERNS (original FLUX naming)
-    minimax_h3    -> _H3_PATTERNS
-    <unknown>     -> falls back to _KREA2_PATTERNS list
+Targeting: `lokr_target_modules=null` (default) → ALL nn.Linear modules get
+adapters (musubi krea2 convention, now the default for every model_type).
+An explicit list of fnmatch patterns restricts targeting. The per-model
+preset lists (`_QWEN_PATTERNS`, `_QWEN21_PATTERNS`, `_FLUX_PATTERNS`,
+`_FLUX2_KLEIN_PATTERNS`, `_H3_PATTERNS`) are reference-only — copy one into
+`lokr_target_modules` for a restricted set.
 """
 from UnifiedTrainer.networks.lokr_module import (
     LokrConfig,

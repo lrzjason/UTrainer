@@ -29,6 +29,13 @@ Unified media pipeline (D3):
     base default implementation, and the MiniMax-H3 adapter (P1.4) overrides
     the hook for real video encoding.  Per-sample metadata records ``media``
     and ``num_frames``.
+
+    Pixel channels (RGBA transparency): image media is loaded with the
+    adapter's ``vae_pixel_channels`` channels — 3 (RGB, default) or 4 (RGBA,
+    qwen_image21).  With 4, the real alpha channel of PNG/WebP sources
+    reaches the VAE (transparency training, pipeline parity: the official
+    Qwen-Image pipeline feeds ``img.convert("RGBA")`` to its 4-channel VAE)
+    and the resized preview is cached as a lossless PNG instead of webp.
 """
 from __future__ import annotations
 
@@ -51,9 +58,11 @@ from UnifiedTrainer.data.config_schema import (
     ReferenceEntry,
     CaptionConfig,
     BatchConfig,
+    MaskConfig,
     find_index_from_right,
     strip_suffix,
 )
+from UnifiedTrainer.data.bucket import BucketSystem
 from UnifiedTrainer.data.cache_manager import CacheManager
 from UnifiedTrainer.data.embedding_cache import EmbeddingCache
 from UnifiedTrainer.data.video_utils import load_image_frames, load_video_frames
@@ -91,6 +100,16 @@ class CacheBuilder:
         # target_source='original' — zero cost otherwise.
         self.pfm_encode_fn = pfm_encode_fn
 
+    def _vae_pixel_channels(self) -> int:
+        """Pixel channels the adapter's VAE consumes (3 = RGB, 4 = RGBA).
+
+        Defaults to 3 for adapters that do not declare
+        ``vae_pixel_channels`` (stubs/tests) — the historical RGB-only
+        pipeline behavior.  qwen_image21 declares 4, so its source PNG/WebP
+        images are loaded as RGBA and the real alpha channel reaches the VAE.
+        """
+        return int(getattr(self.adapter, "vae_pixel_channels", 3) or 3)
+
     def _save_pfm_feats(self, pfm_path: str, frames: torch.Tensor) -> None:
         """Precompute φ(I_orig) features for PFM's original-pixel target.
 
@@ -99,13 +118,153 @@ class CacheBuilder:
         pixels. Stored fp16 as (L, C, h, w) next to the latent npz. Image
         media only (video frames are skipped); silently a no-op when no
         encode fn was injected.
+
+        Only the RGB channels feed the perceptual encoder (C == 4 RGBA
+        sources are sliced to their first three channels — alpha is not
+        perceptual input).
         """
         if self.pfm_encode_fn is None or frames.shape[2] != 1:
             return
-        pixels01 = frames[:, :, 0]  # (B, C, H, W)
+        pixels01 = frames[:, :3, 0]  # (B, 3, H, W) — RGB only
         feats = self.pfm_encode_fn(pixels01)  # (L, B, C, h, w) fp32
         arr = feats.detach().to(torch.float16).cpu().numpy()
         np.savez(pfm_path, feats=arr)
+
+    # ── Edit-mask latents (optional, mask_configs layer) ─────────────
+
+    def _first_target_image_path(self, pair: dict) -> Optional[str]:
+        """First target image path in the pair (mask size reference)."""
+        for entries in self.ds_config.target_configs.values():
+            for entry in entries:
+                p = pair.get(entry.image)
+                if p:
+                    return p
+        return None
+
+    def _parse_bucket(self, bucket: str) -> Optional[Tuple[int, int]]:
+        if not bucket:
+            return None
+        try:
+            w, h = bucket.lower().split("x")
+            return int(w), int(h)
+        except (ValueError, AttributeError):
+            return None
+
+    def _encode_mask(
+        self,
+        mask_path: str,
+        bucket: str,
+        recreate: bool,
+    ) -> Optional[dict]:
+        """Build the latent-grid mask for one sample.
+
+        The single-channel PNG (0/255) is bucket-cropped with the SAME
+        deterministic transform the target went through, then
+        area-averaged down to the latent grid (bucket // vae_scale).
+        Stored as a (1, h, w) float32 npz so at training time it stacks to
+        (B, 1, h, w) and broadcast-multiplies the velocity MSE.
+        """
+        from PIL import Image
+
+        bucket_dims = self._parse_bucket(bucket)
+        bs = BucketSystem(
+            divisibility=self.adapter.bucket_divisibility,
+            resolution_config=self.adapter.resolution_config,
+        )
+        with Image.open(mask_path) as im:
+            if bucket_dims is None:
+                bucket_dims = bs.find_bucket_for_image(
+                    self.ds_config.resolution, im
+                )
+            m = np.array(im.convert("L"))
+
+        m = bs.crop_numpy_to_bucket(m, bucket_dims)
+        scale = int(getattr(self.adapter, "vae_scale_factor", 8) or 8)
+        lh, lw = max(1, m.shape[0] // scale), max(1, m.shape[1] // scale)
+        if m.shape[0] % scale or m.shape[1] % scale:
+            logger.warning(
+                f"mask bucket {bucket_dims} not divisible by vae_scale "
+                f"{scale} — cropping remainder (mask {mask_path})"
+            )
+            m = m[: lh * scale, : lw * scale]
+
+        cache_subdir = self.cache.get_cache_dir(mask_path)
+        stem = os.path.splitext(os.path.basename(mask_path))[0]
+        npz_path = os.path.join(str(cache_subdir), f"{stem}_mask_{lh}x{lw}.npz")
+        if os.path.exists(npz_path) and not recreate:
+            return {"npz_path": npz_path, "bucket": f"{bucket_dims[0]}x{bucket_dims[1]}"}
+
+        t = torch.from_numpy(m).float().div_(255.0)[None, None]  # (1,1,H,W)
+        t = torch.nn.functional.interpolate(t, size=(lh, lw), mode="area")
+        self.cache.save_latent_npz(npz_path, t[0])              # (1, h, w)
+        return {"npz_path": npz_path, "bucket": f"{bucket_dims[0]}x{bucket_dims[1]}"}
+
+    def _build_masks(self, pair: dict, sample_data: dict,
+                     recreate: bool) -> None:
+        """Resolve + build every configured mask for this sample.
+
+        Missing mask files are NOT an error — samples without a mask simply
+        train without region weighting (the loss degrades to plain flow
+        matching).  A size mismatch against the target image IS an error:
+        the bucket crop would silently misalign the mask, so the mask is
+        skipped with a loud warning.
+        """
+        if not self.ds_config.mask_configs:
+            return
+        ref_path = self._first_target_image_path(pair)
+        ref_size = None
+        if ref_path:
+            try:
+                with Image.open(ref_path) as im:
+                    ref_size = im.size
+            except Exception:
+                ref_size = None
+
+        for m_key, m_cfg in self.ds_config.mask_configs.items():
+            mask_path = pair.get(m_cfg.image)
+            if not mask_path or not os.path.exists(mask_path):
+                continue
+            try:
+                if ref_size is not None:
+                    with Image.open(mask_path) as im:
+                        if im.size != ref_size:
+                            logger.warning(
+                                f"mask size mismatch: {mask_path} {im.size} "
+                                f"!= target {ref_path} {ref_size}; mask "
+                                f"'{m_key}' skipped for this sample"
+                            )
+                            continue
+                entry = self._encode_mask(
+                    mask_path, sample_data.get("bucket", ""), recreate
+                )
+            except Exception as e:
+                logger.warning(f"mask build failed for {mask_path}: {e}")
+                continue
+            if entry:
+                sample_data.setdefault("loss_mask", {})[m_key] = entry
+
+    def _backfill_masks(self, sample: dict, image_pairs: list) -> bool:
+        """Backfill masks for an already-cached sample. True if changed."""
+        if not self.ds_config.mask_configs:
+            return False
+        pair = None
+        for p in image_pairs:
+            if p.get("mapping_key") == sample.get("mapping_key", ""):
+                pair = p
+                break
+        if pair is None:
+            return False
+        existing = sample.get("loss_mask") or {}
+        wanted = [
+            k for k, cfg in self.ds_config.mask_configs.items()
+            if k not in existing
+            and pair.get(cfg.image)
+            and os.path.exists(pair.get(cfg.image))
+        ]
+        if not wanted:
+            return False
+        self._build_masks(pair, sample, recreate=False)
+        return True
 
     def _backfill_pfm_feats(self, sample: dict) -> None:
         """Backfill missing φ(I_orig) features for an already-cached sample.
@@ -146,6 +305,7 @@ class CacheBuilder:
                     resolution=resolution,
                     divisibility=self.adapter.bucket_divisibility,
                     resolution_config=self.adapter.resolution_config,
+                    channels=self._vae_pixel_channels(),
                 )
                 self._save_pfm_feats(pfm_path, frames)
             except Exception as e:
@@ -238,6 +398,12 @@ class CacheBuilder:
                     # the recorded source image (no VAE involved).
                     if self.pfm_encode_fn is not None:
                         self._backfill_pfm_feats(sample)
+                    # Edit-mask backfill: a cache built before mask_configs
+                    # was configured (or with mask files added later) gets
+                    # its masks attached here without a full rebuild.
+                    if self.ds_config.mask_configs:
+                        if self._backfill_masks(sample, image_pairs):
+                            self.cache.save_sample(json_file, sample)
                     datarows.append({
                         "json_path": str(json_file),
                         "bucket": sample.get("bucket", ""),
@@ -272,6 +438,12 @@ class CacheBuilder:
                 )
                 if ref_result:
                     sample_data["references"][r_key] = ref_result
+
+            # ── Phase 2.5: Edit-mask latents (mask_configs, optional) ──
+            # Runs after the target is encoded so the mask follows the
+            # target's bucket exactly.  No-op for configs without
+            # mask_configs (the pre-mask pipeline is byte-identical).
+            self._build_masks(pair, sample_data, recreate_latents)
 
             # Save per-sample JSON (captions will be added in phase 3)
             self.cache.save_sample(json_file, sample_data)
@@ -624,10 +796,16 @@ class CacheBuilder:
         records ``media`` and ``num_frames``.
 
         Image behavior is exactly equivalent to the pre-unified pipeline: the
-        same bucket crop is applied, the resized webp is still saved, and the
+        same bucket crop is applied, the resized image is still saved, and the
         latent values are identical (via the base ``encode_video`` default which
         delegates to ``encode_image``).  Existing adapters (krea2, ...) are
         unaware of the media dispatch.
+
+        Channels: image media is loaded with the adapter's
+        ``vae_pixel_channels`` pixel channels — 3 (RGB, default) or 4 (RGBA,
+        qwen_image21).  A 4-channel source keeps its real alpha all the way
+        into the VAE (transparency training) and the resized preview is saved
+        as a LOSSLESS PNG (webp is lossy and would degrade alpha edges).
 
         Args:
             resolution: Encode resolution override (per-image-config);
@@ -647,7 +825,14 @@ class CacheBuilder:
         cache_subdir = self.cache.get_cache_dir(media_path)
         cache_dir = str(cache_subdir)
 
-        resized_path = os.path.join(cache_dir, f"{basename}_{resolution}.webp")
+        channels = self._vae_pixel_channels()
+        # 4-channel (RGBA) sources cache their preview as a lossless PNG —
+        # the default lossy webp would degrade the transparency edges of the
+        # cached copy (the latent npz always carries full alpha regardless).
+        resized_ext = ".png" if channels == 4 else ".webp"
+        resized_path = os.path.join(
+            cache_dir, f"{basename}_{resolution}{resized_ext}"
+        )
         latent_path = os.path.join(cache_dir, f"{basename}_{resolution}.npz")
         pfm_path = latent_path.replace(".npz", "_pfm.npz")
 
@@ -691,6 +876,7 @@ class CacheBuilder:
                             resolution=resolution,
                             divisibility=self.adapter.bucket_divisibility,
                             resolution_config=self.adapter.resolution_config,
+                            channels=channels,
                         )
                         self._save_pfm_feats(pfm_path, frames_b)
                     return {
@@ -720,18 +906,23 @@ class CacheBuilder:
                 resolution=resolution,
                 divisibility=self.adapter.bucket_divisibility,
                 resolution_config=self.adapter.resolution_config,
+                channels=channels,
             )
 
         h, w = int(frames.shape[3]), int(frames.shape[4])
 
         # Save the resized image (image media only) — matches legacy layout.
+        # C == 4 sources produce an (H, W, 4) array → PIL RGBA, saved as the
+        # lossless PNG picked above so the alpha channel survives exactly.
         if media == "image":
             pil_image = Image.fromarray(
                 (frames[0, :, 0].clamp(0, 1).permute(1, 2, 0).numpy() * 255)
                 .round()
                 .astype("uint8")
             )
-            pil_image.save(resized_path, "webp")
+            pil_image.save(
+                resized_path, "PNG" if channels == 4 else "webp"
+            )
 
         # ── Encode via the unified media hook ───────────────────────────
         if vae is not None:

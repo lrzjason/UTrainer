@@ -586,6 +586,13 @@ class Trainer:
             latents = batch.get("latents", {})
             latents = self._move_latents_to_device(latents, device, compute_dtype)
             batch["latents"] = latents
+            # Edit mask (optional) rides along with the latents: same
+            # device, same compute dtype — it multiplies the velocity MSE
+            # in masked_flow_matching.
+            if batch.get("loss_mask") is not None:
+                batch["loss_mask"] = batch["loss_mask"].to(
+                    device=device, dtype=compute_dtype
+                )
 
             # ── Get ALL target latents (multi-target) ──
             target_latents = self._get_target_latents(batch, latents, resolved_bc)
@@ -1334,6 +1341,8 @@ class Trainer:
                     latents = batch.get("latents", {})
                     latents = self._move_latents_to_device(latents, device)
                     batch["latents"] = latents
+                    if batch.get("loss_mask") is not None:
+                        batch["loss_mask"] = batch["loss_mask"].to(device=device)
 
                     target_latents = self._get_target_latents(
                         batch, latents, resolved_bc
