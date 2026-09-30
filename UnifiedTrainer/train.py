@@ -1768,7 +1768,7 @@ def main():
             epoch_dir = os.path.join(output_dir, f"{save_name}-{epoch}")
             os.makedirs(epoch_dir, exist_ok=True)
 
-            # ── Save checkpoint + ComfyUI conversion FIRST ───────────────
+            # ── Save checkpoint FIRST ────────────────────────────────────
             if trainer.should_save_checkpoint(epoch):
                 from UnifiedTrainer.engine.checkpoint import CheckpointManager
 
@@ -1805,7 +1805,16 @@ def main():
 
             # ── Validation loss (controlled RNG, no gradient) ─────────────
             val_every = val_cfg.get("val_every_epoch", 1)
-            if epoch % val_every == 0 or epoch == num_epochs - 1:
+            try:
+                val_every = int(val_every)
+            except (TypeError, ValueError):
+                val_every = 1
+            # val_every_epoch <= 0 means "validation disabled". It used to hit
+            # `epoch % val_every` with val_every == 0 and die with
+            # ZeroDivisionError at the END of every epoch (after the checkpoint
+            # was written, so the run was still recoverable — but the epoch loop
+            # could never advance past epoch 0).
+            if val_every > 0 and (epoch % val_every == 0 or epoch == num_epochs - 1):
                 if val_dataloader is not None:
                     val_result = trainer.validate_epoch(epoch, val_dataloader)
                     if val_result.get("val_loss") is not None:
