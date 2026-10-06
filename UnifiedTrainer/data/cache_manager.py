@@ -43,24 +43,36 @@ class CacheManager:
     # ── Subdir-mirrored cache path ──────────────────────────────────
 
     def get_cache_dir(self, image_path: str) -> Path:
-        """Mirror dataset subdir structure into cache.
+        """Mirror the dataset's **full relative hierarchy** into the cache.
 
-        T2ITrainer pattern:
-        - If image is in dataset root → cache root
-        - If image is in subdir → cache root + subdir name
+        The key is the image's directory relative to the **parent** of
+        ``train_data_dir``, so the dataset's own directory name participates
+        while the nested sub-structure is preserved.
 
-        This prevents basename collisions when multiple subdirs
-        contain images with the same filename.
+        Why not just the last component (old behaviour): two datasets sharing
+        the same internal layout -- e.g.
+        ``.../transparent_edit_shape/handpick/x`` and
+        ``.../transparent_edit_color/handpick/x`` -- both mapped to
+        ``cache/handpick/x``, and the cache-hit check only tests whether the
+        JSON exists (it does not validate the ``dataset`` field), so one
+        dataset silently reused the other's latents.
         """
-        dir_name = os.path.dirname(image_path)
-        if not dir_name or Path(dir_name).resolve() == Path(self.train_data_dir).resolve():
-            return self.cache_dir
-        subdir_name = os.path.basename(dir_name)
-        target_dir = self.cache_dir / subdir_name
+        d = Path(image_path).resolve().parent
+        base = Path(self.train_data_dir).resolve() if self.train_data_dir else None
+        rel = None
+        if base is not None:
+            for anchor in (base.parent, base):
+                try:
+                    rel = d.relative_to(anchor)
+                    break
+                except ValueError:
+                    continue
+        if rel is None or str(rel) in ('.', ''):
+            rel = Path(d.name) if d.name else Path('.')
+        target_dir = self.cache_dir / rel
         target_dir.mkdir(parents=True, exist_ok=True)
         return target_dir
 
-    # ── Per-sample JSON ─────────────────────────────────────────────
 
     def sample_json_path(self, cache_subdir: Path, basename: str) -> Path:
         """Per-sample JSON path: {cache_subdir}/{basename}.json"""

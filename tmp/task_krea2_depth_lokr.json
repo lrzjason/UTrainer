@@ -1,0 +1,8 @@
+{
+    "project": "krea2_depth_lokr",
+    "name": "krea2_depth_lokr",
+    "model": "krea2",
+    "config": "E:/UnifiedTrainer/ScheduledTrainer/UnifiedTrainer/configs/krea2_depth_lokr.json",
+    "priority": 100,
+    "allow_parallel": false
+}

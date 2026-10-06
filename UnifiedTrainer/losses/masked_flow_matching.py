@@ -88,41 +88,22 @@ class MaskedFlowMatchingLoss(BaseLoss):
 
         sq_err = (context.model_pred - target) ** 2
 
-        # ── No mask: plain flow matching (t2i / noop / mask-less configs) ──
-        if context.loss_mask is None:
-            if self.use_weighting:
-                weighting = compute_loss_weighting_for_sd3(context.sigmas)
-                while weighting.dim() < sq_err.dim():
-                    weighting = weighting.unsqueeze(-1)
-                return (weighting * sq_err).mean()
-            return sq_err.mean()
-
-        mask = context.loss_mask
-        if mask.dim() == sq_err.dim() - 1:
-            mask = mask.unsqueeze(1)          # (B, h, w) -> (B, 1, h, w)
-        if mask.shape[-2:] != sq_err.shape[-2:]:
-            raise ValueError(
-                f"masked_flow_matching: mask grid {tuple(mask.shape)} does "
-                f"not match model_pred grid {tuple(sq_err.shape)} — the mask "
-                "is cached against the target bucket; check that the mask "
-                "and target images share dimensions."
-            )
-        mask = mask.to(dtype=sq_err.dtype)
-
-        w = self.base_weight + self.edit_weight * mask   # (B,1,h,w) 广播
+        # Unified, loss-agnostic reduction (BaseLoss.reduce_masked).  This
+        # module's base/edit semantics and normalisation are preserved exactly
+        # -- the implementation now lives in ONE place, so mask weighting
+        # behaves identically in every loss that opts in.
+        weighting = None
         if self.use_weighting:
             weighting = compute_loss_weighting_for_sd3(context.sigmas)
             while weighting.dim() < sq_err.dim():
                 weighting = weighting.unsqueeze(-1)
-            w = w * weighting
-
-        # Normalise so the loss scale matches plain flow matching:
-        # w is (B, 1, h, w) while sq_err is (B, C, h, w), so the weight
-        # only covers 1/C of the summed positions — scale the denominator
-        # by the broadcast factor (numel ratio) instead of assuming the
-        # shapes match.
-        denom = w.sum() * (sq_err.numel() / w.numel())
-        return (w * sq_err).sum() / denom.clamp_min(1e-8)
+        return self.reduce_masked(
+            sq_err,
+            context,
+            weighting=weighting,
+            base_weight=self.base_weight,
+            edit_weight=self.edit_weight,
+        )
 
     def requires(self) -> list:
         return ["model_pred", "noise", "learning_target", "sigmas"]

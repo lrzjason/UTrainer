@@ -1,0 +1,162 @@
+{
+    "model": "qwen_image21",
+    "model_path": "/home/waas/hf_models/Qwen-Image-2.1",
+    "transformer_path": "/home/waas/hf_models/Qwen-Image-2.1/transformer",
+    "vae_path": "/home/waas/hf_models/Qwen-Image-2.1/vae",
+    "text_encoder_path": "/home/waas/hf_models/Qwen-Image-2.1/text_encoder",
+    "tokenizer_path": "/home/waas/hf_models/Qwen-Image-2.1/processor",
+    "processor_path": "/home/waas/hf_models/Qwen-Image-2.1/processor",
+    "scheduler_path": "/home/waas/hf_models/Qwen-Image-2.1/scheduler",
+    "timestep_shift_mode": "dynamic_shift",
+
+    "data": {
+        "cache_dir": "/home/waas/qwen21_cache_transparent_edit",
+        "rebuild_index": true,
+        "num_workers": 4,
+        "val_split_ratio": 0.05,
+        "dataset_configs": [
+            {
+                "name": "transparent_edit",
+                "train_data_dir": "/home/waas/qwen21_consist_dataset",
+                "resolution": 1024,
+                "repeats": 1,
+                "sample_weight": 1.0,
+                "recreate_cache": false,
+                "recreate_latents": false,
+                "recreate_embeddings": false,
+                "val_batch_config_index": 0,
+                "image_configs": {
+                    "T": {
+                        "suffix": "_T"
+                    },
+                    "R": {
+                        "suffix": "_R"
+                    }
+                },
+                "target_configs": {
+                    "T": [
+                        {
+                            "image": "T"
+                        }
+                    ]
+                },
+                "reference_configs": {
+                    "ref_R": [
+                        {
+                            "image": "R",
+                            "sample_type": "from_same_name"
+                        }
+                    ]
+                },
+                "caption_configs": {
+                    "cap_T": {
+                        "ext": ".txt",
+                        "image": "T",
+                        "reference_list": {
+                            "reference_config": "ref_R",
+                            "resize": 1024,
+                            "dropout": 0,
+                            "min_length": 1
+                        }
+                    }
+                },
+                "batch_configs": [
+                    {
+                        "target_config": "T",
+                        "caption_config": "cap_T",
+                        "reference_config": "ref_R",
+                        "caption_dropout": 0.1
+                    }
+                ]
+            }
+        ]
+    },
+
+    "region_loss": {
+        "enable": false
+    },
+
+    "losses": [
+        {
+            "type": "guide_flow_matching",
+            "weight": 1.0,
+            "params": {
+                "fixed_guidance_scale": 1.5,
+                "use_weighting": false
+            }
+        }
+    ],
+
+    "training": {
+        "network_type": "lokr",
+        "lora_rank": 64,
+        "lokr_alpha": 1.0,
+        "lokr_factor": 4,
+        "lokr_model_type": "qwen21",
+        "lokr_target_modules": null,
+        "lokr_full_rank": true,
+        "batch_size": 1,
+        "text_max_length": 1024,
+        "learning_rate": 0.0001,
+        "max_steps": -1,
+        "num_epochs": 20,
+        "optimizer": "adamw8bit",
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "gradient_checkpointing": true,
+        "gradient_accumulation_steps": 1,
+        "max_grad_norm": 1.0,
+        "weight_dtype": "bf16",
+        "mixed_precision": "bf16",
+        "quantize": "torchao_float8",
+        "block_swap": 0,
+        "offload_base_weights": true,
+        "offload_percent": 1.0,
+        "offload_vae": true,
+        "offload_text_encoder": true,
+        "compile": false,
+        "vae_load_mode": "lazy",
+        "vae_on_device": false,
+        "noise_selector": {
+            "type": "explorative",
+            "K_cond": 5,
+            "K_uncond": 5,
+            "warmup_steps": 0,
+            "schedule": "constant",
+            "log_stats": true
+        }
+    },
+
+    "validation": {
+        "val_loss": true,
+        "val_every_epoch": 1,
+        "val_seed": 42,
+        "generate_images": true,
+        "num_val_images": 3,
+        "resolution": 1024,
+        "num_inference_steps": 20,
+        "guidance_scale": 1.0
+    },
+
+    "output": {
+        "dir": "/home/waas/qwen21_transparent_edit_output",
+        "save_name": "qwen21_transparent_edit",
+        "save_every_epoch": 1,
+        "save_start_epoch": 0
+    },
+
+    "reporter": {
+        "type": "wandb",
+        "log_every": 1
+    },
+
+    "helios": {
+        "enabled": false
+    },
+
+    "wandb": {
+        "enabled": true,
+        "project": "UnifiedTrainer",
+        "run_name": "qwen21_transparent_edit"
+    }
+}

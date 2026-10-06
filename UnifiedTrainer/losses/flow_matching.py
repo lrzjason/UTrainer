@@ -56,14 +56,17 @@ class FlowMatchingLoss(BaseLoss):
         else:
             target = context.noise - context.learning_target
 
+        weighting = None
         if self.use_weighting:
             weighting = compute_loss_weighting_for_sd3(context.sigmas)
             # Expand weighting to match pred shape
             while weighting.dim() < context.model_pred.dim():
                 weighting = weighting.unsqueeze(-1)
-            loss = (weighting * (context.model_pred - target) ** 2).mean()
-        else:
-            loss = ((context.model_pred - target) ** 2).mean()
+        # Region/mask weighting is loss-agnostic (BaseLoss.reduce_masked);
+        # with no mask this is bit-identical to the previous plain mean().
+        loss = self.reduce_masked(
+            (context.model_pred - target) ** 2, context, weighting=weighting
+        )
 
         return loss
 

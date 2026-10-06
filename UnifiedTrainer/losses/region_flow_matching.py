@@ -1,0 +1,110 @@
+"""Flow-matching loss with an optional spatial weight map over the latent grid.
+
+Same objective as ``losses/flow_matching.py`` -- the squared error between the
+predicted and the target *velocity* (``noise - learning_target``, or its sign
+flip for data-ward schedulers) -- with one addition: when the trainer puts a
+per-pixel weight map into ``LossContext.extra["region_weight"]``, the error is
+averaged with those weights instead of uniformly.
+
+Why this exists
+---------------
+The object this dataset is about (the bust region) covers a median ~4-9% of the
+frame, so an unweighted latent loss is almost entirely background, and nothing
+in the objective rewards getting the *area* of the region right.  Weights alone
+at the condition interface therefore only act as a weak bias, which is why the
+adapter needed strength 1.5 at inference to show any effect at all (measured
+over 12+ epochs).  Weighting the region raises the gradient there without
+touching the interface: the condition image stays the only size channel.
+
+Normalisation
+-------------
+The weighted average divides by ``sum(w)`` -- a weighted *mean*, not a weighted
+*sum*.  With ``w = 1 + (W-1)*mask``, region coverage ``c`` and in-region weight
+``W``, the mean weight is ``1 + (W-1)*c``, so at ``c = 0.09`` and ``W = 4`` the
+in-region gradient is ``3.2x`` the uniform one while the loss *value* stays on
+the same scale as the plain mean.  That is what makes the logged numbers
+comparable between weighted and unweighted steps -- essential in a run that
+mixes both (BD weighted, BC unweighted).
+
+Reported components (always, so wandb carries both numbers)
+----------------------------------------------------------
+``plain``        -- unweighted mean of this batch.  This is the number that is
+                    comparable across interfaces and with older runs.
+``region_extra`` -- ``weighted - plain``; 0.0 when the step was not weighted.
+
+Numeric note: the unweighted path computes the mean in fp32 instead of bf16.
+PyTorch already accumulates bf16 reductions in fp32, so this differs from
+``FlowMatchingLoss`` only by the final bf16 rounding (<= 0.4%) -- irrelevant
+next to the effects this run is measuring, and strictly more accurate.
+"""
+from __future__ import annotations
+
+from typing import Any, List
+
+import torch
+
+from UnifiedTrainer.losses.base import BaseLoss, LossContext
+from UnifiedTrainer.losses.flow_matching import compute_loss_weighting_for_sd3
+from UnifiedTrainer.registry import LossRegistry
+
+
+@LossRegistry.register("region_flow_matching")
+class RegionFlowMatchingLoss(BaseLoss):
+    """Flow matching with an optional per-pixel region weight (default: off).
+
+    Config::
+
+        {"type": "region_flow_matching", "weight": 1.0,
+         "params": {"use_weighting": false}}
+
+    The weight map is supplied by the trainer (it owns the mask lookup and the
+    decision of which steps are weighted), so this module stays a pure loss.
+    """
+
+    name = "region_flow_matching"
+
+    def __init__(
+        self, weight: float = 1.0, use_weighting: bool = True, **params: Any
+    ):
+        super().__init__(weight=weight, **params)
+        self.use_weighting = use_weighting
+        self.last_components: dict = {}
+
+    def requires(self) -> List[str]:
+        return ["model_pred", "noise", "learning_target", "sigmas"]
+
+    def compute(self, context: LossContext) -> torch.Tensor:
+        # MiniMax-H3's scheduler is data-ward: v = x0 - x_t, so the flow target
+        # flips sign relative to the standard convention.  Rejected outright on
+        # an unknown value for the same reason flow_matching does: a silent
+        # wrong-direction target still produces a decreasing loss.
+        velocity_sign = getattr(context.adapter, "velocity_sign", "standard")
+        if velocity_sign not in ("standard", "data_ward"):
+            raise ValueError(
+                f"Unsupported velocity_sign {velocity_sign!r}; "
+                "expected 'standard' or 'data_ward'"
+            )
+        if velocity_sign == "data_ward":
+            target = context.learning_target - context.noise
+        else:
+            target = context.noise - context.learning_target
+
+        err2 = (context.model_pred - target) ** 2
+
+        weighting = None
+        if self.use_weighting:
+            weighting = compute_loss_weighting_for_sd3(context.sigmas)
+            while weighting.dim() < err2.dim():
+                weighting = weighting.unsqueeze(-1)
+
+        err2 = err2.float()
+        plain = (err2 * weighting).mean() if weighting is not None else err2.mean()
+        # Unified, loss-agnostic reduction: honours extra["region_weight"]
+        # (this module's documented hook) *and* LossContext.loss_mask.
+        loss = self.reduce_masked(err2, context, weighting=weighting)
+
+        self.last_components = {
+            "plain": float(plain.detach()),
+            "region_extra": float(loss.detach()) - float(plain.detach()),
+        }
+        return loss

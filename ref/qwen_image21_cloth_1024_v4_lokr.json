@@ -1,0 +1,134 @@
+{
+  "model": "qwen_image21",
+  "model_path": "/xzdata/UTrainer/models/Qwen-Image-2.1",
+  "transformer_path": "/xzdata/UTrainer/models/Qwen-Image-2.1/transformer",
+  "vae_path": "/xzdata/UTrainer/models/Qwen-Image-2.1/vae",
+  "text_encoder_path": "/xzdata/UTrainer/models/Qwen-Image-2.1/text_encoder",
+  "tokenizer_path": "/xzdata/UTrainer/models/Qwen-Image-2.1/processor",
+  "processor_path": "/xzdata/UTrainer/models/Qwen-Image-2.1/processor",
+  "scheduler_path": "/xzdata/UTrainer/models/Qwen-Image-2.1/scheduler",
+  "timestep_shift_mode": "dynamic_shift",
+  "data": {
+    "cache_dir": "/xzdata/UTrainer/cache/qwen21_cloth_lokr_2026092902",
+    "rebuild_index": false,
+    "val_split_ratio": 0.05,
+    "dataset_configs": [
+      {
+        "train_data_dir": "/xzdata/datasets/xz_cloth_hz_qwen2.1_1024_lokr",
+        "resolution": 1024,
+        "repeats": 1,
+        "recreate_cache": false,
+        "recreate_latents": false,
+        "recreate_embeddings": false,
+        "image_configs": {
+          "T": {
+            "suffix": "_T",
+            "resolution": 1024
+          },
+          "G": {
+            "suffix": "_G",
+            "resolution": 1024
+          },
+          "R": {
+            "suffix": "_R",
+            "resolution": 1024
+          }
+        },
+        "target_configs": {
+          "T": [
+            {
+              "image": "T"
+            }
+          ]
+        },
+        "reference_configs": {
+          "GR": [
+            {
+              "image": "G",
+	      "sample_type": "from_same_name"
+            },
+            {
+              "image": "R",
+	      "sample_type": "from_same_name"
+            }
+          ]
+        },
+        "caption_configs": {
+          "train_T_GR": {
+            "ext": ".txt",
+            "image": "T",
+            "reference_list": {
+              "reference_config": "GR",
+              "resize": 1024,
+              "min_length": 2
+            }
+          }
+        },
+        "batch_configs": [
+          {
+            "target_config": "T",
+            "caption_config": "train_T_GR",
+            "reference_config": "GR",
+            "caption_dropout": 0.3
+          }
+        ]
+      }
+    ],
+    "num_workers": 0
+  },
+  "losses": [
+    {
+      "type": "guide_flow_matching",
+      "weight": 1.0,
+      "params": {
+        "fixed_guidance_scale": 1.5,
+        "use_weighting": false
+      }
+    }
+  ],
+  "training": {
+    "network_type": "lokr",
+    "lora_rank": 64,
+    "lokr_alpha": 1,
+    "lokr_factor": 4,
+    "lokr_model_type": "qwen21",
+    "lokr_target_modules": null,
+    "lokr_full_rank": true,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 0.0001,
+    "max_steps": 150000,
+    "num_epochs": 50,
+    "optimizer": "adamw",
+    "weight_dtype": "bf16",
+    "mixed_precision": "bf16",
+    "gradient_checkpointing": true,
+    "quantize": "bf16",
+    "text_encoder_quantize": "bf16",
+    "block_swap": 0,
+    "include_suffix": true,
+    "max_grad_norm": 1.0,
+    "lr_scheduler": "cosine",
+    "lr_warmup_steps": 50,
+    "compile": false
+  },
+  "output": {
+    "dir": "/xzdata/UTrainer/output/qwen_image21_cloth_1024_lokr",
+    "save_name": "qwen21_cloth_1024_lokr",
+    "checkpoint_every": 200
+  },
+  "reporter": {
+    "type": "tensorboard",
+    "port": 6006,
+    "log_dir": null,
+    "log_every": 1
+  },
+  "validation": {
+    "val_every_epoch": 1,
+    "val_seed": 42,
+    "val_loss": true,
+    "generate_images": false,
+    "resolution": 1024,
+    "num_val_images": 1
+  }
+}

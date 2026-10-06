@@ -1,0 +1,27 @@
+source /etc/waas-script/proxy.sh 
+
+export WANDB_BASE_URL=https://api.bandw.top/
+262342e7a7c471d7c3ea8e58f2a85306d327e12f
+
+export LD_LIBRARY_PATH=/root/miniconda3/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:$LD_LIBRARY_PATH
+# 1. Symlink ALL names cuDNN might dlopen to the cu13 nvrtc — including the
+#    unversioned one the pip package is missing, and .so.12 for a possible
+#    cu12-built libcudnn in the container
+mkdir -p /opt/nvrtc13
+cd /opt/nvrtc13
+ln -sf /root/miniconda3/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.13 libnvrtc.so
+ln -sf /root/miniconda3/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.13 libnvrtc.so.12
+ln -sf /root/miniconda3/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.13 libnvrtc.so.13
+
+# 2. Export before starting training (make this permanent in the cloud's launch script)
+export LD_LIBRARY_PATH=/opt/nvrtc13:$LD_LIBRARY_PATH
+
+/root/UTrainer/start_0819_raw.sh        # 训练 1
+/root/UTrainer/start_0819_xm_k4.sh                    # 训练 2
+/root/UTrainer/start_0819_xm_k10.sh           # 训练 3
+/root/UTrainer/start_0819_xm_improved_k10.sh           # 训练 3
+
+/root/UTrainer/start_0823_xm_k10.sh        # 0823 训练 (repeats=1, res=1536, cosine, DC)
+
+
+/root/UTrainer/start_0902_xmk10_pfm.sh        # 0823 训练 (repeats=1, res=1536, cosine, DC)

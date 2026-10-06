@@ -173,16 +173,21 @@ class GuideFlowMatchingLoss(BaseLoss):
         w_b = self._broadcast_like(w, v_cond)
         v_corrected = (v_cond + w_b * v_uncond) / (1.0 + w_b)
 
+        # Region/mask weighting is owned by BaseLoss.reduce_masked so the
+        # mechanism stays loss-agnostic (mask_configs -> LossContext.loss_mask).
+        # With no mask this is bit-identical to the previous plain mean().
+        weighting = None
         if self.use_weighting:
             weighting = compute_loss_weighting_for_sd3(context.sigmas)
             while weighting.dim() < v_corrected.dim():
                 weighting = weighting.unsqueeze(-1)
-            loss = (weighting * (v_corrected - target) ** 2).mean()
-        else:
-            loss = ((v_corrected - target) ** 2).mean()
+        loss = self.reduce_masked(
+            (v_corrected - target) ** 2, context, weighting=weighting
+        )
 
         self.last_components = {
             "guidance_scale_mean": float(w.mean().item()),
+            **self.mask_telemetry(context),
         }
         return loss
 

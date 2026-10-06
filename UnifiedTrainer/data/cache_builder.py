@@ -160,9 +160,11 @@ class CacheBuilder:
 
         The single-channel PNG (0/255) is bucket-cropped with the SAME
         deterministic transform the target went through, then
-        area-averaged down to the latent grid (bucket // vae_scale).
-        Stored as a (1, h, w) float32 npz so at training time it stacks to
-        (B, 1, h, w) and broadcast-multiplies the velocity MSE.
+        area-averaged down to the latent grid (bucket // vae_scale) and then
+        BINARISED at 0.5: at latent resolution a boundary cell is part region
+        and part background, so averaging alone leaves a semi-transparent rim
+        of fractional values.  Stored as a (1, h, w) float32 npz of exact
+        0.0/1.0 so it stacks to (B, 1, h, w) and weights the velocity MSE.
         """
         from PIL import Image
 
@@ -176,7 +178,16 @@ class CacheBuilder:
                 bucket_dims = bs.find_bucket_for_image(
                     self.ds_config.resolution, im
                 )
-            m = np.array(im.convert("L"))
+            # Alpha-first: an RGBA mask (e.g. the _T target itself) carries
+            # the region in its alpha channel.  convert("L") on RGBA would
+            # instead return the *luminance* of the RGB content, which is
+            # not a mask.
+            if im.mode in ("RGBA", "LA") or (
+                im.mode == "P" and "transparency" in im.info
+            ):
+                m = np.array(im.convert("RGBA"))[..., 3]
+            else:
+                m = np.array(im.convert("L"))
 
         m = bs.crop_numpy_to_bucket(m, bucket_dims)
         scale = int(getattr(self.adapter, "vae_scale_factor", 8) or 8)
@@ -196,6 +207,10 @@ class CacheBuilder:
 
         t = torch.from_numpy(m).float().div_(255.0)[None, None]  # (1,1,H,W)
         t = torch.nn.functional.interpolate(t, size=(lh, lw), mode="area")
+        # Binarise.  Area averaging alone leaves fractional values on boundary
+        # >= 0.5 keeps a boundary cell that the region covers more than
+        # half of and drops the rest -- area-preserving, no dilation.
+        t = (t >= 0.5).to(t.dtype)
         self.cache.save_latent_npz(npz_path, t[0])              # (1, h, w)
         return {"npz_path": npz_path, "bucket": f"{bucket_dims[0]}x{bucket_dims[1]}"}
 

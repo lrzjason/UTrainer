@@ -1063,12 +1063,13 @@ class Trainer:
             # transitions and flush the allocator to eliminate fragmentation.
             #
             # Cost: ~0.05s for empty_cache() — negligible vs 5-15s/step.
-            batch_changed = (
-                _prev_batch_shape is not None
-                and _step_latent_shape is not None
-                and _step_latent_shape != _prev_batch_shape
-            )
-            if batch_changed or steps_this_epoch % 50 == 0:
+            # PERF 2026-10-05: a latent-shape change no longer forces a
+            # CUDA-allocator flush.  The launcher already sets
+            # PYTORCH_ALLOC_CONF=expandable_segments:True, and this dataset
+            # changes latent shape on almost every step, so this branch ran
+            # every step (~0.3-0.4 s, seen as cleanup= in STEP_TIMING).
+            # Only the periodic flush is kept.
+            if steps_this_epoch % 50 == 0:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
