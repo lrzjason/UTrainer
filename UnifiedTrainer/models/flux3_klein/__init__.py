@@ -612,29 +612,28 @@ class Flux3KleinAdapter(BaseModelAdapter):
             text = prompt
 
         # ── 2. Round the window up to the pad multiple ──────────────────
+        # NO truncation: the encoder is Qwen3-VL (long context), so the caption
+        # keeps its natural length and is only rounded UP to the pad multiple
+        # (the reference checkpoint was trained with multiples of 8/16).
         inner = getattr(holder, "tokenizer", holder)
         try:
             real_length = inner(
                 text,
                 return_tensors="pt",
-                truncation=True,
-                max_length=self.max_sequence_length,
+                truncation=False,
             )["input_ids"].shape[1]
-        except Exception:  # noqa: BLE001 - fall back to the cap
+        except Exception:  # noqa: BLE001 - fall back to the configured cap
             real_length = self.max_sequence_length
 
-        padded_length = min(
-            math.ceil(real_length / self.pad_multiple) * self.pad_multiple,
-            self.max_sequence_length,
-        )
-        padded_length = max(padded_length, 1)
+        padded_length = max(
+            math.ceil(real_length / self.pad_multiple) * self.pad_multiple, 1)
 
         inputs = inner(
             text,
             return_tensors="pt",
             padding="max_length",
             padding_side="right",
-            truncation=True,
+            truncation=False,
             max_length=padded_length,
         )
         input_ids = inputs["input_ids"].to(device)

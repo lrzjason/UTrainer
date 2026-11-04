@@ -224,15 +224,26 @@ class Flux2KleinAdapter(BaseModelAdapter):
             )
 
         # ── 2. Tokenize ─────────────────────────────────────────────────
+        # NO truncation and no fixed-length padding: the Flux2 text encoder is
+        # Qwen3 (long context), one prompt per call, so the row keeps its
+        # natural length.  Per-batch zero padding + mask happen later in
+        # _extract_encoder_hidden_states / _extract_encoder_attention_mask.
         inputs = tokenizer(
             prompt_text,
             return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_sequence_length,
+            padding=False,
+            truncation=False,
         )
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
+        # Normalise regardless of what the tokenizer returns: fast tokenizers give
+        # (1, L) int64 tensors, a slow/odd one may hand back 1-D tensors or lists.
+        input_ids = torch.as_tensor(inputs["input_ids"], dtype=torch.long)
+        attention_mask = torch.as_tensor(inputs["attention_mask"], dtype=torch.long)
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if attention_mask.ndim == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
 
         # ── 3. Run encoder ──────────────────────────────────────────────
         with torch.no_grad():
