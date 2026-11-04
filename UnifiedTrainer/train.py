@@ -1052,9 +1052,7 @@ def main():
             # musubi `lokr_full_rank: true` → full-matrix W1/W2, rank/alpha
             # overridden to the 9999 sentinel inside LokrConfig (scale = 1.0).
             full_rank=training_cfg.get("lokr_full_rank", False),
-            # PiSSA-style init (2404.02948): adapter starts at the dominant
-            # Kronecker component of the frozen weight instead of zeros.
-            pissa_init=training_cfg.get("lokr_pissa_init", False),
+                # Kronecker component of the frozen weight instead of zeros.
         )
 
         # Prepare for k-bit training if quantized (same as LoRA path)

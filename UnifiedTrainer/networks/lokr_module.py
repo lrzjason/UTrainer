@@ -127,10 +127,6 @@ class LokrConfig:
     multiplier: float = 1.0
     decompose_both: bool = False
     full_rank: bool = False
-    # PiSSA-style initialisation (Meng et al., 2404.02948): start the adapter at
-    # the dominant Kronecker component of the frozen weight instead of zeros, and
-    # subtract it from the base so the total weight is unchanged at step 0.
-    pissa_init: bool = False
 
     def __post_init__(self):
         if self.full_rank:
@@ -480,91 +476,6 @@ class LokrLayer(nn.Module):
 
 # ── LokrNetwork: manages all LokrLayers ──────────────────────────────────
 
-def pissa_init_lokr_layer(layer: "LokrLayer", weight: torch.Tensor) -> bool:
-    """Initialise a LoKR layer from the dominant Kronecker component of *weight*.
-
-    PiSSA (2404.02948) shows that starting LoRA at "noise & zero" wastes the first
-    hundreds of steps re-learning the principal directions of the frozen weight;
-    initialising the adapter with the principal components (and subtracting them
-    from the base) converges markedly faster.
-
-    For LoKR the update is ``delta = kron(w1, w2) * scale``.  The best single
-    Kronecker factor of a matrix is given by the leading singular pair of the
-    *reshuffled* matrix (Van Loan & Pitsianis): with
-    ``R[(i,j),(p,q)] = W[i*out2+p, j*in2+q]``, the top singular triplet
-    ``(u, s, v)`` yields ``kron(w1, w2) ≈ s·u⊗v``.
-
-    The component is subtracted from the frozen weight so the layer's effective
-    weight is unchanged at step 0 (PiSSA's residual trick), done in the reshaped
-    view so the full Kronecker product is never materialised.
-    """
-    if not (layer.use_w1 and layer.use_w2):
-        # Low-rank factorisations: keep the zero init (documented limitation).
-        return False
-    with torch.no_grad():
-        # 24 GB budget: run the SVD on the CPU.  For an 8192x8192 layer the
-        # float32 copy + reshuffled matrix + U factor peak at ~0.8 GB, which we
-        # do not want to add to the GPU's steady-state usage (fp8 base ~13.3 GB
-        # + activations).  CPU temporaries are free.
-        #
-        # torchao's Float8Tensor (weight-only quantization) intercepts ``view``/
-        # ``reshape`` through __torch_dispatch__ and raises
-        # "Only support reshaping from 2D to 3D or from 3D to 2D", so dequantize
-        # into a *plain* tensor first, then work on it.
-        src = weight
-        if hasattr(src, "dequantize"):
-            try:
-                src = src.dequantize()
-            except Exception:  # noqa: BLE001 - not a torchao tensor after all
-                pass
-        w_cpu = torch.empty(src.shape, dtype=torch.float32)
-        w_cpu.copy_(src.detach().to("cpu", torch.float32))
-        out1, out2, in1, in2 = layer.out1, layer.out2, layer.in1, layer.in2
-        try:
-            w4 = w_cpu.view(out1, out2, in1, in2)                # W[i*out2+p, j*in2+q]
-            r = w4.permute(0, 2, 1, 3).reshape(out1 * in1, out2 * in2)
-            u, s, vh = torch.linalg.svd(r, full_matrices=False)
-            s0 = s[0]
-            if not torch.isfinite(s0) or s0 <= 0:
-                return False
-            w1 = (u[:, 0] * s0.sqrt()).reshape(out1, in1)
-            w2 = (vh[0, :] * s0.sqrt()).reshape(out2, in2)
-            layer.lokr_w1.data.copy_(w1.to(layer.lokr_w1.device, layer.lokr_w1.dtype))
-            layer.lokr_w2.data.copy_(w2.to(layer.lokr_w2.device, layer.lokr_w2.dtype))
-            del u, s, vh, r, w4, w_cpu
-
-            # PiSSA residual: W <- W - scale * kron(w1, w2).  Skipped for
-            # quantization-wrapped weights (torchao Float8Tensor / qbn), whose
-            # storage cannot be written elementwise; the adapter still starts at
-            # the principal component, just without the "total weight unchanged"
-            # property (the dominant component is ~13% of ||W||).
-            is_plain_float = (
-                type(weight).__module__.split(".")[0] == "torch"
-                and weight.is_floating_point()
-                and weight.is_contiguous()
-            )
-            if not is_plain_float:
-                logger.info(
-                    "pissa_init: base weight is quantized/wrapped "
-                    f"({type(weight).__name__}); adapter initialised from the "
-                    "principal Kronecker component, residual not subtracted")
-                return True
-            delta = (
-                layer.lokr_w1.data.float().view(out1, 1, in1, 1)
-                * layer.lokr_w2.data.float().view(1, out2, 1, in2)
-                * layer.scale
-            ).reshape(layer.out_features, layer.in_features)
-            weight.sub_(delta.to(weight.device, weight.dtype))
-            del delta
-            return True
-        except Exception:  # noqa: BLE001 - never fail a run because of an init
-            logger.warning("pissa_init: falling back to zero init (SVD failed)",
-                           exc_info=True)
-            layer.lokr_w1.data.zero_()
-            layer.lokr_w2.data.zero_()
-            return False
-
-
 class LokrNetwork(nn.Module):
     """Container for all LoKR adapter layers.
 
@@ -620,8 +531,6 @@ class LokrNetwork(nn.Module):
                 decompose_both=self.config.decompose_both,
                 full_rank=self.config.full_rank,
             )
-            if getattr(self.config, "pissa_init", False):
-                pissa_init_lokr_layer(layer, module.weight.data)
             # Sanitize name for ModuleDict (replace dots with underscores)
             safe_name = name.replace(".", "_")
             self.layers[safe_name] = layer
