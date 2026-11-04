@@ -217,6 +217,38 @@ class QwenImage21Adapter(BaseModelAdapter):
                 "Expected 'dynamic_shift', 'flow_shift' or 'sigma'."
             )
 
+        # dynamic_shift endpoints (mu-space).  Config-overridable so a run can
+        # bias sampling toward high noise without editing the module: the
+        # defaults below are the checkpoint's OWN scheduler_config.json values
+        # (0.5 -> 0.9 over 256 -> 8192 tokens), which is what every qwen21 run
+        # in this project has used.  Setting base_shift/max_shift higher moves
+        # mass toward sigma=1 (high noise); e.g. 1.5 -> 2.5 gives mean sigma
+        # ~0.84 at 1024x1024 instead of ~0.64.
+        self.base_shift: float = float(
+            config.get("base_shift", QWEN21_SCHEDULER_CONFIG["base_shift"])
+        )
+        self.max_shift: float = float(
+            config.get("max_shift", QWEN21_SCHEDULER_CONFIG["max_shift"])
+        )
+        self.base_image_seq_len: int = int(
+            config.get("base_image_seq_len",
+                       QWEN21_SCHEDULER_CONFIG["base_image_seq_len"])
+        )
+        self.max_image_seq_len: int = int(
+            config.get("max_image_seq_len",
+                       QWEN21_SCHEDULER_CONFIG["max_image_seq_len"])
+        )
+        if self.max_image_seq_len <= self.base_image_seq_len:
+            raise ValueError(
+                f"qwen_image21: max_image_seq_len ({self.max_image_seq_len}) "
+                f"must exceed base_image_seq_len ({self.base_image_seq_len})."
+            )
+        if self.base_shift <= 0.0 or self.max_shift <= 0.0:
+            raise ValueError(
+                f"qwen_image21: base_shift/max_shift must be > 0, got "
+                f"{self.base_shift}/{self.max_shift}"
+            )
+
         # Target grid dims cached from prepare_model_input — used by
         # unpack_prediction to slice the LAST target rows (pipeline parity,
         # no sqrt guesses). Latent-space (H, W); patch_size=1 so latent dims
@@ -652,13 +684,12 @@ class QwenImage21Adapter(BaseModelAdapter):
             **images_kw,
         )
         if not is_multimodal:
-            # Text-only: truncate at the configured budget + template
-            # headroom (see _TEMPLATE_HEADROOM). NO truncation on the
-            # multimodal path (pipeline parity).
-            processor_kwargs.update(
-                truncation=True,
-                max_length=self.text_max_length + self._drop_idx + _TEMPLATE_HEADROOM,
-            )
+            # Text-only: NO truncation. The full caption is encoded at its own
+            # length (the cache stores per-sample lengths and the batch collate
+            # pads with zeros + mask to the longest caption, ai-toolkit style).
+            # ``training.text_max_length`` is kept only as a legacy knob and no
+            # longer clips anything.
+            processor_kwargs.update(truncation=False)
 
         if processor is not None:
             model_inputs = processor(**processor_kwargs).to(device)
@@ -668,8 +699,7 @@ class QwenImage21Adapter(BaseModelAdapter):
                 text=processor_kwargs["text"],
                 padding=True,
                 padding_side="left",
-                truncation=True,
-                max_length=processor_kwargs.get("max_length"),
+                truncation=False,
                 return_tensors="pt",
             )
             model_inputs = tokenizer(**tok_kwargs).to(device)
@@ -833,6 +863,36 @@ class QwenImage21Adapter(BaseModelAdapter):
         encoder_attention_mask = self._extract_encoder_attention_mask(batch, device)
         # (B, text_len) bool — True at VLM image SLOTS (pre-expansion).
         img_mask = self._extract_image_token_mask(batch, device, text_len)
+
+        # ── float8 GEMM padding ───────────────────────────────────────────
+        # torchao's Float8Linear routes the weight-gradient through
+        # ``torch._scaled_mm(grad_out.t(), input)``, so its reduction dim is the
+        # JOINT token count (H*W latent tokens + text_len). ``_scaled_mm``
+        # requires that dim to be a multiple of 16, which a caption length like
+        # 10 (=> 4095 + 10 = 4105) violates. Pad the text stream (and its masks)
+        # with zeros so the joint length becomes 16-aligned; the extra rows are
+        # masked out and their conditioning is zero, so the model output is
+        # unchanged.
+        if getattr(self, "_float8_pad_tokens", True):
+            joint = H * W + text_len
+            pad = (-joint) % 16
+            if pad:
+                encoder_hidden_states = torch.cat(
+                    [encoder_hidden_states,
+                     encoder_hidden_states.new_zeros(B, pad, encoder_hidden_states.shape[2])],
+                    dim=1,
+                )
+                if encoder_attention_mask is not None and encoder_attention_mask.ndim >= 2:
+                    encoder_attention_mask = torch.cat(
+                        [encoder_attention_mask,
+                         encoder_attention_mask.new_zeros(
+                             *encoder_attention_mask.shape[:-1], pad)],
+                        dim=-1,
+                    )
+                if img_mask is not None and img_mask.ndim >= 2:
+                    img_mask = torch.cat(
+                        [img_mask, img_mask.new_zeros(*img_mask.shape[:-1], pad)], dim=-1)
+                text_len = encoder_hidden_states.shape[1]
 
         # ── Reference (edit) path — driven by the cached slot mask ────────
         batch_configs = batch.get("batch_configs", [])
@@ -1080,18 +1140,21 @@ class QwenImage21Adapter(BaseModelAdapter):
 
         # dynamic_shift
         if latent_height is None or latent_width is None:
-            # Base logit-normal (mu=0) when no shape info is available.
-            # Implemented inline: BaseModelAdapter.sample_timesteps rejects any
-            # timestep_shift_mode other than "sigma", so super() would raise.
-            u = torch.randn(batch_size, device=device, dtype=torch.float32)
-            sigmas = torch.sigmoid(u).to(dtype=dtype)
+            # No shape info: use the configured high-noise end (max_shift)
+            # rather than the base logit-normal (mu=0).  Implemented inline:
+            # BaseModelAdapter.sample_timesteps rejects any timestep_shift_mode
+            # other than "sigma", so super() would raise.
+            u = torch.normal(
+                mean=self.max_shift, std=self.sigmoid_scale,
+                size=(batch_size,), device=device,
+            )
+            sigmas = torch.sigmoid(u).clamp(1e-5, 1.0 - 1e-5).to(dtype=dtype)
             return sigmas * n, sigmas
 
-        cfg = QWEN21_SCHEDULER_CONFIG
-        m = (cfg["max_shift"] - cfg["base_shift"]) / (
-            cfg["max_image_seq_len"] - cfg["base_image_seq_len"]
+        m = (self.max_shift - self.base_shift) / (
+            self.max_image_seq_len - self.base_image_seq_len
         )
-        b = cfg["base_shift"] - m * cfg["base_image_seq_len"]
+        b = self.base_shift - m * self.base_image_seq_len
         mu = (latent_height * latent_width) * m + b  # = calculate_shift(image_seq_len)
 
         # Logit-normal: u ~ N(mu, sigmoid_scale), sigma = sigmoid(u).

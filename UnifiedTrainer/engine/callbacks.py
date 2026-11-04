@@ -84,10 +84,15 @@ class WandBCallback(Callback):
         project: str = "UnifiedTrainer",
         config: Optional[dict] = None,
         run_name: Optional[str] = None,
+        save_code: bool = False,
     ):
+        """``save_code=False`` keeps the git repo out of wandb storage (policy:
+        only scalar curves + config go to wandb; model files and source are never
+        uploaded).  Pass ``save_code=True`` to opt in."""
         self.project = project
         self.config = config or {}
         self.run_name = run_name
+        self.save_code = save_code
         self._wandb = None
         self._initialized = False
 
@@ -97,13 +102,19 @@ class WandBCallback(Callback):
         try:
             import wandb
             self._wandb = wandb
-            init_kwargs = {"project": self.project, "config": self.config}
+            settings = wandb.Settings(save_code=self.save_code)
+            init_kwargs = {
+                "project": self.project,
+                "config": self.config,
+                "settings": settings,
+            }
             if self.run_name:
                 init_kwargs["name"] = self.run_name
             wandb.init(**init_kwargs)
             self._initialized = True
-        except ImportError:
-            logger.warning("wandb not installed, skipping WandBCallback")
+        except Exception as exc:  # wandb missing OR cloud unreachable: never kill a run
+            logger.warning(f"WandBCallback disabled ({exc}); training continues without it")
+            self._wandb = None
 
     def on_train_start(self, trainer: Any) -> None:
         self._init_wandb()

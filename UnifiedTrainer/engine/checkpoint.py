@@ -509,9 +509,51 @@ class CheckpointManager:
         lycoris_net.save_weights(str(path), dtype=torch.bfloat16)
         logger.info(f"Saved LoKR checkpoint: {path} ({lycoris_net.num_modules} modules)")
 
+        # Auto-convert to the ComfyUI/FLUX.3 key layout next to the native file.
+        # ComfyUI registers `lycoris_*` for many architectures but NOT for
+        # FLUX.3 -- it only accepts `lora_unet_<comfy name>` / `diffusion_model.
+        # <comfy name>` with the original BFL module names, so the native file
+        # loads as "lora key not loaded" for every key.  The extra file costs
+        # disk only; the native file remains the resume/interchange format.
+        comfy_path = None
+        try:
+            from UnifiedTrainer.networks.lokr_convert import (
+                comfy_filename_for, convert_file,
+            )
+
+            # MOSS targets live at `layers.N.proj.q` (official names, which
+            # ComfyUI keeps verbatim); qwen-image-2.x targets live under
+            # `transformer_blocks.N.*` and ComfyUI already understands those
+            # diffusers names, so a pure prefix rename is correct there; the rest
+            # goes through the FLUX.3/Krea2 name mapping.
+            targets = list(getattr(lycoris_net, "_target_names", []) or [])
+            is_moss = any(t.startswith("layers.") for t in targets)
+            is_diffusers_native = any(t.startswith("transformer_blocks.") for t in targets)
+            if is_moss:
+                model_kind, native_mods = "moss", None
+            elif is_diffusers_native:
+                model_kind, native_mods = "rename", None
+            else:
+                model_kind, native_mods = "flux3", targets
+            comfy_path = comfy_filename_for(path)
+            convert_file(
+                path, comfy_path, to="comfyui",
+                model=model_kind,
+                native_modules=native_mods,
+                metadata={"save_name": self.save_name, "epoch": epoch, "step": step},
+            )
+            logger.info(f"Saved ComfyUI-compatible LoKR: {comfy_path}")
+        except Exception as e:  # noqa: BLE001 - never fail a checkpoint save
+            logger.warning(
+                f"Could not write the ComfyUI-converted LoKR next to {path}: {e}"
+            )
+            comfy_path = None
+
         # Metadata
         meta = {"step": step, "epoch": epoch, "network_type": "lokr",
                 "num_modules": lycoris_net.num_modules}
+        if comfy_path is not None:
+            meta["comfyui_path"] = str(comfy_path)
         if config:
             meta["config"] = config
         meta_path = path.with_suffix(".json")

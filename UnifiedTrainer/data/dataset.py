@@ -26,7 +26,7 @@ from torch.utils.data import Dataset, Sampler
 
 logger = logging.getLogger(__name__)
 
-from UnifiedTrainer.data.cache_manager import CacheManager
+from UnifiedTrainer.data.cache_manager import CacheManager, filter_rows_to_datasets
 from UnifiedTrainer.data.bucket import BucketSystem
 from UnifiedTrainer.data.embedding_cache import EmbeddingCache
 from UnifiedTrainer.data.config_schema import BatchConfig, DatasetConfig, parse_dataset_configs
@@ -77,6 +77,26 @@ class UnifiedDataset(Dataset):
             self.datarows = self.cache.load_train_index()
         else:
             self.datarows = self.cache.load_val_index()
+
+        # Scope the index to the datasets THIS config trains.  The index is a
+        # cache-dir level artifact (every per-sample JSON under the cache dir), so
+        # a config training a subset of the datasets sharing that dir would
+        # otherwise train on all of them — e.g. a 222-pair shape-only config
+        # reporting "532 datarows" because the colour dataset shares the cache.
+        wanted = {
+            ds_cfg.train_data_dir for ds_cfg in self.dataset_configs
+            if ds_cfg.train_data_dir
+        }
+        if wanted:
+            kept, dropped = filter_rows_to_datasets(self.datarows, wanted)
+            if dropped:
+                logger.warning(
+                    f"Dataset [{split}]: dropping {len(dropped)} index row(s) that "
+                    f"belong to datasets this config does not train "
+                    f"({sorted({r.get('dataset', '?') for r in dropped})}); "
+                    f"keeping {len(kept)}."
+                )
+                self.datarows = kept
 
         if not self.datarows:
             raise FileNotFoundError(
@@ -323,6 +343,19 @@ class UnifiedDataset(Dataset):
                     latents[role] = loaded
 
 
+        # Bucket-aligned pixel copies for pixel-space losses (e.g.
+        # losses/composite_consistency.py): the cache stores the PREPROCESSED
+        # target/reference images (`*_1024.png`) with the exact crop/resize the
+        # latents were built from, so a loss can compare against pixels without
+        # re-deriving the transform.  Absent entries simply stay missing.
+        pixel_paths = {}
+        _t_entry = targets.get(target_key) if (target_key and target_key in targets) else None
+        if isinstance(_t_entry, dict) and _t_entry.get("image_path"):
+            pixel_paths["T"] = _t_entry["image_path"]
+        _r_entry = references.get(reference_key) if (reference_key and reference_key in references) else None
+        if isinstance(_r_entry, dict) and _r_entry.get("image_path"):
+            pixel_paths["R"] = _r_entry["image_path"]
+
         # Load caption embedding
         embedding = None
         npz_path = ""  # init: may stay "" when captions dict is empty
@@ -414,6 +447,7 @@ class UnifiedDataset(Dataset):
             "group_id": os.path.splitext(os.path.basename(json_path))[0],
             "latents": latents,
             "pfm_feats": pfm_feats,
+            "pixel_paths": pixel_paths,
             "loss_mask": loss_mask,
             "embedding": embedding,
             "batch_config": {
@@ -446,6 +480,7 @@ def collate_fn(batch: list) -> dict:
         "group_ids": [b["group_id"] for b in batch],
         "latents": {},
         "pfm_feats": {},
+        "pixel_paths": [b.get("pixel_paths", {}) for b in batch],
         "loss_mask": None,
         "embeddings": [b["embedding"] for b in batch],
         "image_configs": [b["image_configs"] for b in batch],

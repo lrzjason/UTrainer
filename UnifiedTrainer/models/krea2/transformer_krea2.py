@@ -82,12 +82,22 @@ class Krea2AttnProcessor:
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
+        # Grouped-query attention: expand the KV heads here instead of passing
+        # ``enable_gqa=True``.  The fused SDPA kernels reject differing head
+        # counts and silently fall back to the fp32 math backend, which measured
+        # 67.7 ms vs 24.2 ms (fwd+bwd, L=2048, 48/12 heads, RTX 5060 Ti) for the
+        # same math.  Expanding one 12->48 head copy keeps the memory-efficient
+        # kernel.  See UnifiedTrainer/kernels/eager.py::sdpa_gqa.
+        repeat = attn.num_heads // attn.num_kv_heads
+        if repeat > 1:
+            key = key.repeat_interleave(repeat, dim=2)
+            value = value.repeat_interleave(repeat, dim=2)
+
         hidden_states = dispatch_attention_fn(
             query,
             key,
             value,
             attn_mask=attention_mask,
-            enable_gqa=attn.num_heads != attn.num_kv_heads,
             backend=self._attention_backend,
             parallel_config=self._parallel_config,
         )

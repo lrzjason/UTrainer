@@ -150,6 +150,15 @@ def _quantize_text_encoder(te, mode, compute_dtype):
         _replace_linear_with_4bit(te, compute_dtype=compute_dtype, quant_type="nf4")
     elif mode == "int8":
         _replace_linear_with_8bit(te, threshold=0.0)
+    elif mode in ("torchao_float8", "fp8", "float8"):
+        # torchao weight-only fp8: half the VRAM of bf16 and better fidelity than
+        # nf4/int8. Quantized on CPU (the encoder is still off-device here) so the
+        # fp8 weights are what .to(cuda) moves afterwards.
+        from UnifiedTrainer.utils.quantize import Float8WeightOnlyConfig, torchao_quantize_
+
+        if torchao_quantize_ is None or Float8WeightOnlyConfig is None:
+            raise RuntimeError("torchao is not available; cannot use fp8 text encoder")
+        torchao_quantize_(te, Float8WeightOnlyConfig())
     else:
         return
     logger.info(f"Text encoder quantized ({mode})")
@@ -248,6 +257,54 @@ def _save_checkpoint_on_exception(trainer, lycoris_net, config, output_dir,
     except Exception as e:
         logger.error(f"Failed to save recoverable checkpoint on interrupt: {e}")
         return False
+
+
+def _missing_mask_entries(sample: dict, wanted) -> list:
+    """Mask keys declared by ``mask_configs`` that this sample JSON lacks.
+
+    Returns [] when the sample is fine (or when no mask layer is configured).
+
+    Why this exists: a per-sample JSON written BEFORE ``mask_configs`` was added
+    has no ``loss_mask`` section at all, and the builder's mask backfill lives
+    inside the dataset SCAN path — which ``_check_cache_validity``'s fast path
+    skips entirely.  Without this check, adding ``mask_configs`` to a config with
+    an existing cache silently trains with region weighting OFF: observed as
+    ``guide_flow_matching/mask_active=0.0`` for a whole 20-epoch run, with zero
+    ``*_mask_*.npz`` files on disk.  Treating it as cache-invalid routes the run
+    through the scan, where ``CacheBuilder._backfill_masks`` builds only the
+    missing entries (incremental, no latent rebuild).
+    """
+    if not wanted:
+        return []
+    have = sample.get("loss_mask") or {}
+    lack = []
+    for key in wanted:
+        entry = have.get(key)
+        path = entry.get("npz_path", "") if isinstance(entry, dict) else ""
+        if not path or not os.path.exists(path):
+            lack.append(key)
+    return lack
+
+
+def _resolve_lokr_targets(training_cfg: dict):
+    """`lokr_target_modules` / `lokr_preset` -> fnmatch patterns.
+
+    MOSS defaults to the KohakuMossTrainer `attn-mlp` preset (the 252 joint
+    attn/MLP projections) instead of "every nn.Linear": adapting the modulation
+    and embedding layers destroys the conditioning path.  `"all"` restores the
+    old behaviour.
+    """
+    from UnifiedTrainer.networks.lokr_module import resolve_target_modules
+
+    explicit = training_cfg.get("lokr_target_modules", None)
+    preset = training_cfg.get("lokr_preset", None)
+    if explicit is not None:
+        return resolve_target_modules(explicit)
+    if preset is not None:
+        return resolve_target_modules(preset)
+    if (training_cfg.get("lokr_model_type") or "").lower() == "moss":
+        return resolve_target_modules("attn-mlp")
+    return None
 
 
 def main():
@@ -651,6 +708,13 @@ def main():
         # mid-epoch with "encoder_hidden_states missing"; the full check is
         # a few thousand os.path.exists calls, so it is cheap at startup and
         # makes the incremental rebuild (missing files only) reliable.
+        #
+        # The same loop also enforces the MASK layer: see _missing_mask_entries.
+        mask_keys = {
+            ds_cfg.train_data_dir: sorted(ds_cfg.mask_configs)
+            for ds_cfg in dataset_configs
+            if ds_cfg.mask_configs
+        }
         try:
             train_rows = cache_mgr.load_train_index()
             if train_rows:
@@ -688,6 +752,16 @@ def main():
                         npz = cap_entry.get("npz_path", "")
                         if npz and not os.path.exists(npz):
                             return False, f"embedding .npz missing: {npz}"
+                    # Mask layer (region weighting): invalidates a cache built
+                    # before mask_configs existed, so the scan path backfills it.
+                    lack = _missing_mask_entries(
+                        sample, mask_keys.get(row.get("dataset", ""), [])
+                    )
+                    if lack:
+                        return False, (
+                            f"mask layer {lack} not built for "
+                            f"{os.path.basename(jp)}"
+                        )
         except Exception:
             pass  # if spot-check fails for any reason, rebuild to be safe
 
@@ -914,9 +988,15 @@ def main():
             logger.info(f"Transformer loaded + int8 quantized on GPU. "
                         f"VRAM: {torch.cuda.memory_allocated() / 1024**3:.1f}GB allocated")
     elif quantize_mode.startswith("torchao_"):
-        # torchao weight-only quantization (float8/int8/int4)
-        # Per-block quantization to avoid VRAM peak of full bf16 model on GPU:
-        # each block is moved to GPU one at a time, quantized, frozen, moved back.
+        # torchao weight-only quantization, aligned with ai-toolkit
+        # (toolkit/util/quantize.py: qtype "float8" -> Float8WeightOnlyConfig()).
+        #
+        # Weight-only float8 dequantises the weight to bf16 inside the forward and
+        # then runs a *bf16* matmul: no fp8 GEMM, therefore no K % 16 constraint
+        # (`_scaled_mm` needs the reduction dim to be a multiple of 16, which our
+        # joint image+text token count is not). The only requirement is a
+        # deterministic forward, which is why gradient checkpointing must use the
+        # reentrant implementation (see the gradient-checkpointing block below).
         from UnifiedTrainer.utils.quantize import quantize_model as torchao_quantize_model
         transformer = adapter.load_transformer(transformer_path, weight_dtype)
         # Strip "torchao_" prefix to get the qtype name (e.g. "float8", "int8", "int4")
@@ -968,10 +1048,13 @@ def main():
             alpha=training_cfg.get("lokr_alpha", 1.0),
             factor=training_cfg.get("lokr_factor", -1),
             model_type=training_cfg.get("lokr_model_type", "krea2"),
-            target_modules=training_cfg.get("lokr_target_modules", None),
+            target_modules=_resolve_lokr_targets(training_cfg),
             # musubi `lokr_full_rank: true` → full-matrix W1/W2, rank/alpha
             # overridden to the 9999 sentinel inside LokrConfig (scale = 1.0).
             full_rank=training_cfg.get("lokr_full_rank", False),
+            # PiSSA-style init (2404.02948): adapter starts at the dominant
+            # Kronecker component of the frozen weight instead of zeros.
+            pissa_init=training_cfg.get("lokr_pissa_init", False),
         )
 
         # Prepare for k-bit training if quantized (same as LoRA path)
@@ -1035,21 +1118,40 @@ def main():
             lora_dropout=0.0,
             bias="none",
         )
-        # When using torchao quantization, bypass PEFT's TorchaoLoraLinear dispatcher.
-        # PEFT 0.18.1's TorchaoLoraLinear requires a get_apply_tensor_subclass kwarg
-        # that diffusers' add_adapter doesn't pass. Regular PEFT Linear works fine —
-        # torchao's AffineQuantizedTensor handles F.linear via __torch_function__.
-        if quantize_mode.startswith("torchao_"):
+        # LoRA injection.
+        # PEFT's torchao dispatcher is neutralized for EVERY add_adapter() call,
+        # not just torchao_* runs. Two reasons:
+        #   1. diffusers' add_adapter() never passes the get_apply_tensor_subclass
+        #      kwarg PEFT's TorchaoLoraLinear needs, so that path always fails; a
+        #      plain PEFT Linear is correct (torchao's AffineQuantizedTensor
+        #      handles F.linear through __torch_function__).
+        #   2. PEFT installs the dispatcher whenever torchao is merely IMPORTABLE,
+        #      so even quantize="none" hits it. On torchao >= 0.17 the
+        #      `from torchao.quantization import LinearActivationQuantizedTensor`
+        #      inside dispatch_torchao raises ImportError (the symbol was
+        #      removed), breaking LoRA for every model. Previously masked because
+        #      42/46 shipped configs use network_type="lokr", which never calls
+        #      add_adapter().
+        _peft_lora_model = None
+        _restore_dispatch_torchao = None
+        try:
             import peft.tuners.lora.model as _peft_lora_model
-            _original_dispatch_torchao = _peft_lora_model.dispatch_torchao
-            _peft_lora_model.dispatch_torchao = lambda *a, **kw: None
-            logger.info("Bypassed PEFT TorchaoLoraLinear dispatcher for torchao quantization")
-            try:
-                transformer.add_adapter(lora_config)
-            finally:
-                _peft_lora_model.dispatch_torchao = _original_dispatch_torchao
-        else:
+
+            if getattr(_peft_lora_model, "dispatch_torchao", None) is not None:
+                _restore_dispatch_torchao = _peft_lora_model.dispatch_torchao
+                _peft_lora_model.dispatch_torchao = lambda *a, **kw: None
+                logger.info(
+                    "Neutralized PEFT TorchaoLoraLinear dispatcher "
+                    f"(quantize={quantize_mode})"
+                )
+        except Exception as e:  # noqa: BLE001 - never block LoRA injection
+            logger.debug(f"Could not neutralize PEFT torchao dispatcher: {e}")
+
+        try:
             transformer.add_adapter(lora_config)
+        finally:
+            if _peft_lora_model is not None and _restore_dispatch_torchao is not None:
+                _peft_lora_model.dispatch_torchao = _restore_dispatch_torchao
 
     # ── BouncingOffloader: bounce frozen base weights to CPU for torchao models ──
     # T2ITrainer pattern: BouncingOffloader attaches after add_adapter() so PEFT
@@ -1074,7 +1176,30 @@ def main():
     # T2ITrainer: add_adapter() (line 1335) → enable_gradient_checkpointing() (line 1338)
     if config.get("training", {}).get("gradient_checkpointing", True):
         if hasattr(transformer, "enable_gradient_checkpointing"):
-            transformer.enable_gradient_checkpointing()
+            # diffusers' API here is ``enable_gradient_checkpointing(gradient_checkpointing_func)``
+            # — there is no ``gradient_checkpointing_kwargs`` — and its default wrapper uses
+            # the NON-reentrant checkpoint whose strict saved-tensor check cannot survive a
+            # quantized (torchao float8) weight: the dequantised weight is produced lazily, so
+            # the recomputation saves a different number of tensors ("106 vs 91").
+            # Pass the reentrant implementation explicitly, like the T2ITrainer runs did.
+            import functools as _functools
+            import torch.utils.checkpoint as _ckpt
+            gc_kwargs = config.get("training", {}).get(
+                "gradient_checkpointing_kwargs", {"use_reentrant": True})
+            gc_func = _functools.partial(_ckpt.checkpoint, **gc_kwargs)
+            try:
+                transformer.enable_gradient_checkpointing(gradient_checkpointing_func=gc_func)
+                logger.info(f"Gradient checkpointing: reentrant func {gc_kwargs}")
+            except TypeError:
+                transformer.enable_gradient_checkpointing()
+                logger.warning("Gradient checkpointing: fallback to the model default "
+                               "(non-reentrant) — quantized weights may abort on backward")
+            # Belt and braces: some vendored models keep their own reference to the
+            # checkpointing callable on the instance, so overwrite it as well.
+            if gc_kwargs.get("use_reentrant", True):
+                for _obj in (transformer, getattr(transformer, "module", None)):
+                    if _obj is not None and hasattr(_obj, "_gradient_checkpointing_func"):
+                        _obj._gradient_checkpointing_func = gc_func
             # CRITICAL: torch.utils.checkpoint silently skips when no tensor
             # argument requires grad.  After base-model freezing + LoRA, the
             # patched latents entering img_in/txt_in have requires_grad=False,
@@ -1174,7 +1299,7 @@ def main():
 
     losses_need_vae = any(getattr(l, "requires_vae", False) for l in losses)
     val_wants_images = bool(
-        config.get("validation", {}).get("generate_images", False)
+        config.get("validation", {}).get("generate_images", True)
     )
     vae_manager = None
     if vae_path and (losses_need_vae or val_wants_images):
@@ -1286,6 +1411,11 @@ def main():
         device = trainer.accelerator.device
         trainer.device = device
 
+    # Fused-kernel path (training.kernels: auto | off | triton). Installs the
+    # attention hook over diffusers' dispatch_attention_fn BEFORE compile so a
+    # compiled graph sees the same call site; no-op when the knob is "off".
+    trainer.setup_kernels()
+
     # torch.compile the transformer (opt-in via training.compile: true).
     # Must run AFTER accelerator.prepare and LoKR hook attachment so the
     # compiled graph covers the final model. No-op when compile is false.
@@ -1308,7 +1438,9 @@ def main():
 
     # ── Setup callbacks (reporter: tensorboard / wandb) ─────────
     reporter_cfg = config.get("reporter", {})
-    reporter_type = reporter_cfg.get("type", "tensorboard")  # default: tensorboard
+    # Default reporter is TensorBoard (local, no account, no network). Set
+    # reporter.type = "wandb" to opt in to Weights & Biases, or "none" to disable.
+    reporter_type = reporter_cfg.get("type", "tensorboard")
     output_dir = config.get("output", {}).get("dir", "output")
     save_name = config.get("output", {}).get("save_name", "experiment")
 
@@ -1335,6 +1467,7 @@ def main():
             project=wandb_cfg.get("project", "UnifiedTrainer"),
             config=config,
             run_name=wandb_cfg.get("run_name"),
+            save_code=wandb_cfg.get("save_code", False),
         )
         trainer.callbacks.add(wandb_cb)
         logger.info(f"WandB reporter enabled: project={wandb_cb.project}")
@@ -1478,7 +1611,9 @@ def main():
     val_cfg = config.get("validation", {})
     val_split_ratio = data_cfg.get("val_split_ratio", 0.0)
     rebuild_index = data_cfg.get("rebuild_index", False)
-    if val_split_ratio > 0 or val_cfg.get("val_loss", False) or val_cfg.get("generate_images", False):
+    if val_split_ratio > 0 or val_cfg.get("val_loss", True) or val_cfg.get(
+        "generate_images", True
+    ):
         effective_ratio = val_split_ratio if val_split_ratio > 0 else 0.1
         val_seed = val_cfg.get("val_seed", 42)
 
@@ -1490,13 +1625,23 @@ def main():
                 f"Val split already exists ({len(existing_val)} val samples), reusing"
             )
         else:
-            # Rebuild full index from per-sample JSONs, then split
+            # Rebuild full index from per-sample JSONs, then split.
+            # include_datasets: the index lives in the CACHE DIR, so without this
+            # the scan would return rows for every dataset sharing that dir and a
+            # subset-config would silently train (and validate) on all of them.
+            configured_datasets = {
+                ds_cfg.train_data_dir for ds_cfg in dataset_configs
+                if ds_cfg.train_data_dir
+            }
             primary_ds_name = (
                 dataset_configs[0].train_data_dir
                 if dataset_configs
                 else "default"
             )
-            full_datarows = cache_mgr.rebuild_full_index(dataset_name=primary_ds_name)
+            full_datarows = cache_mgr.rebuild_full_index(
+                dataset_name=primary_ds_name,
+                include_datasets=configured_datasets,
+            )
             logger.info(f"Rebuilt full index: {len(full_datarows)} datarows")
             if full_datarows:
                 val_datarows, new_train_datarows = cache_mgr.create_val_split(
@@ -1514,12 +1659,19 @@ def main():
         # rebuild_index=True but no validation configured — still rebuild
         # the train index from per-sample JSONs so newly added datasets
         # are included in the sample count.
+        configured_datasets = {
+            ds_cfg.train_data_dir for ds_cfg in dataset_configs
+            if ds_cfg.train_data_dir
+        }
         primary_ds_name = (
             dataset_configs[0].train_data_dir
             if dataset_configs
             else "default"
         )
-        full_datarows = cache_mgr.rebuild_full_index(dataset_name=primary_ds_name)
+        full_datarows = cache_mgr.rebuild_full_index(
+            dataset_name=primary_ds_name,
+            include_datasets=configured_datasets,
+        )
         if full_datarows:
             cache_mgr.save_train_index(full_datarows)
             logger.info(f"Index rebuilt (no val split): {len(full_datarows)} datarows")
@@ -1619,7 +1771,7 @@ def main():
 
     # ── Build validation dataloader if val_loss is enabled ─────────
     val_dataloader = None
-    if val_cfg.get("val_loss", False):
+    if val_cfg.get("val_loss", True):
         val_dataset = UnifiedDataset(
             adapter=adapter,
             cache_dir=cache_dir,
@@ -1845,7 +1997,7 @@ def main():
                                         cb._writer.add_scalar(f"val/loss_{name}", val, trainer.step)
 
                 # ── Generate validation images into per-epoch dir ──────────
-                if val_cfg.get("generate_images", False):
+                if val_cfg.get("generate_images", True):
                     # 共享 VAE（vae_manager）：acquire/release 在
                     # generate_validation_images 内部完成，不再每轮重新加载。
                     trainer.epoch_output_dir = epoch_dir

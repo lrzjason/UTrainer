@@ -113,14 +113,17 @@ class Trainer:
         self.compile_mode: str = training_cfg.get(
             "compile_mode", "max-autotune-no-cudagraphs"
         )
+        # None keeps inductor's own choice; False specialises on static shapes,
+        # which is what a bucketed dataset wants (a few shapes, traced once).
+        self.compile_dynamic: bool | None = training_cfg.get("compile_dynamic", None)
         self._compiled = False
 
         # Validation params
         val_cfg = config.get("validation", {})
         self.val_every_epoch: int = val_cfg.get("val_every_epoch", 1)
         self.val_seed: int = val_cfg.get("val_seed", 42)
-        self.val_loss_enabled: bool = val_cfg.get("val_loss", False)
-        self.gen_images: bool = val_cfg.get("generate_images", False)
+        self.val_loss_enabled: bool = val_cfg.get("val_loss", True)
+        self.gen_images: bool = val_cfg.get("generate_images", True)
         self.val_num_inference_steps: int = val_cfg.get(
             "num_inference_steps", 20
         )
@@ -260,12 +263,79 @@ class Trainer:
         for loss_module in self.losses:
             loss_module.to(device, dtype)
 
+    def setup_kernels(self) -> None:
+        """Install the fused-kernel path before the model can be compiled.
+
+        Config:
+            training.kernels: "auto" | "off" | "triton"   (default "auto")
+
+        * ``off``    - leave every op as eager PyTorch (bit-exact baseline);
+        * ``auto``   - Triton kernels where this device supports them, with the
+                       correct SDPA fallback everywhere else;
+        * ``triton`` - Triton only; unsupported calls raise (benchmarks, CI).
+
+        What gets installed: ``UnifiedTrainer.kernels.install_attention_backend()``
+        routes diffusers' ``dispatch_attention_fn`` - the single funnel every
+        model adapter's attention goes through - to
+        ``UnifiedTrainer.kernels.attention``.  On CUDA builds without a fused
+        SDPA kernel that call replaces the fp32 math fallback and expands
+        grouped-query KV heads (see ``kernels/eager.py::sdpa_gqa``).
+        """
+        training_cfg = self.config.get("training", {})
+        choice = str(training_cfg.get("kernels", "auto")).strip().lower()
+        try:
+            from UnifiedTrainer import kernels
+        except Exception as exc:  # never fail a run because of an optional path
+            logger.warning(f"kernels: package unavailable ({exc}); using eager ops")
+            return
+        try:
+            kernels.set_mode(choice)
+        except ValueError as exc:
+            logger.warning(f"kernels: {exc}; using 'auto'")
+            kernels.set_mode("auto")
+        self._kernels = kernels
+        if kernels.mode() == "off":
+            kernels.uninstall_attention_backend()
+            from UnifiedTrainer.kernels import patch as _patch
+
+            _patch.remove()
+            logger.info("kernels: disabled (training.kernels=off), eager ops only")
+            return
+        installed = kernels.install_attention_backend()
+        patched = False
+        try:
+            from UnifiedTrainer.kernels import patch as _patch
+
+            patched = _patch.install()
+        except Exception as exc:  # the hook alone is still a win; never fail
+            logger.warning(f"kernels: block-op patch unavailable ({exc})")
+        state = kernels.available()
+        if installed:
+            logger.info(
+                "kernels: attention hook installed (mode=%s, triton=%s, cuda=%s, "
+                "block ops=%s)",
+                state["mode"], state["triton"], state["cuda"], patched,
+            )
+        else:
+            logger.warning(
+                "kernels: attention hook NOT installed (diffusers attention "
+                "dispatch unavailable); falling back to eager attention"
+            )
+
     def setup_compile(self) -> None:
         """Wrap the transformer in torch.compile for graph fusion + kernel fusion.
 
         Config:
             training.compile: true   -enable torch.compile
             training.compile_mode: "max-autotune-no-cudagraphs"  -compile mode
+            training.compile_dynamic: null | true | false
+
+        ``compile_dynamic`` maps to torch.compile's ``dynamic`` argument.  The
+        default (``null``) lets inductor decide; ``false`` specialises per static
+        shape, which is what a bucketed dataset wants (a handful of bucket
+        shapes, each traced once) - measured 64.6 -> 51.5 ms on one Krea-2
+        block at L=1024 versus 166.8 -> 132.8 ms at L=2048, see
+        md/14-kernel-optimizations-applied.md.
 
         Reference: adapted from ai-toolkit config_modules.py compile_mode pattern.
         """
@@ -274,7 +344,9 @@ class Trainer:
         if self.transformer is None:
             return
         self.transformer = torch.compile(
-            self.transformer, mode=self.compile_mode
+            self.transformer,
+            mode=self.compile_mode,
+            dynamic=self.compile_dynamic,
         )
         self._compiled = True
 
@@ -353,6 +425,17 @@ class Trainer:
         if self.ema_decay > 0 and self.transformer is not None:
             from UnifiedTrainer.engine.ema import EMAManager
             trainable = [p for p in self.transformer.parameters() if p.requires_grad]
+            if not trainable and getattr(self, "optimizer", None) is not None:
+                # LoKR params may live on a side network that is not unfrozen yet
+                # when setup_ema() runs (observed with qwen21: "tracking 0 trainable
+                # params", i.e. EMA silently did nothing). Fall back to whatever the
+                # optimizer is actually updating.
+                seen: set[int] = set()
+                for group in self.optimizer.param_groups:
+                    for p in group["params"]:
+                        if p.requires_grad and id(p) not in seen:
+                            seen.add(id(p))
+                            trainable.append(p)
             self.ema = EMAManager(trainable, decay=self.ema_decay)
             logger.info(
                 f"EMA enabled: decay={self.ema_decay}, "
@@ -851,6 +934,11 @@ class Trainer:
                                 # batch slot: (L, 1, C, h, w) -> (L, C, h, w).
                                 feats_i = _feats[:, 0] if _feats.dim() == 5 else _feats
 
+                    # Per-sample cached pixel-copy paths (pixel-space losses,
+                    # e.g. losses/composite_consistency.py): {"T": png, "R": png}.
+                    _pp_list = batch.get("pixel_paths") or []
+                    _pp_i = _pp_list[i] if i < len(_pp_list) else None
+
                     loss_ctx = LossContext(
                         model_pred=unpacked_i,
                         noise=noise_i,
@@ -870,6 +958,8 @@ class Trainer:
                             {"pfm_feats": feats_i} if feats_i is not None else {}
                         ),
                     )
+                    if _pp_i:
+                        loss_ctx.extra["pixel_paths"] = _pp_i
 
                     for loss_module in self.losses:
                         loss_val = loss_module(loss_ctx)
@@ -961,6 +1051,25 @@ class Trainer:
                         total_loss.backward()
 
                 _t4 = _time.perf_counter()
+
+                # ── DIAG (UTR_DIAG_GRAD=1): is the LoRA actually learning? ──
+                if os.environ.get("UTR_DIAG_GRAD") and self.step % 5 == 0:
+                    try:
+                        _ps = [p for g in self.optimizer.param_groups for p in g["params"]]
+                        _gn = [p.grad.detach().abs().mean().item() for p in _ps if p.grad is not None]
+                        _pn = [p.detach().abs().mean().item() for p in _ps]
+                        _fields = [a for a in dir(loss_ctx) if not a.startswith("_")]
+                        _tgt = getattr(loss_ctx, "learning_target", None)
+                        _prd = getattr(loss_ctx, "model_pred", None)
+                        _fmt = lambda t: "none" if t is None else f"(m={t.float().mean():+.3f},s={t.float().std():.3f})"
+                        logger.info(
+                            f"[DIAG-GRAD] step={self.step} n_train={len(_ps)} n_grad={len(_gn)} "
+                            f"grad_mean={(sum(_gn)/max(1,len(_gn))):.2e} w_mean={(sum(_pn)/max(1,len(_pn))):.2e} "
+                            f"lr={self.optimizer.param_groups[0]['lr']:.1e} "
+                            f"pred={_fmt(_prd)} target={_fmt(_tgt)} sigma={float(loss_ctx.sigmas.reshape(-1)[0]):.2f}"
+                        )
+                    except Exception as _exc:
+                        logger.warning(f"[DIAG-GRAD] failed: {_exc}")
 
                 step_loss_val = total_loss.item()
 
@@ -1257,7 +1366,15 @@ class Trainer:
                     ),
                     None,
                 )
-                if existing is not None:
+                # `loss_params` is an explicit request for a DIFFERENT
+                # configuration on the validation side.  Reusing the training
+                # instance would silently apply training-only parameters — e.g.
+                # a region-weighted guide_flow_matching (base_weight/edit_weight)
+                # would weight the val metric too, so it could no longer be
+                # compared with an unweighted baseline run.  So a params dict
+                # forces a fresh module; without one the training instance is
+                # reused exactly as before.
+                if existing is not None and not loss_params:
                     modules.append(existing)
                     continue
                 module = LossRegistry.get(t)(weight=1.0, **loss_params)
@@ -1271,6 +1388,8 @@ class Trainer:
             logger.info(
                 "val_loss modules overridden by validation.loss_types: "
                 f"{[getattr(m, 'name', type(m).__name__) for m in modules]}"
+                + (f" (fresh instances, loss_params={loss_params})"
+                   if loss_params else " (training instances reused)")
             )
         self._val_loss_modules = modules
         return modules
@@ -1426,6 +1545,11 @@ class Trainer:
                     ):
                         # 按 velocity_sign 分发估算干净 latent（与 losses/flow_matching.py 同源）
                         x0_hat = self.adapter.compute_x0_hat(noise_i, unpacked_i)
+                        # Per-sample cached pixel-copy paths (see train loop)
+                        _pp_list = batch.get("pixel_paths") or []
+                        _pp_i = _pp_list[ti] if ti < len(_pp_list) else None
+                        _extra = {"pixel_paths": _pp_i} if _pp_i else {}
+
                         loss_ctx = LossContext(
                             model_pred=unpacked_i,
                             noise=noise_i,
@@ -1441,6 +1565,7 @@ class Trainer:
                                 and ti < len(uncond_unpacked)
                                 else None
                             ),
+                            extra=_extra,
                         )
                         for loss_module in val_loss_modules:
                             loss_val = loss_module(loss_ctx)

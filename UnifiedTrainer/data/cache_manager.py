@@ -25,11 +25,39 @@ Latent storage (unified media pipeline, D3):
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def filter_rows_to_datasets(datarows: list, wanted) -> tuple:
+    """Split index rows into (kept, dropped) by their ``dataset`` field.
+
+    The train/val/full indexes are CACHE-DIR level artifacts: they live in the
+    cache root and ``rebuild_full_index`` collects every per-sample JSON under
+    that directory.  A config that trains only a SUBSET of the datasets sharing
+    one cache dir (e.g. shape-only against a cache that also holds the colour
+    dataset) would therefore silently train on all of them — observed as
+    "Dataset [train]: 532 datarows" for a 222-pair dataset.
+
+    ``wanted`` is a set of dataset identities (``train_data_dir`` values).
+    Rows with an empty/missing ``dataset`` field are KEPT: they cannot be
+    attributed, and older caches may not carry the field at all.  An empty
+    ``wanted`` keeps everything (no filtering configured).
+    """
+    wanted = {w for w in (wanted or ()) if w}
+    if not wanted:
+        return list(datarows), []
+    kept, dropped = [], []
+    for row in datarows:
+        ds = row.get("dataset", "") if isinstance(row, dict) else ""
+        (dropped if ds and ds not in wanted else kept).append(row)
+    return kept, dropped
 
 
 class CacheManager:
@@ -187,7 +215,8 @@ class CacheManager:
         """Check if the train index file exists."""
         return (self.cache_dir / f"train_dataset_{key}.json").exists()
 
-    def rebuild_full_index(self, dataset_name: str = "default", key: str = "default") -> list:
+    def rebuild_full_index(self, dataset_name: str = "default", key: str = "default",
+                           include_datasets=None) -> list:
         """Reconstruct the full index by scanning existing per-sample JSONs.
 
         No VAE/text encoder needed — reads per-sample JSON metadata only.
@@ -197,9 +226,16 @@ class CacheManager:
         Reads the 'dataset' field from each per-sample JSON to preserve
         per-dataset identity (critical for per-dataset batch sizing).
 
+        ``include_datasets`` (a set of ``train_data_dir`` values) RESTRICTS the
+        scan to the datasets the current config actually trains.  Without it a
+        shared cache dir returns rows for every dataset it holds, so a config
+        training a subset of them would silently train on all of them.  None/empty
+        keeps the historical behaviour (everything).
+
         Returns the rebuilt datarow list and saves it to full_dataset_{key}.json.
         """
         datarows = []
+        wanted = {w for w in (include_datasets or ()) if w}
 
         # Scan cache root + all subdirs for per-sample JSONs
         all_jsons = []
@@ -211,6 +247,7 @@ class CacheManager:
                     continue
             all_jsons.append(p)
 
+        skipped = 0
         for json_path in sorted(all_jsons):
             try:
                 with open(json_path, "r", encoding="utf-8") as f:
@@ -227,11 +264,22 @@ class CacheManager:
             # for older caches that don't have the 'dataset' field.
             ds_name = sample.get("dataset", dataset_name)
 
+            if wanted and ds_name and ds_name not in wanted:
+                skipped += 1
+                continue
+
             datarows.append({
                 "json_path": str(json_path),
                 "bucket": sample.get("bucket", ""),
                 "dataset": ds_name,
             })
+
+        if wanted:
+            logger.info(
+                f"rebuild_full_index: kept {len(datarows)} rows for "
+                f"{len(wanted)} configured dataset(s), skipped {skipped} row(s) "
+                f"belonging to other datasets in this cache dir"
+            )
 
         if datarows:
             self.save_full_index(datarows, key)

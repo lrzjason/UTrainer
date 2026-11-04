@@ -87,6 +87,7 @@ class GuideFlowMatchingLoss(BaseLoss):
         guidance_scale_max: float = 8.0,
         fixed_guidance_scale: Optional[float] = None,
         use_weighting: bool = False,
+        area_normalize: bool = False,
         **params,
     ):
         super().__init__(weight=weight, **params)
@@ -107,6 +108,9 @@ class GuideFlowMatchingLoss(BaseLoss):
         self.guidance_scale_max = float(guidance_scale_max)
         self.fixed_guidance_scale = fixed_guidance_scale
         self.use_weighting = use_weighting
+        # MaskFlow §4.1 MFL: scale the masked loss by HW/Σmask so small edit
+        # regions are not diluted by the full-image mean (needs loss_mask).
+        self.area_normalize = bool(area_normalize)
         # Telemetry for callbacks/wandb (loss/guide_flow_matching/<component>).
         self.last_components: dict = {}
 
@@ -182,7 +186,8 @@ class GuideFlowMatchingLoss(BaseLoss):
             while weighting.dim() < v_corrected.dim():
                 weighting = weighting.unsqueeze(-1)
         loss = self.reduce_masked(
-            (v_corrected - target) ** 2, context, weighting=weighting
+            (v_corrected - target) ** 2, context, weighting=weighting,
+            area_normalize=self.area_normalize,
         )
 
         self.last_components = {

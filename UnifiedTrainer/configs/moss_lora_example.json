@@ -1,0 +1,106 @@
+{
+  "model": "moss",
+  "model_path": "E:\\hf_models\\MOSS-Image-Base",
+  "processor_path": "E:\\hf_models\\MOSS-Image-Base\\text_encoder",
+  "reference_conditioning": false,
+  "multimodal_reference": false,
+  "data": {
+    "cache_dir": "E:\\images\\my_moss_cache",
+    "rebuild_index": true,
+    "dataset_configs": [
+      {
+        "name": "my_dataset",
+        "train_data_dir": "E:\\images\\my_dataset",
+        "resolution": 512,
+        "repeats": 1,
+        "sample_weight": 1.0,
+        "image_configs": {
+          "T": {
+            "suffix": "_t"
+          }
+        },
+        "target_configs": {
+          "T": [
+            {
+              "image": "T"
+            }
+          ]
+        },
+        "reference_configs": {
+          "none": []
+        },
+        "caption_configs": {
+          "cap_txt": {
+            "ext": ".txt",
+            "image": "T"
+          }
+        },
+        "batch_configs": [
+          {
+            "target_config": "T",
+            "caption_config": "cap_txt",
+            "reference_config": "none",
+            "caption_dropout": 0.0
+          }
+        ]
+      }
+    ],
+    "num_workers": 0,
+    "val_split_ratio": 0.0
+  },
+  "losses": [
+    {
+      "type": "flow_matching",
+      "weight": 1.0,
+      "params": {
+        "use_weighting": false
+      }
+    }
+  ],
+  "training": {
+    "network_type": "lokr",
+    "lora_rank": 16,
+    "lokr_alpha": 1.0,
+    "lokr_factor": 4,
+    "lokr_model_type": "moss",
+    "lokr_target_modules": null,
+    "batch_size": 1,
+    "learning_rate": 0.0001,
+    "max_steps": 1000,
+    "num_epochs": 10,
+    "optimizer": "adamw8bit",
+    "lr_scheduler": "constant",
+    "lr_warmup_steps": 0,
+    "gradient_checkpointing": true,
+    "gradient_accumulation_steps": 1,
+    "max_grad_norm": 1.0,
+    "weight_dtype": "bf16",
+    "mixed_precision": "bf16",
+    "quantize": "none",
+    "text_encoder_quantize": "none",
+    "offload_vae": true,
+    "offload_text_encoder": true,
+    "vae_load_mode": "lazy",
+    "vae_on_device": false,
+    "compile": false,
+    "kernels": "auto",
+    "noise_selector": {
+      "type": "random"
+    },
+    "lokr_full_rank": true
+  },
+  "validation": {
+    "val_every_epoch": 1,
+    "val_num_inference_steps": 20,
+    "val_guidance_scale": 3.0,
+    "val_seed": 42,
+    "val_loss": true,
+    "generate_images": true
+  },
+  "output": {
+    "dir": "output/moss_lora",
+    "save_name": "moss_lora",
+    "checkpoint_every": 500,
+    "save_dtype": "bf16"
+  }
+}

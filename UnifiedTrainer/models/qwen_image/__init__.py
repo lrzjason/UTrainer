@@ -235,14 +235,9 @@ class QwenImageAdapter(BaseModelAdapter):
         if is_multimodal:
             proc_kwargs.update(images=refs, do_rescale=False)
         else:
-            proc_kwargs.update(
-                truncation=True,
-                max_length=(
-                    _DEFAULT_MAX_SEQ_LEN
-                    + _PROMPT_TEMPLATE_START_IDX
-                    + _PROMPT_TEMPLATE_NUM_SUFFIX_TOKENS
-                ),
-            )
+            # No truncation: the whole caption is encoded. Cached embeddings keep
+            # their own length; the batch collate pads with zeros + mask.
+            proc_kwargs.update(truncation=False)
 
         if processor is not None:
             main_inputs = processor(**proc_kwargs).to(device)
@@ -253,10 +248,9 @@ class QwenImageAdapter(BaseModelAdapter):
             tok_kwargs: dict[str, Any] = dict(
                 text=proc_kwargs["text"],
                 padding=True,
-                truncation=True,
+                truncation=False,
                 return_tensors="pt",
             )
-            tok_kwargs["max_length"] = proc_kwargs.get("max_length")
             main_inputs = tokenizer(**tok_kwargs).to(device)
 
         input_ids = main_inputs.input_ids

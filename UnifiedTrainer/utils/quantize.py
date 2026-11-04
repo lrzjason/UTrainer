@@ -169,6 +169,55 @@ def quantize(
             logger.warning(f"Failed to quantize {name}: {e}")
 
 
+def convert_to_float8_training(
+    model: nn.Module,
+    exclude: Optional[Union[str, List[str]]] = None,
+) -> int:
+    """Convert ``nn.Linear`` layers into torchao's training-time ``Float8Linear``.
+
+    This is the ONLY float8 path that is safe for training:
+
+    * weight-only float8 (``Float8WeightOnlyConfig``) dequantises lazily on every call,
+      so the tensors saved during a forward pass are not reproducible and
+      ``torch.utils.checkpoint`` aborts with
+      "A different number of tensors was saved during the original forward and
+      recomputation" (106 vs 91 in our qwen21 runs);
+    * ``Float8Linear`` is a real module - the cast and the ``_scaled_mm`` happen
+      deterministically inside ``forward``, so gradient checkpointing works.
+
+    Returns the number of converted layers.
+    """
+    try:
+        from torchao.float8 import convert_to_float8_training as _convert
+    except ImportError as exc:  # pragma: no cover - torchao too old
+        logger.warning(f"torchao.float8 training conversion unavailable: {exc}")
+        return 0
+
+    if exclude is not None:
+        exclude = [exclude] if isinstance(exclude, str) else list(exclude)
+
+    def _filter(module: nn.Module, fqn: str) -> bool:
+        if not isinstance(module, nn.Linear):
+            return False
+        if "lycoris" in fqn or "lora" in fqn:
+            return False
+        # fp8 ``_scaled_mm`` requires the reduction dim to be a multiple of 16.
+        # In the forward that is in_features; in the weight-gradient that is the
+        # token count (handled by padding) but ALSO out_features when the module
+        # is differentiated w.r.t. its input. Keep only layers whose static dims
+        # are 16-aligned, otherwise e.g. a 4096x24 projection aborts mid-epoch.
+        if module.in_features % 16 != 0 or module.out_features % 16 != 0:
+            return False
+        if exclude and any(fnmatch(fqn, pattern) for pattern in exclude):
+            return False
+        return True
+
+    _convert(model, module_filter_fn=_filter)
+    n = sum(1 for m in model.modules() if type(m).__name__ == "Float8Linear")
+    logger.info(f"torchao float8 TRAINING conversion: {n} Linear -> Float8Linear")
+    return n
+
+
 def freeze(module: nn.Module) -> None:
     """Freeze a quantized module (set requires_grad=False on all params)."""
     for param in module.parameters():

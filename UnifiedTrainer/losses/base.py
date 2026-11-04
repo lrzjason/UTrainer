@@ -171,12 +171,24 @@ class BaseLoss(ABC):
             # form, so no cache rebuild is required.
             m = (m >= 0.5).to(m.dtype)
             if m.shape[-2:] != like.shape[-2:]:
-                raise ValueError(
-                    f"{self.name}: loss_mask grid {tuple(m.shape)} does not match "
-                    f"the loss grid {tuple(like.shape)} - the mask is cached "
-                    "against the target bucket; check that the mask and target "
-                    "images share dimensions."
-                )
+                # Patchifying adapters (MOSS / FLUX.3: VAE 32ch -> 128ch via 2x2)
+                # cache the mask on the VAE latent grid, one factor above the
+                # patchified loss grid.  Area-pool by the integer ratio so the
+                # mask still lines up (no cache rebuild needed).
+                fh = m.shape[-2] // like.shape[-2]
+                fw = m.shape[-1] // like.shape[-1]
+                if (fh >= 1 and fw >= 1 and fh == fw
+                        and m.shape[-2] == like.shape[-2] * fh
+                        and m.shape[-1] == like.shape[-1] * fw):
+                    m = torch.nn.functional.avg_pool2d(m, fh)
+                    m = (m >= 0.5).to(m.dtype)
+                else:
+                    raise ValueError(
+                        f"{self.name}: loss_mask grid {tuple(m.shape)} does not match "
+                        f"the loss grid {tuple(like.shape)} - the mask is cached "
+                        "against the target bucket; check that the mask and target "
+                        "images share dimensions."
+                    )
             w = bw + ew * m
         else:
             raw = (context.extra or {}).get("region_weight")
@@ -194,25 +206,41 @@ class BaseLoss(ABC):
         weighting: Optional[torch.Tensor] = None,
         base_weight: Optional[float] = None,
         edit_weight: Optional[float] = None,
+        area_normalize: bool = False,
     ) -> torch.Tensor:
         """Region-weighted reduction of a per-element squared error.
 
         ``sq_err`` is the raw (unweighted) per-element error; ``weighting`` is
         an optional sigma/timestep weighting already broadcastable to it.
         Falls back to the plain-mean semantics when nothing is weighted.
+
+        ``area_normalize`` (MaskFlow §4.1 MFL): when a mask is present, scale
+        the masked loss by HW/Σmask so small edit regions are not diluted by
+        the full-image mean — small mattes get the same gradient magnitude as
+        large ones.  No-op without a mask.
         """
         if weighting is not None:
             while weighting.dim() < sq_err.dim():
                 weighting = weighting.unsqueeze(-1)
         w = self.region_weight_map(context, sq_err, base_weight, edit_weight)
+        mask = getattr(context, "loss_mask", None)
         if w is None:
             if weighting is not None:
-                return (weighting * sq_err).mean()
-            return sq_err.mean()
+                loss = (weighting * sq_err).mean()
+            else:
+                loss = sq_err.mean()
+            if area_normalize and mask is not None:
+                m = (mask >= 0.5).to(sq_err.dtype)
+                loss = loss * (m.numel() / m.sum().clamp_min(1.0))
+            return loss
         if weighting is not None:
             w = w * weighting
         w_full = w.expand_as(sq_err)
-        return (sq_err * w_full).sum() / w_full.sum().clamp_min(1e-6)
+        loss = (sq_err * w_full).sum() / w_full.sum().clamp_min(1e-6)
+        if area_normalize and mask is not None:
+            m = (mask >= 0.5).to(sq_err.dtype)
+            loss = loss * (m.numel() / m.sum().clamp_min(1.0))
+        return loss
 
     def mask_telemetry(self, context: LossContext) -> dict:
         """wandb-friendly flags: is masking active, and at what weights."""

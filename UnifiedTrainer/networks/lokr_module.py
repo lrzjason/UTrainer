@@ -52,6 +52,49 @@ logger = logging.getLogger(__name__)
 FULL_RANK_SENTINEL = 9999
 
 
+# ── MOSS target presets (mirror of KohakuMossTrainer) ───────────────────
+# `src/kohakumoss/adapters/build/presets.py` in the reference trainer defines the
+# LyCORIS preset expressions below.  `attn-mlp` is that trainer's default and the
+# one the recipes use; our old "all nn.Linear" default additionally adapted
+# `time_embedding.*`, `shared_block_modulation`, `video_head_modulation`,
+# `video_embedder`, `text_embedder.*` and `final_linear_video` - the layers that
+# generate every block's (shift, scale, gate) modulation.  Adapting those with a
+# full-rank LoKR rewrites the conditioning path itself, which shows up as blurry,
+# desaturated samples and garbled text.
+MOSS_TARGET_PRESETS: dict[str, list[str]] = {
+    # layers.N.proj.(q|k|v|o) + layers.N.proj.(ffn_up_gate|ffn_down) -> 252 modules
+    "attn-mlp": [
+        "layers.*.proj.q", "layers.*.proj.k", "layers.*.proj.v", "layers.*.proj.o",
+        "layers.*.proj.ffn_up_gate", "layers.*.proj.ffn_down",
+    ],
+    # joint attention only -> 168 modules
+    "attn": [
+        "layers.*.proj.q", "layers.*.proj.k", "layers.*.proj.v", "layers.*.proj.o",
+    ],
+    # attn-mlp + the text refiner blocks -> 262 modules
+    "full-block": [
+        "layers.*.proj.q", "layers.*.proj.k", "layers.*.proj.v", "layers.*.proj.o",
+        "layers.*.proj.ffn_up_gate", "layers.*.proj.ffn_down",
+        "text_embedder.blocks.*.qkv", "text_embedder.blocks.*.proj",
+        "text_embedder.blocks.*.ffn_gate", "text_embedder.blocks.*.ffn_up",
+        "text_embedder.blocks.*.ffn_down",
+    ],
+}
+
+
+def resolve_target_modules(spec):
+    """Expand a MOSS preset name (or list of fnmatch patterns) for ``attach``."""
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        if spec in ("all", "*"):
+            return None
+        if spec in MOSS_TARGET_PRESETS:
+            return list(MOSS_TARGET_PRESETS[spec])
+        return [spec]
+    return list(spec)
+
+
 # ── Configuration ────────────────────────────────────────────────────────
 
 @dataclass
@@ -84,6 +127,10 @@ class LokrConfig:
     multiplier: float = 1.0
     decompose_both: bool = False
     full_rank: bool = False
+    # PiSSA-style initialisation (Meng et al., 2404.02948): start the adapter at
+    # the dominant Kronecker component of the frozen weight instead of zeros, and
+    # subtract it from the base so the total weight is unchanged at step 0.
+    pissa_init: bool = False
 
     def __post_init__(self):
         if self.full_rank:
@@ -177,6 +224,48 @@ _FLUX2_KLEIN_PATTERNS = [
     "*proj_out",
 ]
 
+# FLUX.3 klein (models/flux3_klein/transformer_flux3.py):
+# - per-mode blocks (Flux3ModeTransformerBlock): Flux3Attention
+#   (to_q/to_k/to_v/to_out.0) + Flux3FeedForward (ff.linear_in/linear_out —
+#   same naming as Flux2, NOT ff.net.*)
+# - joint blocks (Flux3SingleTransformerBlock): identical sub-module names
+# - the blocks live in three ModuleLists/ModuleDicts:
+#       txt_mode_blocks.*, mode_blocks.image.*, mode_blocks.image_cond.*,
+#       single_transformer_blocks.*
+# - patch embed / text embed / final proj: x_embedders.{image,image_cond} /
+#   context_embedder / proj_out
+# Modulation (early_stream_modulations.*/single_stream_modulations.*.linear),
+# timestep embedders and norms are intentionally NOT targeted.
+_FLUX3_KLEIN_PATTERNS = [
+    "*txt_mode_blocks.*.attn.to_k",
+    "*txt_mode_blocks.*.attn.to_q",
+    "*txt_mode_blocks.*.attn.to_v",
+    "*txt_mode_blocks.*.attn.to_out.0",
+    "*txt_mode_blocks.*.ff.linear_in",
+    "*txt_mode_blocks.*.ff.linear_out",
+    "*mode_blocks.image.*.attn.to_k",
+    "*mode_blocks.image.*.attn.to_q",
+    "*mode_blocks.image.*.attn.to_v",
+    "*mode_blocks.image.*.attn.to_out.0",
+    "*mode_blocks.image.*.ff.linear_in",
+    "*mode_blocks.image.*.ff.linear_out",
+    "*mode_blocks.image_cond.*.attn.to_k",
+    "*mode_blocks.image_cond.*.attn.to_q",
+    "*mode_blocks.image_cond.*.attn.to_v",
+    "*mode_blocks.image_cond.*.attn.to_out.0",
+    "*mode_blocks.image_cond.*.ff.linear_in",
+    "*mode_blocks.image_cond.*.ff.linear_out",
+    "*single_transformer_blocks.*.attn.to_k",
+    "*single_transformer_blocks.*.attn.to_q",
+    "*single_transformer_blocks.*.attn.to_v",
+    "*single_transformer_blocks.*.attn.to_out.0",
+    "*single_transformer_blocks.*.ff.linear_in",
+    "*single_transformer_blocks.*.ff.linear_out",
+    "*x_embedders.*",
+    "*context_embedder",
+    "*proj_out",
+]
+
 # Qwen-Image 2.1 (models/qwen_image21/transformer_qwenimage21.py):
 # single-stream blocks only — attn.to_q/k/v/out.0 plus the SwiGLU img_mlp
 # (proj/gate_layer/out). Reference-only preset: by default ALL nn.Linear
@@ -203,6 +292,7 @@ _MODEL_PATTERNS = {
     "qwen21": _QWEN21_PATTERNS,
     "flux": _FLUX_PATTERNS,
     "flux2_klein": _FLUX2_KLEIN_PATTERNS,
+    "flux3_klein": _FLUX3_KLEIN_PATTERNS,
     "minimax_h3": _H3_PATTERNS,
 }
 
@@ -390,6 +480,91 @@ class LokrLayer(nn.Module):
 
 # ── LokrNetwork: manages all LokrLayers ──────────────────────────────────
 
+def pissa_init_lokr_layer(layer: "LokrLayer", weight: torch.Tensor) -> bool:
+    """Initialise a LoKR layer from the dominant Kronecker component of *weight*.
+
+    PiSSA (2404.02948) shows that starting LoRA at "noise & zero" wastes the first
+    hundreds of steps re-learning the principal directions of the frozen weight;
+    initialising the adapter with the principal components (and subtracting them
+    from the base) converges markedly faster.
+
+    For LoKR the update is ``delta = kron(w1, w2) * scale``.  The best single
+    Kronecker factor of a matrix is given by the leading singular pair of the
+    *reshuffled* matrix (Van Loan & Pitsianis): with
+    ``R[(i,j),(p,q)] = W[i*out2+p, j*in2+q]``, the top singular triplet
+    ``(u, s, v)`` yields ``kron(w1, w2) ≈ s·u⊗v``.
+
+    The component is subtracted from the frozen weight so the layer's effective
+    weight is unchanged at step 0 (PiSSA's residual trick), done in the reshaped
+    view so the full Kronecker product is never materialised.
+    """
+    if not (layer.use_w1 and layer.use_w2):
+        # Low-rank factorisations: keep the zero init (documented limitation).
+        return False
+    with torch.no_grad():
+        # 24 GB budget: run the SVD on the CPU.  For an 8192x8192 layer the
+        # float32 copy + reshuffled matrix + U factor peak at ~0.8 GB, which we
+        # do not want to add to the GPU's steady-state usage (fp8 base ~13.3 GB
+        # + activations).  CPU temporaries are free.
+        #
+        # torchao's Float8Tensor (weight-only quantization) intercepts ``view``/
+        # ``reshape`` through __torch_dispatch__ and raises
+        # "Only support reshaping from 2D to 3D or from 3D to 2D", so dequantize
+        # into a *plain* tensor first, then work on it.
+        src = weight
+        if hasattr(src, "dequantize"):
+            try:
+                src = src.dequantize()
+            except Exception:  # noqa: BLE001 - not a torchao tensor after all
+                pass
+        w_cpu = torch.empty(src.shape, dtype=torch.float32)
+        w_cpu.copy_(src.detach().to("cpu", torch.float32))
+        out1, out2, in1, in2 = layer.out1, layer.out2, layer.in1, layer.in2
+        try:
+            w4 = w_cpu.view(out1, out2, in1, in2)                # W[i*out2+p, j*in2+q]
+            r = w4.permute(0, 2, 1, 3).reshape(out1 * in1, out2 * in2)
+            u, s, vh = torch.linalg.svd(r, full_matrices=False)
+            s0 = s[0]
+            if not torch.isfinite(s0) or s0 <= 0:
+                return False
+            w1 = (u[:, 0] * s0.sqrt()).reshape(out1, in1)
+            w2 = (vh[0, :] * s0.sqrt()).reshape(out2, in2)
+            layer.lokr_w1.data.copy_(w1.to(layer.lokr_w1.device, layer.lokr_w1.dtype))
+            layer.lokr_w2.data.copy_(w2.to(layer.lokr_w2.device, layer.lokr_w2.dtype))
+            del u, s, vh, r, w4, w_cpu
+
+            # PiSSA residual: W <- W - scale * kron(w1, w2).  Skipped for
+            # quantization-wrapped weights (torchao Float8Tensor / qbn), whose
+            # storage cannot be written elementwise; the adapter still starts at
+            # the principal component, just without the "total weight unchanged"
+            # property (the dominant component is ~13% of ||W||).
+            is_plain_float = (
+                type(weight).__module__.split(".")[0] == "torch"
+                and weight.is_floating_point()
+                and weight.is_contiguous()
+            )
+            if not is_plain_float:
+                logger.info(
+                    "pissa_init: base weight is quantized/wrapped "
+                    f"({type(weight).__name__}); adapter initialised from the "
+                    "principal Kronecker component, residual not subtracted")
+                return True
+            delta = (
+                layer.lokr_w1.data.float().view(out1, 1, in1, 1)
+                * layer.lokr_w2.data.float().view(1, out2, 1, in2)
+                * layer.scale
+            ).reshape(layer.out_features, layer.in_features)
+            weight.sub_(delta.to(weight.device, weight.dtype))
+            del delta
+            return True
+        except Exception:  # noqa: BLE001 - never fail a run because of an init
+            logger.warning("pissa_init: falling back to zero init (SVD failed)",
+                           exc_info=True)
+            layer.lokr_w1.data.zero_()
+            layer.lokr_w2.data.zero_()
+            return False
+
+
 class LokrNetwork(nn.Module):
     """Container for all LoKR adapter layers.
 
@@ -445,6 +620,8 @@ class LokrNetwork(nn.Module):
                 decompose_both=self.config.decompose_both,
                 full_rank=self.config.full_rank,
             )
+            if getattr(self.config, "pissa_init", False):
+                pissa_init_lokr_layer(layer, module.weight.data)
             # Sanitize name for ModuleDict (replace dots with underscores)
             safe_name = name.replace(".", "_")
             self.layers[safe_name] = layer
@@ -508,10 +685,46 @@ class LokrNetwork(nn.Module):
         logger.info(f"Saved LoKR weights: {path} ({len(self.layers)} modules, {len(state)} tensors)")
 
     def load_weights(self, path: str):
-        """Load LoKR parameters from a safetensors file."""
+        """Load LoKR parameters from a safetensors file.
+
+        Accepts BOTH key layouts:
+
+        * native  -- ``lycoris_<diffusers module, dots->underscores>.<suffix>``
+        * ComfyUI -- ``lora_unet_<comfy module, dots->underscores>.<suffix>``
+          or ``diffusion_model.<comfy module>.<suffix>`` (the form
+          :mod:`UnifiedTrainer.networks.lokr_convert` writes next to every
+          checkpoint), so a converted file can be resumed for further training
+          without a manual step.  Detection is by key prefix; the translation
+          is name-only (plus the adaLN row permutation), so it is lossless.
+        """
         from safetensors.torch import load_file
 
         state = load_file(path)
+
+        if any(k.startswith(("lora_unet_", "diffusion_model.")) for k in state):
+            from UnifiedTrainer.networks.lokr_convert import (
+                convert_moss_state_dict, convert_state_dict,
+            )
+
+            # `_target_names` are the exact dotted module paths this network
+            # attached to, so the name match is unambiguous (flattening is
+            # lossy and must never be inverted by string surgery).
+            targets = list(self._target_names)
+            is_moss = any(t.startswith("layers.") for t in targets)
+            if is_moss:
+                # MOSS keeps the official module names in ComfyUI, so the
+                # conversion is a plain prefix rename (see convert_moss_state_dict).
+                state = convert_moss_state_dict(state, to="unifiedtrainer")
+            else:
+                state = convert_state_dict(
+                    state, to="unifiedtrainer", native_modules=targets
+                )
+            logger.info(
+                f"LoKR checkpoint detected as ComfyUI "
+                f"{'MOSS' if is_moss else 'FLUX.3'} format; "
+                f"converted {len(state)} keys back to native names for resume"
+            )
+
         loaded = 0
         for safe_name, layer in self.layers.items():
             prefix = f"lycoris_{safe_name}"

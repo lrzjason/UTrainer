@@ -500,16 +500,10 @@ class Krea2Adapter(BaseModelAdapter):
         if is_multimodal:
             proc_kwargs.update(images=refs, do_rescale=False)
         else:
-            # Text-only path: truncate at the configured budget (default 1024,
-            # override with training.text_max_length). Do NOT pad to max_length.
-            proc_kwargs.update(
-                truncation=True,
-                max_length=(
-                    self.text_max_length
-                    + _PROMPT_TEMPLATE_START_IDX
-                    + _PROMPT_TEMPLATE_NUM_SUFFIX_TOKENS
-                ),
-            )
+            # Text-only path: NO truncation — the whole caption is encoded.
+            # Cached embeddings keep per-sample lengths; the batch collate pads
+            # with zeros + mask to the longest caption. Do NOT pad to max_length.
+            proc_kwargs.update(truncation=False)
 
         main_inputs = processor(**proc_kwargs).to(device)
         input_ids = main_inputs.input_ids
