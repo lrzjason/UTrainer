@@ -88,6 +88,9 @@ class GuideFlowMatchingLoss(BaseLoss):
         fixed_guidance_scale: Optional[float] = None,
         use_weighting: bool = False,
         area_normalize: bool = False,
+        freq_weight: float = 0.0,
+        freq_alpha: float = 1.0,
+        freq_sigma_max: float = 0.15,
         **params,
     ):
         super().__init__(weight=weight, **params)
@@ -111,6 +114,13 @@ class GuideFlowMatchingLoss(BaseLoss):
         # MaskFlow §4.1 MFL: scale the masked loss by HW/Σmask so small edit
         # regions are not diluted by the full-image mean (needs loss_mask).
         self.area_normalize = bool(area_normalize)
+        # Optional late-stage spectral detail penalty, identical semantics to
+        # losses/flow_matching.py: applied to the *denoised* residual
+        # (x0_pred - x0) and gated to clean samples only (sigma <= sigma_max,
+        # i.e. clean fraction >= 1 - sigma_max).
+        self.freq_weight = float(freq_weight)
+        self.freq_alpha = float(freq_alpha)
+        self.freq_sigma_max = float(freq_sigma_max)
         # Telemetry for callbacks/wandb (loss/guide_flow_matching/<component>).
         self.last_components: dict = {}
 
@@ -189,6 +199,24 @@ class GuideFlowMatchingLoss(BaseLoss):
             (v_corrected - target) ** 2, context, weighting=weighting,
             area_normalize=self.area_normalize,
         )
+
+        if self.freq_weight > 0.0 and v_corrected.dim() == 4:
+            # Spectral detail term on the corrected (denoised) residual, gated to
+            # the late/high-signal phase only — see losses/flow_matching.py for
+            # why it is x0-based and gated.
+            try:
+                from UnifiedTrainer.losses.flow_matching import high_frequency_energy
+
+                x0_pred = context.noise - v_corrected
+                x0_res = x0_pred - context.learning_target
+                sig = context.sigmas.float().view(-1)
+                keep = sig <= self.freq_sigma_max
+                if keep.any():
+                    sel = x0_res[keep] if x0_res.shape[0] == sig.shape[0] else x0_res
+                    loss = loss + self.freq_weight * high_frequency_energy(
+                        sel, self.freq_alpha)
+            except Exception:  # noqa: BLE001 - the term is optional, never fatal
+                pass
 
         self.last_components = {
             "guidance_scale_mean": float(w.mean().item()),
