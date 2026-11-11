@@ -194,6 +194,27 @@ _H3_PATTERNS = [
     "*transformer_blocks.*.ff.net.2",
 ]
 
+# MiniMax-H3-Image (models/minimax_h3_image/transformer_minimaxh3image.py): the H3 block
+# stack plus the text token refiner. The AdaLN modulation projection
+# (adaln_proj.linear) and the per-step PDD heads are left out on purpose -- the former
+# conditions on the timestep, the latter are the distilled output heads.
+_H3_IMAGE_PATTERNS = [
+    "*transformer_blocks.*.attn.to_q",
+    "*transformer_blocks.*.attn.to_k",
+    "*transformer_blocks.*.attn.to_v",
+    "*transformer_blocks.*.attn.to_out.0",
+    "*transformer_blocks.*.ff.net.0.proj",
+    "*transformer_blocks.*.ff.net.2",
+    "*token_refiner.refiner_blocks.*.attn.to_q",
+    "*token_refiner.refiner_blocks.*.attn.to_k",
+    "*token_refiner.refiner_blocks.*.attn.to_v",
+    "*token_refiner.refiner_blocks.*.attn.to_out.0",
+    "*token_refiner.refiner_blocks.*.ff.net.0.proj",
+    "*token_refiner.refiner_blocks.*.ff.net.2",
+    "*proj_in",
+    "*context_embedder",
+]
+
 # Flux2 Klein 4B (models/flux2_klein/transformer_flux2.py):
 # - double-stream blocks: Flux2Attention (to_q/to_k/to_v/to_out.0 + add_*_proj)
 #   and Flux2FeedForward (ff.linear_in/linear_out — NOT ff.net.*)
@@ -290,6 +311,7 @@ _MODEL_PATTERNS = {
     "flux2_klein": _FLUX2_KLEIN_PATTERNS,
     "flux3_klein": _FLUX3_KLEIN_PATTERNS,
     "minimax_h3": _H3_PATTERNS,
+    "minimax_h3_image": _H3_IMAGE_PATTERNS,
 }
 
 

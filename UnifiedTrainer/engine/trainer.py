@@ -39,6 +39,32 @@ from UnifiedTrainer.utils.helios import parse_helios_config, apply_helios_corrup
 logger = logging.getLogger(__name__)
 
 
+def _unique_loss_keys(losses: List[Any]) -> List[str]:
+    """One logging key per configured loss entry.
+
+    The key is the module's ``name`` (``flow_matching``, ``l2_reg``, …). When
+    the SAME loss type is configured more than once — different ``params``
+    and/or ``weight`` — the instances would otherwise share a key and their
+    values would be summed into one curve. Such duplicates get a positional
+    suffix (``flow_matching#1``, ``flow_matching#2``) so each one is logged
+    individually to wandb (``loss/<key>``) and tensorboard
+    (``train/loss_<key>``).
+    """
+    names = [getattr(loss, "name", type(loss).__name__) for loss in losses]
+    totals: dict = {}
+    for name in names:
+        totals[name] = totals.get(name, 0) + 1
+    seen: dict = {}
+    keys = []
+    for name in names:
+        if totals[name] == 1:
+            keys.append(name)
+        else:
+            seen[name] = seen.get(name, 0) + 1
+            keys.append(f"{name}#{seen[name]}")
+    return keys
+
+
 class Trainer:
     """Unified training engine.
 
@@ -71,6 +97,19 @@ class Trainer:
         self.config = config
         self.adapter = adapter
         self.losses = losses or []
+        # Per-loss logging keys. One key per CONFIGURED loss entry, so every
+        # loss reaches wandb/tensorboard individually. Two instances of the
+        # same loss type (same ``name``) used to collapse into a single
+        # accumulated number; they now get ``<name>#1``, ``<name>#2``, …
+        self.loss_keys: List[str] = _unique_loss_keys(self.losses)
+        if self.losses:
+            logger.info(
+                "Loss logging keys: "
+                + ", ".join(
+                    f"{k} (weight={getattr(m, 'weight', 1.0)})"
+                    for k, m in zip(self.loss_keys, self.losses)
+                )
+            )
         self.transformer = transformer
         # 统一 VAE 组件：所有可能用到 VAE 的过程（pfm 解码、验证采样、
         # regenerator …）共用 vae_manager 持有的同一个实例。VAE 在训练循环
@@ -961,21 +1000,23 @@ class Trainer:
                     if _pp_i:
                         loss_ctx.extra["pixel_paths"] = _pp_i
 
-                    for loss_module in self.losses:
+                    for loss_module, loss_key in zip(
+                        self.losses, self.loss_keys
+                    ):
                         loss_val = loss_module(loss_ctx)
                         total_loss = total_loss + loss_val
-                        loss_breakdown[loss_module.name] = (
-                            loss_breakdown.get(loss_module.name, 0.0)
+                        loss_breakdown[loss_key] = (
+                            loss_breakdown.get(loss_key, 0.0)
                             + loss_val.item()
                         )
                         # Component telemetry (e.g. pfm main/tone/freq):
                         # merged into the SAME dict so components get the
                         # identical /num_targets normalisation and reach
-                        # wandb as loss/<module>/<component>.
+                        # wandb as loss/<key>/<component>.
                         for _ck, _cv in getattr(
                             loss_module, "last_components", {}
                         ).items():
-                            _bk = f"{loss_module.name}/{_ck}"
+                            _bk = f"{loss_key}/{_ck}"
                             loss_breakdown[_bk] = (
                                 loss_breakdown.get(_bk, 0.0) + _cv
                             )
@@ -1431,9 +1472,15 @@ class Trainer:
 
         logger.info(f"\n--- Start val_loss (epoch {epoch}, seed={self.val_seed}) ---")
 
-        # Swap in EMA weights for validation (smoother evaluation)
-        if self.ema is not None:
+        # EMA weights for validation are OPT-IN (validation.use_ema, default
+        # False): val_loss then measures the exact weights that get saved as
+        # checkpoints, instead of a smoothed copy that never reaches disk.
+        ema_applied = False
+        if self.ema is not None and bool(
+            self.config.get("validation", {}).get("use_ema", False)
+        ):
             self.ema.apply()
+            ema_applied = True
 
         self.transformer.eval()
         total_loss = 0.0
@@ -1443,6 +1490,9 @@ class Trainer:
         # the breakdown is a true mean and sums to avg_val_loss.
         val_breakdown = {}
         val_loss_modules = self._resolve_val_loss_modules()
+        # Same per-entry keys as the training loop, so a duplicated loss type
+        # is reported as val_loss/flow_matching#1, #2 instead of one summed curve.
+        val_loss_keys = _unique_loss_keys(val_loss_modules)
 
         try:
             with torch.no_grad():
@@ -1567,11 +1617,13 @@ class Trainer:
                             ),
                             extra=_extra,
                         )
-                        for loss_module in val_loss_modules:
+                        for loss_module, loss_key in zip(
+                            val_loss_modules, val_loss_keys
+                        ):
                             loss_val = loss_module(loss_ctx)
                             total = total + loss_val
-                            batch_breakdown[loss_module.name] = (
-                                batch_breakdown.get(loss_module.name, 0.0)
+                            batch_breakdown[loss_key] = (
+                                batch_breakdown.get(loss_key, 0.0)
                                 + loss_val.item()
                             )
                     # Normalise per target count, then accumulate across batches
@@ -1589,8 +1641,8 @@ class Trainer:
                     del total, model_pred, unpacked, noisy_latents, noises, target_latents
 
         finally:
-            # Restore original weights if EMA was applied
-            if self.ema is not None:
+            # Restore the raw weights only if EMA was actually swapped in.
+            if ema_applied:
                 self.ema.restore()
 
             torch.random.set_rng_state(before_state)
@@ -1981,6 +2033,12 @@ class Trainer:
         Returns:
             tuple (generated_PIL_image, reference_PIL_image) or None on failure
         """
+        # Adapters whose sampler is not a plain flow-match Euler loop own the whole
+        # loop: MiniMax-H3-Image runs a fixed PDD grid with one output head per step,
+        # which the generic scheduler below cannot drive.
+        if hasattr(self.adapter, "sample_validation"):
+            return self.adapter.sample_validation(self, batch, epoch, sample_idx)
+
         from PIL import Image as PILImage
 
         # Use self.device (always CUDA) — after BouncingOffloader some params are on CPU

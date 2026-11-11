@@ -112,6 +112,8 @@ class FlowMatchingLoss(BaseLoss):
         self.freq_weight = float(freq_weight)
         self.freq_alpha = float(freq_alpha)
         self.freq_sigma_max = float(freq_sigma_max)
+        # Per-step component telemetry for callbacks (filled by compute()).
+        self.last_components: dict = {}
 
     def compute(self, context: LossContext) -> torch.Tensor:
         # MiniMax-H3's scheduler is data-ward: v = x0 - x_t, so the flow
@@ -142,7 +144,14 @@ class FlowMatchingLoss(BaseLoss):
                 weighting = weighting.unsqueeze(-1)
         # Region/mask weighting is loss-agnostic (BaseLoss.reduce_masked);
         # with no mask this is bit-identical to the previous plain mean().
-        loss = self.reduce_masked(residual ** 2, context, weighting=weighting)
+        sq_err = residual ** 2
+        main_loss = self.reduce_masked(sq_err, context, weighting=weighting)
+        components = {"main": float(main_loss.detach())}
+        if weighting is not None:
+            components["main_unweighted"] = float(
+                self.reduce_masked(sq_err, context, weighting=None).detach()
+            )
+        freq_term = None
 
         if self.freq_weight > 0.0 and residual.dim() == 4:
             # Denoised residual: x0_pred - x0 (velocity + x_t decomposition), whose
@@ -153,13 +162,24 @@ class FlowMatchingLoss(BaseLoss):
                 sig = context.sigmas.float().view(-1)
                 keep = sig <= self.freq_sigma_max
                 if keep.any():
-                    loss = loss + self.freq_weight * high_frequency_energy(
+                    freq_term = self.freq_weight * high_frequency_energy(
                         x0_res[keep] if x0_res.shape[0] == sig.shape[0] else x0_res,
                         self.freq_alpha)
             except Exception:  # noqa: BLE001 - the term is optional, never fatal
-                pass
+                freq_term = None
 
-        return loss
+        # Per-component telemetry: the trainer folds ``last_components`` into its
+        # per-loss breakdown, so the weighted FM term and the FFT detail term
+        # each get their own wandb (``loss/<module>/main|freq``) and tensorboard
+        # (``train/loss_<module>/main|freq``) curve instead of being collapsed
+        # into one number. ``main_unweighted`` is the same reduction without the
+        # sigma weighting (sd3/min_snr).
+        self.last_components = {
+            **components,
+            "freq": float(freq_term.detach()) if freq_term is not None else 0.0,
+        }
+
+        return main_loss if freq_term is None else main_loss + freq_term
 
     def requires(self) -> list:
         return ["model_pred", "noise", "learning_target", "sigmas"]

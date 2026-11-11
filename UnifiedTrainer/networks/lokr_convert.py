@@ -83,6 +83,10 @@ _ADALN_COMFY = "final_layer.image.adaLN_modulation.1"
 _SUFFIXES = (".lokr_w1_a", ".lokr_w1_b", ".lokr_w2_a", ".lokr_w2_b",
              ".lokr_t2", ".lokr_w1", ".lokr_w2", ".alpha")
 
+# qwen-image-2.1 fuses these two into `img_mlp.gate_up`; ComfyUI only exposes
+# them through its `lycoris_` aliases (see convert_rename_state_dict)
+_QWEN_FUSED_MLP_HALVES = ("_img_mlp_gate_layer", "_img_mlp_proj")
+
 
 def _flatten(name: str) -> str:
     return name.replace(".", "_")
@@ -353,6 +357,19 @@ def convert_rename_state_dict(state: dict, to: str = "comfyui") -> dict:
     :func:`convert_state_dict` only knows its own module list, so feeding it a
     model with 32 ``transformer_blocks.*`` drops almost every key (690/696 in the
     qwen21 baseline) and writes a ~500 KB "ComfyUI" file instead of the real one.
+
+    Qwen-Image-2.1 exception
+    ------------------------
+    ``comfy/ldm/qwen_image21/model.py`` fuses the gated MLP into one
+    ``img_mlp.gate_up`` Linear (2*hidden rows), while the trainer keeps
+    ``img_mlp.gate_layer`` and ``img_mlp.proj`` as separate modules.  ComfyUI
+    handles that mismatch only through the ``lycoris_`` aliases registered in
+    ``comfy/lora.py`` (``model_lora_keys_unet``: ``gate_up`` -> rows
+    ``[0:h]`` for ``.gate_layer`` and ``[h:2h]`` for ``.proj``).  It does **not**
+    register a ``lora_unet_*`` alias for those two names, so those keys would be
+    silently skipped ("lora key not loaded: ...lokr_w2") -- 64 modules / 192 keys
+    / 27.6% of a qwen21 file.  Keep exactly those two module kinds on the
+    ``lycoris_`` form; every other key keeps the ``lora_unet_`` form.
     """
     out: dict = {}
     dropped = 0
@@ -362,14 +379,23 @@ def convert_rename_state_dict(state: dict, to: str = "comfyui") -> dict:
             if body is None or not body.startswith("lycoris_"):
                 dropped += 1
                 continue
-            out[f"lora_unet_{_flatten(body[len('lycoris_'):])}{suf}"] = tensor
+            flat = _flatten(body[len("lycoris_"):])
+            if flat.endswith(_QWEN_FUSED_MLP_HALVES):
+                # let ComfyUI slice the fused gate_up layer (see docstring)
+                out[f"lycoris_{flat}{suf}"] = tensor
+            else:
+                out[f"lora_unet_{flat}{suf}"] = tensor
     else:
         for key, tensor in state.items():
             body, suf = _split(key)
             if body is None:
                 dropped += 1
                 continue
-            flat = body[len("lora_unet_"):] if body.startswith("lora_unet_") else body
+            flat = body
+            for pre in ("lycoris_", "lora_unet_"):
+                if flat.startswith(pre):
+                    flat = flat[len(pre):]
+                    break
             out[f"lycoris_{flat}{suf}"] = tensor
     if dropped:
         logger.info("lokr_convert(rename): %d key(s) skipped (unknown prefix)", dropped)

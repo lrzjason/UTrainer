@@ -1,0 +1,144 @@
+{
+    "_comment": "MiniMax-H3-Image LoRA/LoKr training (text-to-image). The adapter (models/minimax_h3_image) loads MiniMax's ORIGINAL checkpoint layout directly and converts it in memory: transformer/ + pdd_fused_heads.safetensors + vae/, with the Qwen3-VL text encoder read from text_encoder/. No diffusers model classes are involved -- the DiT and the VAE are vendored inside UTrainer. The model is a guidance-distilled, 6-step PDD checkpoint: one output head per sampling step, and training picks the head whose sigma band contains the sampled sigma.",
+    "model": "minimax_h3_image",
+    "model_path": "/home/waas/hf_models/MiniMax-H3-Image",
+    "transformer_path": "/home/waas/hf_models/MiniMax-H3-Image/transformer",
+    "vae_path": "/home/waas/hf_models/MiniMax-H3-Image/vae",
+    "text_encoder_path": "/home/waas/hf_models/MiniMax-H3-Image/text_encoder",
+    "tokenizer_path": "/home/waas/hf_models/MiniMax-H3-Image/tokenizer",
+    "processor_path": "/home/waas/hf_models/MiniMax-H3-Image/processor",
+    "data": {
+        "cache_dir": "/home/waas/minimax_h3_image_cache",
+        "rebuild_index": true,
+        "num_workers": 4,
+        "val_split_ratio": 0.05,
+        "dataset_configs": [
+            {
+                "name": "h3i_t2i",
+                "train_data_dir": "/home/waas/datasets/h3i_train",
+                "resolution": 1024,
+                "repeats": 1,
+                "sample_weight": 1.0,
+                "recreate_cache": false,
+                "recreate_latents": false,
+                "recreate_embeddings": false,
+                "val_batch_config_index": 0,
+                "image_configs": {
+                    "T": {
+                        "suffix": ""
+                    }
+                },
+                "target_configs": {
+                    "T": [
+                        {
+                            "image": "T"
+                        }
+                    ]
+                },
+                "reference_configs": {
+                    "none": []
+                },
+                "caption_configs": {
+                    "cap_t": {
+                        "ext": ".txt",
+                        "image": "T"
+                    }
+                },
+                "batch_configs": [
+                    {
+                        "target_config": "T",
+                        "caption_config": "cap_t",
+                        "caption_dropout": 0.1
+                    }
+                ]
+            }
+        ]
+    },
+    "losses": [
+        {
+            "type": "guide_flow_matching",
+            "weight": 1.0,
+            "params": {
+                "fixed_guidance_scale": 1.5,
+                "use_weighting": true,
+                "freq_weight": 0.1,
+                "freq_alpha": 1.0,
+                "freq_sigma_max": 0.3
+            }
+        }
+    ],
+    "_loss_note": "guide_flow_matching (DC-Gen Eq. 10) is the correct objective here: MiniMax-H3-Image is a CFG-DISTILLED checkpoint, so its output already IS the CFG-combined velocity and plain flow_matching is biased. The loss needs the cached empty-prompt embedding (written at cache-build time from encode_text('')) and runs a second forward per step -- on a PDD model BOTH forwards carry the same sigma, therefore the same output head, which is what makes the correction valid. fixed_guidance_scale must be the checkpoint's effective distillation scale w*: 1.5 is only a placeholder -- measure it with `python -m UnifiedTrainer.utils.estimate_guidance_scale --config <this config>` before a long run, and prefer the measured value (md/09 shows a wrong, spread-out w is worse than plain FM). freq_sigma_max is 0.3, NOT the qwen21 habit of 0.05: this model's PDD grid only has sigma values 1.0 / 0.9675 / 0.8875 / 0.75 / 0.5328 / 0.232, so 0.3 makes the FFT term fire on exactly the last step (sigma 0.232) and nowhere else. Plain flow_matching remains available as an A/B arm.",
+    "training": {
+        "network_type": "lokr",
+        "lora_rank": 64,
+        "lokr_alpha": 1.0,
+        "lokr_factor": 4,
+        "lokr_model_type": "minimax_h3_image",
+        "lokr_target_modules": null,
+        "lokr_full_rank": false,
+        "batch_size": 1,
+        "learning_rate": 0.0001,
+        "max_steps": -1,
+        "num_epochs": 10,
+        "optimizer": "adamw8bit",
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "gradient_checkpointing": true,
+        "gradient_accumulation_steps": 1,
+        "max_grad_norm": 1.0,
+        "weight_dtype": "bf16",
+        "mixed_precision": "bf16",
+        "quantize": "torchao_float8",
+        "text_encoder_quantize": "none",
+        "offload_base_weights": true,
+        "offload_percent": 1.0,
+        "offload_vae": true,
+        "offload_text_encoder": true,
+        "block_swap": 0,
+        "vae_load_mode": "lazy",
+        "vae_on_device": false,
+        "ema_decay": 0.999,
+        "pdd_sigma_mode": "grid",
+        "noise_selector": {
+            "type": "random"
+        },
+        "_training_note": "pdd_sigma_mode: 'grid' samples sigma from the checkpoint's distilled steps (1.0, 0.9675, 0.8875, 0.75, 0.5328, 0.232) -- the heads were trained on exactly those levels; 'uniform' draws uniform sigma in between. The DiT is ~12B params in bf16 (~24 GB), so the offload trio stays on for 24-32 GB cards; raise block_swap if sampling/forward still OOMs. lokr_model_type 'minimax_h3_image' selects the block + token-refiner pattern preset."
+    },
+    "validation": {
+        "val_loss": true,
+        "val_every_epoch": 1,
+        "val_seed": 42,
+        "generate_images": true,
+        "num_val_images": 1,
+        "resolution": 1024,
+        "num_inference_steps": 6,
+        "guidance_scale": 1.0,
+        "_validation_note": "val_loss stays PLAIN flow_matching MSE on the raw weights (validation.loss_types / use_ema), so the number tracks the saved checkpoint and is comparable across runs. Image sampling is the checkpoint's own 6-step PDD grid (adapter-owned loop): one output head per step, data-ward Euler in float32, guidance 1.0.",
+        "loss_types": [
+            "flow_matching"
+        ],
+        "loss_params": {
+            "use_weighting": false
+        },
+        "use_ema": false
+    },
+    "output": {
+        "dir": "/home/waas/minimax_h3_image_output/example",
+        "save_name": "minimax_h3_image_lokr",
+        "save_every_epoch": 1,
+        "save_start_epoch": 0,
+        "save_ema": true
+    },
+    "reporter": {
+        "type": "wandb",
+        "log_every": 1
+    },
+    "helios": {
+        "enabled": false
+    },
+    "wandb": {
+        "enabled": true,
+        "project": "UnifiedTrainer",
+        "run_name": "minimax_h3_image_lokr_example"
+    }
+}

@@ -195,10 +195,22 @@ class GuideFlowMatchingLoss(BaseLoss):
             weighting = compute_loss_weighting_for_sd3(context.sigmas)
             while weighting.dim() < v_corrected.dim():
                 weighting = weighting.unsqueeze(-1)
-        loss = self.reduce_masked(
-            (v_corrected - target) ** 2, context, weighting=weighting,
+        sq_err = (v_corrected - target) ** 2
+        main_loss = self.reduce_masked(
+            sq_err, context, weighting=weighting,
             area_normalize=self.area_normalize,
         )
+        components = {"main": float(main_loss.detach())}
+        if weighting is not None:
+            # Same reduction without the SD3 sigma weighting, so the logged
+            # curves show the contribution of the weighting itself.
+            components["main_unweighted"] = float(
+                self.reduce_masked(
+                    sq_err, context, weighting=None,
+                    area_normalize=self.area_normalize,
+                ).detach()
+            )
+        freq_term = None
 
         if self.freq_weight > 0.0 and v_corrected.dim() == 4:
             # Spectral detail term on the corrected (denoised) residual, gated to
@@ -213,16 +225,24 @@ class GuideFlowMatchingLoss(BaseLoss):
                 keep = sig <= self.freq_sigma_max
                 if keep.any():
                     sel = x0_res[keep] if x0_res.shape[0] == sig.shape[0] else x0_res
-                    loss = loss + self.freq_weight * high_frequency_energy(
+                    freq_term = self.freq_weight * high_frequency_energy(
                         sel, self.freq_alpha)
             except Exception:  # noqa: BLE001 - the term is optional, never fatal
-                pass
+                freq_term = None
 
+        # Per-component telemetry. ``main`` is the guide-corrected flow-matching
+        # term (SD3-weighted when use_weighting=True; ``main_unweighted`` is the
+        # same reduction without that weighting), ``freq`` is the FFT detail
+        # term; main + freq sum to this loss's value. The trainer logs each as
+        # its own curve (loss/<key>/main, .../freq, .../main_unweighted) instead
+        # of a single opaque number, in the step bar and in wandb/tensorboard.
         self.last_components = {
+            **components,
+            "freq": float(freq_term.detach()) if freq_term is not None else 0.0,
             "guidance_scale_mean": float(w.mean().item()),
             **self.mask_telemetry(context),
         }
-        return loss
+        return main_loss if freq_term is None else main_loss + freq_term
 
     def requires(self) -> List[str]:
         return [

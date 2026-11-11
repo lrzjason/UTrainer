@@ -495,14 +495,25 @@ class CheckpointManager:
         epoch: int,
         config: Optional[dict] = None,
         is_final: bool = False,
+        tag: str = "",
+        comfyui_only: bool = False,
     ) -> Path:
         """Save LoKR adapter weights via LyCORIS native API.
 
         Saves in LyCORIS format (lycoris_ prefix, lokr_w1/w2 keys).
         Also saves metadata JSON for resume.
+
+        ``tag`` inserts an extra segment into the file stem, e.g.
+        ``tag="ema"`` -> ``<save_name>_epoch7_ema.safetensors`` (+ the
+        ``_comfyui`` conversion). ``comfyui_only=True`` keeps only the
+        ComfyUI-converted file: the native file is written as the conversion
+        input and deleted afterwards, and no metadata JSON is emitted. That is
+        what auxiliary inference-only snapshots (EMA weights) use -- they are
+        not resume artifacts.
         """
         suffix = "final" if is_final else f"epoch{epoch}"
-        filename = f"{self.save_name}_{suffix}.safetensors"
+        stem = f"{self.save_name}_{suffix}" + (f"_{tag}" if tag else "")
+        filename = f"{stem}.safetensors"
         path = self.output_dir / filename
 
         # Self-contained LoKR save — safetensors with lycoris-compatible keys
@@ -550,8 +561,28 @@ class CheckpointManager:
             comfy_path = None
 
         # Metadata
+        if comfyui_only:
+            # Inference-only snapshot (e.g. EMA): the native file was just the
+            # conversion input and no JSON is written, so nothing on disk can be
+            # mistaken for a resume checkpoint or picked up by list_checkpoints.
+            if comfy_path is not None:
+                try:
+                    path.unlink()
+                except OSError as e:  # noqa: BLE001
+                    logger.warning(f"Could not remove the temporary native LoKR {path}: {e}")
+            else:
+                # Conversion failed: keep the native file rather than losing the
+                # snapshot entirely.
+                logger.warning(
+                    f"ComfyUI conversion failed for the '{tag or 'aux'}' snapshot; "
+                    f"keeping the native file {path}"
+                )
+            return comfy_path or path
+
         meta = {"step": step, "epoch": epoch, "network_type": "lokr",
                 "num_modules": lycoris_net.num_modules}
+        if tag:
+            meta["tag"] = tag
         if comfy_path is not None:
             meta["comfyui_path"] = str(comfy_path)
         if config:

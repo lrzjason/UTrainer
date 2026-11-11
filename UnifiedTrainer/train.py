@@ -175,6 +175,38 @@ def _is_rank0() -> bool:
         return True
 
 
+def _save_ema_lokr(ckpt_mgr, trainer, lycoris_net, step, epoch, config,
+                   is_final=False):
+    """Write the EMA weights as an extra ComfyUI-format checkpoint.
+
+    The regular checkpoint is the raw training state; this adds a smoothed
+    snapshot next to it so the EMA weights exist on disk as an inference
+    artifact. Enabled by ``output.save_ema`` (default true); only the
+    ``*_ema_comfyui.safetensors`` file is kept -- no native file, no training
+    state, so it can never be picked up as a resume checkpoint. Note that
+    ``validation.use_ema`` is a separate switch (default false): val_loss
+    measures the raw weights unless it is turned on.
+    """
+    if not config.get("output", {}).get("save_ema", True):
+        return None
+    ema = getattr(trainer, "ema", None)
+    if ema is None or lycoris_net is None:
+        return None
+    try:
+        ema.apply()
+        path = ckpt_mgr.save_lokr(
+            lycoris_net, step, epoch, config,
+            is_final=is_final, tag="ema", comfyui_only=True,
+        )
+        logger.info(f"EMA checkpoint saved (ComfyUI format only): {path}")
+        return path
+    except Exception as exc:  # noqa: BLE001 - aux snapshot must never fail a save
+        logger.warning(f"EMA checkpoint save failed (ignored): {exc}")
+        return None
+    finally:
+        ema.restore()
+
+
 def _save_checkpoint_on_exception(trainer, lycoris_net, config, output_dir,
                                   save_name, network_type, exception):
     """Save recoverable state on an exception/interrupt mid-training.
@@ -967,7 +999,15 @@ def main():
     logger.info("=== Phase 2: Training components (transformer + LoRA) ===")
 
     logger.info(f"Loading transformer from {transformer_path}...")
-    if quantize_mode == "nf4":
+    if quantize_mode == "prequantized":
+        # The adapter loads a saved nf4 snapshot straight onto the GPU (see
+        # models/minimax_h3_image/quantize.py); nothing to replace or move here.
+        transformer = adapter.load_transformer(transformer_path, weight_dtype)
+        logger.info(
+            "Transformer loaded from pre-quantized nf4 snapshot. VRAM: %.1fGB allocated",
+            torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0,
+        )
+    elif quantize_mode == "nf4":
         transformer = adapter.load_transformer(transformer_path, weight_dtype)
         _replace_linear_with_4bit(transformer, compute_dtype=weight_dtype, quant_type="nf4")
         # Free old bf16 Linear weights BEFORE GPU move - otherwise they
@@ -1056,7 +1096,7 @@ def main():
         )
 
         # Prepare for k-bit training if quantized (same as LoRA path)
-        if quantize_mode in ("nf4", "int8"):
+        if quantize_mode in ("nf4", "int8", "prequantized"):
             from peft.utils.other import prepare_model_for_kbit_training
             transformer = prepare_model_for_kbit_training(transformer)
 
@@ -1073,7 +1113,7 @@ def main():
     else:
         # ── Standard LoRA via PEFT (existing code, unchanged) ────────────
         # Prepare for k-bit training if quantized
-        if quantize_mode in ("nf4", "int8"):
+        if quantize_mode in ("nf4", "int8", "prequantized"):
             from peft.utils.other import prepare_model_for_kbit_training
             transformer = prepare_model_for_kbit_training(transformer)
 
@@ -1252,7 +1292,7 @@ def main():
         # No offloader: move the whole quantized model to GPU. Device-only .to()
         # (no dtype cast) preserves torchao AffineQuantizedTensor params.
         transformer = transformer.to(device=device)
-    elif quantize_mode in ("nf4", "int8"):
+    elif quantize_mode in ("nf4", "int8", "prequantized"):
         transformer = transformer.to(device=device)
     else:
         transformer = transformer.to(device=device, dtype=weight_dtype)
@@ -1927,6 +1967,8 @@ def main():
                     path = ckpt_mgr.save_lokr(
                         lycoris_net, trainer.step, epoch, config
                     )
+                    _save_ema_lokr(ckpt_mgr, trainer, lycoris_net,
+                                   trainer.step, epoch, config)
                 else:
                     path = ckpt_mgr.save_lora(
                         trainer.transformer, trainer.step, epoch, config
@@ -2033,6 +2075,8 @@ def main():
             final_path = ckpt_mgr.save_lokr(
                 lycoris_net, trainer.step, num_epochs, config, is_final=True
             )
+            _save_ema_lokr(ckpt_mgr, trainer, lycoris_net,
+                           trainer.step, num_epochs, config, is_final=True)
         else:
             final_path = ckpt_mgr.save_lora(
                 trainer.transformer, trainer.step, num_epochs, config,
