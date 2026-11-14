@@ -46,18 +46,22 @@ resumed.
 `float8_e4m3fn` plus one `float32` scale per output row and runs `torch._scaled_mm`; the
 backward only needs the input gradient, which uses the weight dequantised on the fly.
 
-Wiring (`quantize.py`), mirroring the nf4 snapshot flow:
+Wiring (`quantize.py`):
 
 ```text
 build_meta_model_fp8(...)   meta build; every quantizable Linear -> meta Fp8Linear
                             (`_keep_in_fp32_modules` = proj_in / time_embedder /
                             pdd_proj_out / rope stay full precision)
-load_fp8_into(...)          restore <dir>/transformer_fp8.safetensors + fp8_manifest.json
-load_streaming_fp8(...)     no snapshot: stream the bf16 shards, quantize per layer on the GPU
-save_fp8(...)               write the snapshot (33 GB) so the next start skips the pass
+load_streaming_fp8(...)     stream the bf16 shards, quantize each layer on the GPU
+                            (one shard in RAM; ~4 min per start)
+load_fp8_into(...)          optional: restore a snapshot (transformer_fp8.safetensors)
+save_fp8(...)               optional: write that snapshot
 ```
 
-`training.quantize_path` is reused for the snapshot directory (default `<model>/fp8`).
+**Default: no snapshot, no extra path.** `training.quantize: "fp8"` alone quantizes the base
+from the bf16 shards at every start and writes nothing to disk. A 33 GB fp8 snapshot is only
+produced when the config explicitly names `training.quantize_path` *and* sets
+`save_prequantized: true`; the same pair makes a later start load it instead.
 
 Measured on the 48 GB card, 1024², LoKR full-rank factor 8:
 

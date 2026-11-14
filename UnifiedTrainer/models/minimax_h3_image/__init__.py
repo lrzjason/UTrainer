@@ -245,16 +245,15 @@ class MiniMaxH3ImageAdapter(BaseModelAdapter):
         self._trace(f"transformer: start (quantize={quantize_mode})")
 
         # fp8 (torch._scaled_mm, sm89+): 33 GB of weights, so the whole 31B DiT fits next to
-        # 1024² activations on a 48 GB card but NOT at 4 MP. Same snapshot idea as nf4:
-        # ``training.quantize = "fp8"`` uses ``training.quantize_path`` when it holds an fp8
-        # snapshot and otherwise quantizes the original bf16 shards on the fly.
+        # 1024² activations on a 48 GB card but NOT at 4 MP.
+        #
+        # No snapshot directory is invented for fp8: the base is quantized from the bf16 shards
+        # on every start (~4 min, one shard in RAM). A snapshot is written ONLY when the config
+        # explicitly names ``training.quantize_path`` AND sets ``save_prequantized: true`` --
+        # an fp8 run must not leave a 33 GB artifact behind that nobody asked for.
         if quantize_mode in ("fp8", "float8", "fp8_e4m3"):
-            cache_dir = training_cfg.get("quantize_path") or os.path.join(path, "fp8")
-            if not _quantize.is_fp8_available(cache_dir):
-                default_dir = os.path.join(path, "fp8")
-                if _quantize.is_fp8_available(default_dir):
-                    cache_dir = default_dir
-            if _quantize.is_fp8_available(cache_dir):
+            cache_dir = training_cfg.get("quantize_path") or None
+            if cache_dir and _quantize.is_fp8_available(cache_dir):
                 model = _quantize.build_meta_model_fp8(MiniMaxH3ImageTransformer2DModel, cfg)
                 info = _quantize.load_fp8_into(model, cache_dir, device="cuda")
                 logger.info(
@@ -264,14 +263,16 @@ class MiniMaxH3ImageAdapter(BaseModelAdapter):
                 )
                 self._num_pdd_heads = int(cfg["num_pdd_heads"])
                 return model
-            logger.warning(
-                "MiniMax-H3-Image: no fp8 snapshot at %s -- quantizing from the original "
-                "checkpoint (streaming, one shard in RAM at a time)", cache_dir,
+            logger.info(
+                "MiniMax-H3-Image: fp8 base from the original bf16 shards (streaming, one "
+                "shard in RAM at a time)%s",
+                f"; snapshot dir {cache_dir}" if cache_dir else "; no snapshot dir, nothing "
+                "is written to disk",
             )
             model = _quantize.build_meta_model_fp8(MiniMaxH3ImageTransformer2DModel, cfg)
             placed = _quantize.load_streaming_fp8(model, path, cfg, device="cuda")
             logger.info("MiniMax-H3-Image: %d tensors quantized to fp8 on the GPU", placed)
-            if training_cfg.get("save_prequantized", True):
+            if cache_dir and training_cfg.get("save_prequantized"):
                 try:
                     out = _quantize.save_fp8(model, cache_dir)
                     logger.info("MiniMax-H3-Image: fp8 snapshot written to %s", out)
