@@ -349,6 +349,88 @@ def convert_state_dict(
     return out
 
 
+# ── MiniMax-H3 (image): the checkpoint's own names on both sides ──────────────
+#
+# The training-side blocks use the released checkpoint's module layout (one fused
+# `attn.qkv_proj`, `attn.out_proj`, `mlp.fc1` = [gate; value], `mlp.fc2`; see
+# models/minimax_h3_image/transformer_minimaxh3image.py), so a LoKR file differs from what
+# ComfyUI expects by the two block-stack prefixes only:
+#
+#     transformer_blocks.N.*              <-> blocks.N.*
+#     token_refiner.refiner_blocks.N.*    <-> token_refiner.blocks.N.*
+#
+# ComfyUI's MiniMaxH3 branch (`comfy/lora.py`, `comfy/ldm/minimax/model.py`) registers those
+# checkpoint paths with no `lora_unet_` prefix, and the trainer reads them back because the
+# mapping is a prefix rewrite -- so ONE file is both the resume checkpoint and the ComfyUI
+# LoRA: no `_comfyui` sibling, no q/k/v re-factorisation, no dropped keys.
+#
+# The maths match for our saves: a full-rank LoKR writes direct `lokr_w1`/`lokr_w2` with the
+# musubi 9999-alpha sentinel, i.e. scale 1.0, which is exactly what ComfyUI's `LoKrAdapter`
+# adds on top of the frozen weight.
+_H3_PREFIX_PAIRS = (
+    ("transformer_blocks.", "blocks."),
+    ("token_refiner.refiner_blocks.", "token_refiner.blocks."),
+)
+
+
+def h3_path_to_comfy(dotted: str) -> Optional[str]:
+    """Trainer module path -> checkpoint path: ``transformer_blocks.9.mlp.fc1`` -> ``blocks.9.mlp.fc1``.
+
+    None for a module outside both block stacks: the checkpoint (and ComfyUI's key map) has no
+    counterpart, so the caller keeps the trainer name and ComfyUI simply ignores that key.
+    """
+    for native, comfy in _H3_PREFIX_PAIRS:
+        if dotted.startswith(native):
+            return comfy + dotted[len(native):]
+    return None
+
+
+def h3_path_from_comfy(dotted: str) -> str:
+    """Checkpoint path -> trainer module path (inverse of :func:`h3_path_to_comfy`)."""
+    for native, comfy in _H3_PREFIX_PAIRS:
+        if dotted.startswith(comfy):
+            return native + dotted[len(comfy):]
+    return dotted
+
+
+def convert_h3_state_dict(state: dict, to: str = "comfyui") -> dict:
+    """Rename MiniMax-H3 LoKR keys between trainer paths and checkpoint/ComfyUI paths.
+
+    ``to="comfyui"``        ``transformer_blocks.N.*`` -> ``blocks.N.*`` (+ refiner stack)
+    ``to="unifiedtrainer"`` ``blocks.N.*`` -> ``transformer_blocks.N.*`` (+ refiner stack)
+
+    Both directions are a pure prefix rewrite, so a file survives a round trip unchanged. Keys
+    outside the two block stacks (``proj_in``, ``context_embedder``, ...) are passed through
+    verbatim: ComfyUI ignores them, and dropping them would make the file non-resumable.
+    """
+    out: dict = {}
+    kept: list[str] = []
+    for key, tensor in state.items():
+        body, suf = _split(key)
+        if body is None:
+            out[key] = tensor
+            continue
+        if body.startswith(("lycoris_", "lora_unet_")) or ".attn.to_q" in body:
+            raise ValueError(
+                f"convert_h3_state_dict: {key!r} is a pre-layout-change MiniMax-H3 LoKR "
+                f"(separate q/k/v projections). Those factors cannot be folded into one "
+                f"`attn.qkv_proj` without re-fitting; retrain on the current code."
+            )
+        if body.startswith("diffusion_model."):
+            body = body[len("diffusion_model."):]
+        target = h3_path_to_comfy(body) if to == "comfyui" else h3_path_from_comfy(body)
+        if target is None:
+            kept.append(body)
+            target = body
+        out[f"{target}{suf}"] = tensor
+    if kept:
+        logger.info(
+            "lokr_convert(minimax_h3): %d key(s) outside the block stacks kept verbatim "
+            "(ComfyUI ignores them): %s", len(kept), sorted(set(kept))[:4],
+        )
+    return out
+
+
 def convert_rename_state_dict(state: dict, to: str = "comfyui") -> dict:
     """Pure prefix rename: ``lycoris_<path><suf>`` <-> ``lora_unet_<path><suf>``.
 
@@ -410,7 +492,9 @@ def convert_file(src, dst, to: str = "comfyui", metadata: Optional[dict] = None,
     ``num_layers`` / ``num_single_layers`` / ``flow_map``); ``model="moss"`` uses
     the MOSS-Image mapping (``num_layers`` = 42 video blocks); ``model="rename"``
     is a pure ``lycoris_`` -> ``lora_unet_`` rename for architectures whose module
-    names ComfyUI already understands (qwen-image-2.x).
+    names ComfyUI already understands (qwen-image-2.x); ``model="minimax_h3"`` rewrites
+    the two block-stack prefixes (``transformer_blocks.`` <-> ``blocks.``) -- the trainer
+    already keeps the checkpoint's fused ``attn.qkv_proj`` / ``mlp.fc1`` layout.
     """
     from safetensors.torch import load_file, save_file
 
@@ -421,6 +505,10 @@ def convert_file(src, dst, to: str = "comfyui", metadata: Optional[dict] = None,
             state, to=to, num_layers=kw.pop("num_layers", 42))
     elif model == "rename":
         converted = convert_rename_state_dict(state, to=to)
+    elif model in ("minimax_h3", "dotted"):
+        # "dotted" is the pre-rename name for the same target; kept so an old config
+        # still converts instead of raising.
+        converted = convert_h3_state_dict(state, to=to)
     else:
         converted = convert_state_dict(state, to=to, **kw)
 
@@ -450,7 +538,8 @@ def main(argv=None) -> int:
     ap.add_argument("--num-layers", type=int, default=5)
     ap.add_argument("--num-single-layers", type=int, default=28)
     ap.add_argument("--flow-map", action="store_true")
-    ap.add_argument("--model", default="flux3", choices=["flux3", "moss"])
+    ap.add_argument("--model", default="flux3",
+                    choices=["flux3", "moss", "rename", "minimax_h3"])
     args = ap.parse_args(argv)
 
     dst = args.dst

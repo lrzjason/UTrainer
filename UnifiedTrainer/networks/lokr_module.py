@@ -95,6 +95,16 @@ def resolve_target_modules(spec):
     return list(spec)
 
 
+def model_target_preset(model_type: str):
+    """Reference target patterns for ``model_type`` (None = every nn.Linear).
+
+    Used as the *default* for the models whose modulation/embedding layers must stay frozen
+    (MiniMax-H3-Image); other model types keep the krea2/musubi "all Linears" convention.
+    """
+    patterns = _MODEL_PATTERNS.get((model_type or "").lower())
+    return list(patterns) if patterns else None
+
+
 # ── Configuration ────────────────────────────────────────────────────────
 
 @dataclass
@@ -195,24 +205,20 @@ _H3_PATTERNS = [
 ]
 
 # MiniMax-H3-Image (models/minimax_h3_image/transformer_minimaxh3image.py): the H3 block
-# stack plus the text token refiner. The AdaLN modulation projection
-# (adaln_proj.linear) and the per-step PDD heads are left out on purpose -- the former
-# conditions on the timestep, the latter are the distilled output heads.
+# stack plus the text token refiner, in the released checkpoint's module layout (one fused
+# `attn.qkv_proj`, `attn.out_proj`, `mlp.fc1` = [gate; value], `mlp.fc2`) -- that is what
+# makes the LoKR file renamable to ComfyUI's keys instead of needing a re-fit. The AdaLN
+# modulation projection (adaln_proj.linear) and the per-step PDD heads are left out on
+# purpose: the former conditions on the timestep, the latter are the distilled output heads.
 _H3_IMAGE_PATTERNS = [
-    "*transformer_blocks.*.attn.to_q",
-    "*transformer_blocks.*.attn.to_k",
-    "*transformer_blocks.*.attn.to_v",
-    "*transformer_blocks.*.attn.to_out.0",
-    "*transformer_blocks.*.ff.net.0.proj",
-    "*transformer_blocks.*.ff.net.2",
-    "*token_refiner.refiner_blocks.*.attn.to_q",
-    "*token_refiner.refiner_blocks.*.attn.to_k",
-    "*token_refiner.refiner_blocks.*.attn.to_v",
-    "*token_refiner.refiner_blocks.*.attn.to_out.0",
-    "*token_refiner.refiner_blocks.*.ff.net.0.proj",
-    "*token_refiner.refiner_blocks.*.ff.net.2",
-    "*proj_in",
-    "*context_embedder",
+    "*transformer_blocks.*.attn.qkv_proj",
+    "*transformer_blocks.*.attn.out_proj",
+    "*transformer_blocks.*.mlp.fc1",
+    "*transformer_blocks.*.mlp.fc2",
+    "*token_refiner.refiner_blocks.*.attn.qkv_proj",
+    "*token_refiner.refiner_blocks.*.attn.out_proj",
+    "*token_refiner.refiner_blocks.*.mlp.fc1",
+    "*token_refiner.refiner_blocks.*.mlp.fc2",
 ]
 
 # Flux2 Klein 4B (models/flux2_klein/transformer_flux2.py):
@@ -514,6 +520,9 @@ class LokrNetwork(nn.Module):
         self.layers: Dict[str, LokrLayer] = nn.ModuleDict()
         self._hooks: List[torch.utils.hooks.RemovableHook] = []
         self._target_names: List[str] = []
+        # sanitised ModuleDict key -> dotted module path (needed by save_weights: flattening
+        # dots to underscores is not invertible on its own)
+        self._safe_to_target: Dict[str, str] = {}
 
     @property
     def num_modules(self) -> int:
@@ -535,11 +544,32 @@ class LokrNetwork(nn.Module):
         # the preset lists below (_MODEL_PATTERNS) are reference-only and can
         # be copied into the config for that purpose.
 
-        # Discover matching Linear modules
+        # Discover matching Linear modules (bnb quantized linears and the MiniMax-H3 fp8
+        # layer included: LoKr only needs in/out features plus the base forward).
+        try:
+            import bitsandbytes as bnb
+
+            linear_types = [nn.Linear]
+            for attr in ("Linear4bit", "Linear8bitLt"):
+                cls = getattr(bnb.nn, attr, None)
+                if cls is not None:
+                    linear_types.append(cls)
+            linear_types = tuple(linear_types)
+        except Exception:  # noqa: BLE001
+            linear_types = (nn.Linear,)
+        try:  # fp8 base layer (models/minimax_h3_image/fp8_linear.py)
+            from UnifiedTrainer.models.minimax_h3_image.fp8_linear import Fp8Linear
+
+            linear_types = linear_types + (Fp8Linear,)
+        except Exception:  # noqa: BLE001 - torchao/triton may be absent
+            pass
+
         for name, module in model.named_modules():
-            if not isinstance(module, nn.Linear):
+            if not isinstance(module, linear_types):
                 continue
-            if patterns is not None and not any(fnmatch.fnmatch(name, p) for p in patterns):
+            if patterns is not None and not any(
+                fnmatch.fnmatch(name, p) or p in name for p in patterns
+            ):
                 continue
 
             # Create LokrLayer for this Linear
@@ -557,6 +587,7 @@ class LokrNetwork(nn.Module):
             safe_name = name.replace(".", "_")
             self.layers[safe_name] = layer
             self._target_names.append(name)
+            self._safe_to_target[safe_name] = name
 
             # Register forward hook on the Linear module
             hook = module.register_forward_hook(
@@ -587,19 +618,33 @@ class LokrNetwork(nn.Module):
             hook.remove()
         self._hooks.clear()
 
-    def save_weights(self, path: str, dtype: torch.dtype = torch.bfloat16):
+    def save_weights(self, path: str, dtype: torch.dtype = torch.bfloat16,
+                     key_style: str | None = None):
         """Save all LoKR parameters to a safetensors file.
 
-        Key format (ComfyUI-compatible):
-            lycoris_{layer_name}.lokr_w1
-            lycoris_{layer_name}.lokr_w2
-            lycoris_{layer_name}.alpha
+        Key format:
+            native (default)  ``lycoris_{layer_name}``   (dots -> underscores)
+            ``key_style="h3"`` ``{checkpoint module path}``, i.e. ``blocks.9.attn.qkv_proj``
+
+        The H3 form is the released checkpoint's own spelling, which is also what ComfyUI's
+        MiniMaxH3 LoRA key map registers (no ``lora_unet_`` prefix), so one file serves both
+        readers -- :func:`load_weights` accepts it back. It needs no coordinate change: the
+        trainer's blocks already keep the checkpoint's fused qkv / gate-first MLP layout (see
+        ``models/minimax_h3_image/transformer_minimaxh3image.py``).
         """
         from safetensors.torch import save_file
 
+        if key_style is None and getattr(self, "comfy_key_style", None) == "minimax_h3":
+            key_style = "h3"
+
         state = {}
         for safe_name, layer in self.layers.items():
-            prefix = f"lycoris_{safe_name}"
+            if key_style == "h3":
+                from UnifiedTrainer.networks.lokr_convert import h3_path_to_comfy
+                target = self._safe_to_target.get(safe_name) or safe_name.replace("_", ".")
+                prefix = h3_path_to_comfy(target) or target
+            else:
+                prefix = f"lycoris_{safe_name}"
             if layer.use_w1:
                 state[f"{prefix}.lokr_w1"] = layer.lokr_w1.data.to(dtype)
             else:
@@ -618,70 +663,99 @@ class LokrNetwork(nn.Module):
     def load_weights(self, path: str):
         """Load LoKR parameters from a safetensors file.
 
-        Accepts BOTH key layouts:
+        Accepts every key layout this project writes:
 
-        * native  -- ``lycoris_<diffusers module, dots->underscores>.<suffix>``
-        * ComfyUI -- ``lora_unet_<comfy module, dots->underscores>.<suffix>``
-          or ``diffusion_model.<comfy module>.<suffix>`` (the form
-          :mod:`UnifiedTrainer.networks.lokr_convert` writes next to every
-          checkpoint), so a converted file can be resumed for further training
-          without a manual step.  Detection is by key prefix; the translation
-          is name-only (plus the adaLN row permutation), so it is lossless.
+        * checkpoint / ComfyUI -- ``blocks.9.attn.qkv_proj.<suffix>`` (MiniMax-H3: what
+          ``key_style="h3"`` writes, what ComfyUI's ``LoraLoaderModelOnly`` reads, and what
+          makes one file both resumable and usable for inference)
+        * native    -- ``lycoris_<trainer module, dots->underscores>.<suffix>``
+        * converted -- ``lora_unet_<comfy module>.<suffix>`` / ``diffusion_model.<comfy module>.<suffix>``
+          (the FLUX.3 / MOSS / rename forms, translated back by
+          :mod:`UnifiedTrainer.networks.lokr_convert`)
+
+        Detection is by key prefix and the translation is name-only (the FLUX.3 adaLN row
+        permutation excepted), so resuming from a ComfyUI file is bit-identical to resuming
+        from the native one.
         """
         from safetensors.torch import load_file
 
+        from UnifiedTrainer.networks.lokr_convert import (
+            convert_moss_state_dict, convert_state_dict, h3_path_from_comfy,
+        )
+
         state = load_file(path)
+        is_h3 = getattr(self, "comfy_key_style", None) == "minimax_h3"
+        targets = list(self._target_names)
 
+        # ── 1. foreign prefix -> native or checkpoint-dotted names ──────────
         if any(k.startswith(("lora_unet_", "diffusion_model.")) for k in state):
-            from UnifiedTrainer.networks.lokr_convert import (
-                convert_moss_state_dict, convert_state_dict,
-            )
-
-            # `_target_names` are the exact dotted module paths this network
-            # attached to, so the name match is unambiguous (flattening is
-            # lossy and must never be inverted by string surgery).
-            targets = list(self._target_names)
-            is_moss = any(t.startswith("layers.") for t in targets)
-            if is_moss:
-                # MOSS keeps the official module names in ComfyUI, so the
-                # conversion is a plain prefix rename (see convert_moss_state_dict).
+            if is_h3:
+                state = convert_h3_state_dict(state, to="unifiedtrainer")
+            elif any(t.startswith("layers.") for t in targets):
+                # MOSS keeps the official module names in ComfyUI: plain prefix rename.
                 state = convert_moss_state_dict(state, to="unifiedtrainer")
             else:
                 state = convert_state_dict(
-                    state, to="unifiedtrainer", native_modules=targets
-                )
-            logger.info(
-                f"LoKR checkpoint detected as ComfyUI "
-                f"{'MOSS' if is_moss else 'FLUX.3'} format; "
-                f"converted {len(state)} keys back to native names for resume"
-            )
+                    state, to="unifiedtrainer", native_modules=targets)
 
+        # ── 2. {module, suffix} -> {trainer module path} ────────────────────
+        suffixes = (".lokr_w1_a", ".lokr_w1_b", ".lokr_w2_a", ".lokr_w2_b",
+                    ".lokr_t2", ".lokr_w1", ".lokr_w2", ".alpha")
+        by_module: dict[str, dict[str, "torch.Tensor"]] = {}
+        for key, tensor in state.items():
+            body, suffix = None, None
+            for suf in suffixes:
+                if key.endswith(suf):
+                    body, suffix = key[: -len(suf)], suf.lstrip(".")
+                    break
+            if body is None:
+                continue
+            if body.startswith("lycoris_"):
+                safe_name = body[len("lycoris_"):]
+                # `_safe_to_target` is the exact dotted path this network attached to;
+                # inverting the flat form by string surgery is ambiguous (see save_weights).
+                dotted = self._safe_to_target.get(safe_name, safe_name.replace("_", "."))
+            elif is_h3 and body.startswith(("blocks.", "token_refiner.blocks.")):
+                dotted = h3_path_from_comfy(body)
+            else:
+                dotted = body
+            by_module.setdefault(dotted, {})[suffix] = tensor
+
+        # ── 3. apply ────────────────────────────────────────────────────────
         loaded = 0
         for safe_name, layer in self.layers.items():
-            prefix = f"lycoris_{safe_name}"
-            if layer.use_w1:
-                key = f"{prefix}.lokr_w1"
-                if key in state:
-                    layer.lokr_w1.data.copy_(state[key])
-                    loaded += 1
-            else:
+            dotted = self._safe_to_target.get(safe_name, safe_name.replace("_", "."))
+            params = by_module.get(dotted)
+            if not params:
+                continue
+            if layer.use_w1 and "lokr_w1" in params:
+                layer.lokr_w1.data.copy_(params["lokr_w1"])
+                loaded += 1
+            elif not layer.use_w1:
                 for suffix in ("lokr_w1_a", "lokr_w1_b"):
-                    key = f"{prefix}.{suffix}"
-                    if key in state:
-                        getattr(layer, suffix).data.copy_(state[key])
+                    if suffix in params:
+                        getattr(layer, suffix).data.copy_(params[suffix])
                         loaded += 1
-            if layer.use_w2:
-                key = f"{prefix}.lokr_w2"
-                if key in state:
-                    layer.lokr_w2.data.copy_(state[key])
-                    loaded += 1
-            else:
+            if layer.use_w2 and "lokr_w2" in params:
+                layer.lokr_w2.data.copy_(params["lokr_w2"])
+                loaded += 1
+            elif not layer.use_w2:
                 for suffix in ("lokr_w2_a", "lokr_w2_b"):
-                    key = f"{prefix}.{suffix}"
-                    if key in state:
-                        getattr(layer, suffix).data.copy_(state[key])
+                    if suffix in params:
+                        getattr(layer, suffix).data.copy_(params[suffix])
                         loaded += 1
 
+        if loaded == 0:
+            logger.warning(
+                f"LoKR load matched NO tensors in {path} (keys: {list(state)[:3]}). "
+                f"The file may have been written by an older MiniMax-H3 layout "
+                f"(split q/k/v) that cannot be resumed; retrain instead."
+            )
+        elif loaded < 2 * len(self.layers):
+            logger.warning(
+                f"LoKR load matched {loaded} tensors for {len(self.layers)} modules "
+                f"(expected {2 * len(self.layers)}); the file does not cover every target."
+            )
         logger.info(f"Loaded LoKR weights: {path} ({loaded} tensors into {len(self.layers)} modules)")
 
     def extra_repr(self) -> str:
@@ -709,6 +783,14 @@ def apply_lokr(model: nn.Module, config: LokrConfig) -> LokrNetwork:
         .save_weights() / .load_weights() for checkpointing.
     """
     network = LokrNetwork(config)
+    # MiniMax-H3's blocks keep the released checkpoint's module layout (one fused
+    # `attn.qkv_proj`, `mlp.fc1` = [gate; value]), which is also what ComfyUI's MiniMaxH3
+    # branch registers for LoRA (no `lora_unet_` prefix). So the checkpoint is written in
+    # that spelling directly (`save_weights(key_style="h3")`): ONE file that resumes training
+    # and loads in `LoraLoaderModelOnly`, no conversion step and no duplicated weights.
+    network.comfy_key_style = (
+        "minimax_h3" if getattr(config, "model_type", "") == "minimax_h3_image" else None
+    )
     network.attach(model)
 
     num_params = sum(p.numel() for p in network.parameters())

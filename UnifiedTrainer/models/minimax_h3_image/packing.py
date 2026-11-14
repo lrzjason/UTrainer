@@ -166,27 +166,3 @@ def get_image_canvas_size(
         max(multiple, round(height * scale / multiple) * multiple),
         max(multiple, round(width * scale / multiple) * multiple),
     )
-
-
-def sigmas_to_head_indices(sigmas: "torch.Tensor", grid) -> "torch.Tensor":
-    """Map continuous training sigmas to the PDD output head that covers them.
-
-    The release distils one head per sampling step, i.e. head ``i`` was trained on the sigma
-    band ``(grid[i+1], grid[i]]``. A sigma is assigned to the band that contains it; sigmas
-    outside the grid fall back to the nearest band. This is what keeps a fine-tune on the
-    same per-step specialization the sampler uses at inference.
-    """
-    grid_t = torch.as_tensor(grid, dtype=torch.float32, device=sigmas.device)
-    heads = []
-    for sigma in sigmas.float().flatten().tolist():
-        head = 0
-        for i in range(len(grid_t) - 1):
-            if sigma <= float(grid_t[i]) and sigma > float(grid_t[i + 1]):
-                head = i
-                break
-            if sigma > float(grid_t[0]):
-                head = 0
-            elif sigma <= float(grid_t[-1]):
-                head = len(grid_t) - 2
-        heads.append(head)
-    return torch.tensor(heads, dtype=torch.long, device=sigmas.device)

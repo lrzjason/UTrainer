@@ -62,32 +62,71 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-def _collect_linears(module, targets, skip_lora=True):
+def _collect_linears(module, targets, skip_lora=True, prefix="", keep=()):
     """Collect every replaceable (parent, attr_name, child) nn.Linear in the tree.
 
     Collecting first (instead of recursing while replacing) makes the
     replacement loop safe to drive with a progress bar.
+
+    ``keep`` holds the model's ``_keep_in_fp32_modules`` entries: MiniMax-H3(-Image)
+    declares ``["proj_in", "time_embedder", "pdd_proj_out", "rope"]`` and quantizing any of
+    them breaks the model (the adaln modulation comes out tens of times too large and the
+    residual stream explodes), so they are skipped by dotted-path substring.
     """
     import torch.nn as nn
 
+    try:
+        import bitsandbytes as bnb
+
+        already_quantized = tuple(
+            cls for cls in (getattr(bnb.nn, "Linear4bit", None), getattr(bnb.nn, "Linear8bitLt", None))
+            if cls is not None
+        )
+    except Exception:  # noqa: BLE001 - bitsandbytes is optional here
+        already_quantized = ()
+    # MiniMax-H3 fp8 base layers are already quantized too (their weight lives in the
+    # `weight_fp8` buffer); quantizing them again would wrap a float8 tensor in a 4bit param.
+    try:
+        from UnifiedTrainer.models.minimax_h3_image.fp8_linear import Fp8Linear
+
+        already_quantized = already_quantized + (Fp8Linear,)
+    except Exception:  # noqa: BLE001
+        pass
+
     for name, child in list(module.named_children()):
+        path = f"{prefix}.{name}" if prefix else name
+        # A model that came back from the nf4 loader is already quantized; wrapping its
+        # Params4bit (uint8 storage) again would try to require grad on a uint8 tensor.
+        if already_quantized and isinstance(child, already_quantized):
+            continue
         if isinstance(child, nn.Linear) and (not skip_lora or "lora" not in name.lower()):
+            if any(k in path for k in keep):
+                continue
             targets.append((module, name, child))
         else:
-            _collect_linears(child, targets, skip_lora)
+            _collect_linears(child, targets, skip_lora, path, keep)
 
 
-def _replace_linear_with_4bit(module, compute_dtype, quant_type="nf4"):
+def _replace_linear_with_4bit(module, compute_dtype, quant_type="nf4", keep_in_fp32=None):
     """Recursively replace nn.Linear with bnb.nn.Linear4bit for NF4 quantization.
 
     The weight data stays in full precision on CPU; quantization happens when
     Params4bit.cuda() is called (i.e. when the model is moved to GPU).
+
+    Modules the checkpoint declares in ``_keep_in_fp32_modules`` are left alone: the release
+    keeps them in float32 (they are the input/output projections and the timestep embedder),
+    and quantizing them silently degrades the model.
     """
     import bitsandbytes as bnb
     import torch.nn as nn
 
+    if keep_in_fp32 is None:
+        keep_in_fp32 = getattr(module, "_keep_in_fp32_modules", None) or ()
+    keep = tuple(keep_in_fp32)
+    if keep:
+        logger.info(f"{quant_type}: keeping {list(keep)} in fp32 (checkpoint _keep_in_fp32_modules)")
     targets = []
-    _collect_linears(module, targets)
+    _collect_linears(module, targets, keep=keep)
     for parent, name, child in _progress(
         targets, desc=f"{quant_type} quantize", unit="linear", leave=False
     ):
@@ -323,10 +362,15 @@ def _resolve_lokr_targets(training_cfg: dict):
 
     MOSS defaults to the KohakuMossTrainer `attn-mlp` preset (the 252 joint
     attn/MLP projections) instead of "every nn.Linear": adapting the modulation
-    and embedding layers destroys the conditioning path.  `"all"` restores the
-    old behaviour.
+    and embedding layers destroys the conditioning path.  MiniMax-H3-Image
+    defaults to its own preset (`_H3_IMAGE_PATTERNS`: the block qkv/out and the
+    gate-first MLP, both block stacks) for the same reason -- the AdaLN
+    projections alone are 13B parameters and must stay frozen. `"all"` restores
+    the old "every nn.Linear" behaviour.
     """
-    from UnifiedTrainer.networks.lokr_module import resolve_target_modules
+    from UnifiedTrainer.networks.lokr_module import (
+        model_target_preset, resolve_target_modules,
+    )
 
     explicit = training_cfg.get("lokr_target_modules", None)
     preset = training_cfg.get("lokr_preset", None)
@@ -334,8 +378,11 @@ def _resolve_lokr_targets(training_cfg: dict):
         return resolve_target_modules(explicit)
     if preset is not None:
         return resolve_target_modules(preset)
-    if (training_cfg.get("lokr_model_type") or "").lower() == "moss":
+    model_type = (training_cfg.get("lokr_model_type") or "").lower()
+    if model_type == "moss":
         return resolve_target_modules("attn-mlp")
+    if model_type == "minimax_h3_image":
+        return model_target_preset(model_type)
     return None
 
 
@@ -502,11 +549,18 @@ def main():
             logger.warning(f"Loss '{loss_type}' not registered, skipping")
             continue
         loss_cls = LossRegistry.get(loss_type)
-        params = loss_cfg.get("params", loss_cfg.get("args", {}))
+        # Both spellings are accepted: options nested under "params"/"args" (the documented
+        # form) and options written flat next to "type"/"weight". Flat keys used to be dropped
+        # silently, so `fixed_guidance_scale: 1.5` in a config had no effect and the loss ran on
+        # its defaults (guidance sampled from U[1, 8]) -- the logged guidance_scale_mean is what
+        # exposed it. Nested wins on conflict.
+        nested = loss_cfg.get("params", loss_cfg.get("args", {})) or {}
+        flat = {k: v for k, v in loss_cfg.items() if k not in ("type", "name", "weight", "params", "args")}
+        params = {**flat, **nested}
         weight = loss_cfg.get("weight", 1.0)
         loss_instance = loss_cls(weight=weight, **params)
         losses.append(loss_instance)
-        logger.info(f"  Loss: {loss_type} (weight={weight})")
+        logger.info(f"  Loss: {loss_type} (weight={weight}, params={sorted(params)})")
 
     # ── Load model components via adapter ──────────────────────
     import torch
@@ -538,7 +592,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # VRAM optimization options (all default-enabled for 16GB safety)
-    quantize_mode = config.get("training", {}).get("quantize") or "none"  # none|int8|nf4|torchao_float8|torchao_int8|torchao_int4
+    # none|int8|nf4|prequantized|fp8|torchao_float8|torchao_int8|torchao_int4
+    #   `prequantized` loads a saved nf4 snapshot; `fp8` builds the MiniMax-H3 `Fp8Linear`
+    #   base (torch._scaled_mm, sm89+) from a snapshot or by streaming the bf16 shards.
+    quantize_mode = config.get("training", {}).get("quantize") or "none"
     # Text encoder quantization for the cache build (the H3 Qwen3-VL encoder
     # is ~15GB bf16; nf4/int8 keeps the cache phase within VRAM).  Same bnb
     # helpers as the transformer path; applied to every text encoder load.
@@ -819,7 +876,10 @@ def main():
     need_text_encoder = need_cache_build or any(
         ds_cfg.recreate_cache or ds_cfg.recreate_embeddings for ds_cfg in dataset_configs
     )
-    if not need_text_encoder and not os.path.exists(empty_embedding_path):
+    needs_uncond_embedding = any(
+        getattr(loss, "needs_uncond_forward", False) for loss in losses
+    )
+    if needs_uncond_embedding and not need_text_encoder and not os.path.exists(empty_embedding_path):
         need_text_encoder = True
 
     # ── Standalone suffix embedding creation (no full cache rebuild) ────
@@ -846,7 +906,12 @@ def main():
                         except TypeError:
                             proc = adapter.load_processor(proc_path)
                 if te is not None and tok is not None and proc is not None:
-                    te = te.to(device)
+                    if getattr(te, 'is_quantized', False) or getattr(te, 'hf_device_map', None):
+                        # 4-bit BnB encoder: already on the GPU via device_map; .to() would re-quantize
+                        # (bitsandbytes Params4bit.to -> quantize_4bit) and crash.
+                        logger.info('Text encoder stays off the GPU (quantized / device-mapped / configured CPU)')
+                    else:
+                        te = te.to(device)
                     te.requires_grad_(False)
                     from UnifiedTrainer.data.embedding_cache import EmbeddingCache
                     suffix_emb = adapter.encode_suffix_embedding(te, tok, proc, device, torch.float32)
@@ -905,7 +970,14 @@ def main():
             vae = vae.to(device)
             vae.requires_grad_(False)
         if text_encoder is not None:
-            text_encoder = text_encoder.to(device)
+            if (getattr(text_encoder, 'is_quantized', False)
+                    or getattr(text_encoder, 'hf_device_map', None)
+                    or getattr(adapter, '_te_on_cpu', False)):
+                # 4-bit BnB encoder: already on the GPU via device_map; .to() would re-quantize
+                # (bitsandbytes Params4bit.to -> quantize_4bit) and crash.
+                logger.info('Text encoder is quantized/device-mapped; skipping .to(device)')
+            else:
+                text_encoder = text_encoder.to(device)
             text_encoder.requires_grad_(False)
         logger.info("Cache components moved to GPU for cache build")
 
@@ -962,6 +1034,11 @@ def main():
         gc.collect()
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         torch.cuda.empty_cache()
+        try:
+            if hasattr(adapter, "release_text_encoder"):
+                adapter.release_text_encoder()
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("text encoder release failed: %s", _exc)
         logger.info("VAE + text encoder deleted after cache build (freed VRAM)")
 
         if torch.cuda.is_available():
@@ -999,7 +1076,24 @@ def main():
     logger.info("=== Phase 2: Training components (transformer + LoRA) ===")
 
     logger.info(f"Loading transformer from {transformer_path}...")
-    if quantize_mode == "prequantized":
+    if quantize_mode in ("fp8", "float8", "fp8_e4m3"):
+        # MiniMax-H3 fp8 base: `Fp8Linear` keeps the frozen weight as e4m3 + one fp32 scale
+        # per output row and runs `torch._scaled_mm` (Ada/Hopper). The adapter owns the whole
+        # path (snapshot at training.quantize_path, else streaming-quantize the bf16 shards --
+        # see models/minimax_h3_image/quantize.py), so nothing is replaced or moved here.
+        # VRAM: 33 GB of weights, i.e. 1024² training only. The `_keep_in_fp32_modules`
+        # projections stay full precision (that guard is inside build_meta_model_fp8).
+        transformer = adapter.load_transformer(transformer_path, weight_dtype)
+        fp8_linears = sum(
+            1 for m in transformer.modules()
+            if type(m).__name__ == "Fp8Linear"
+        )
+        logger.info(
+            "Transformer loaded with %d fp8 Linears. VRAM: %.1fGB allocated",
+            fp8_linears,
+            torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0,
+        )
+    elif quantize_mode == "prequantized":
         # The adapter loads a saved nf4 snapshot straight onto the GPU (see
         # models/minimax_h3_image/quantize.py); nothing to replace or move here.
         transformer = adapter.load_transformer(transformer_path, weight_dtype)
@@ -1092,11 +1186,10 @@ def main():
             # musubi `lokr_full_rank: true` → full-matrix W1/W2, rank/alpha
             # overridden to the 9999 sentinel inside LokrConfig (scale = 1.0).
             full_rank=training_cfg.get("lokr_full_rank", False),
-                # Kronecker component of the frozen weight instead of zeros.
         )
 
         # Prepare for k-bit training if quantized (same as LoRA path)
-        if quantize_mode in ("nf4", "int8", "prequantized"):
+        if quantize_mode in ("nf4", "int8"):
             from peft.utils.other import prepare_model_for_kbit_training
             transformer = prepare_model_for_kbit_training(transformer)
 
@@ -1113,7 +1206,7 @@ def main():
     else:
         # ── Standard LoRA via PEFT (existing code, unchanged) ────────────
         # Prepare for k-bit training if quantized
-        if quantize_mode in ("nf4", "int8", "prequantized"):
+        if quantize_mode in ("nf4", "int8"):
             from peft.utils.other import prepare_model_for_kbit_training
             transformer = prepare_model_for_kbit_training(transformer)
 
@@ -1123,10 +1216,16 @@ def main():
 
         lora_rank = config.get("training", {}).get("lora_rank", 16)
         lora_alpha = config.get("training", {}).get("lora_alpha", lora_rank)
-        lora_target_modules = config.get("training", {}).get(
-            "lora_target_modules",
-            ["to_q", "to_k", "to_v", "to_out", "to_gate", "ff.gate", "ff.up", "ff.down"],
-        )
+        # MiniMax-H3-Image blocks keep the released checkpoint layout (one fused
+        # `attn.qkv_proj`, `attn.out_proj`, gate-first `mlp.fc1`/`mlp.fc2`), so the diffusers
+        # `to_q`/`ff.up` spellings match nothing there.
+        if (config.get("model") or "") == "minimax_h3_image":
+            _default_lora_targets = ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"]
+        else:
+            _default_lora_targets = ["to_q", "to_k", "to_v", "to_out", "to_gate",
+                                     "ff.gate", "ff.up", "ff.down"]
+        lora_target_modules = (config.get("training", {}).get("lora_target_modules")
+                               or _default_lora_targets)
         # Resolve target_module patterns to explicit full Linear names for ALL
         # quantize modes. PEFT's native pattern matching can resolve to ModuleList
         # parents (e.g. "to_out" matches the ModuleList wrapping Linear+Dropout
@@ -1135,10 +1234,29 @@ def main():
         # against nn.Linear names is unambiguous and matches what the torchao
         # path has always done (same target set on cloud runs).
         import torch.nn as nn
+
+        # After nf4/int8 quantization the leaves are bnb Linear4bit / Linear8bitLt, not
+        # nn.Linear, so matching on nn.Linear alone finds nothing. PEFT supports LoRA on
+        # both bnb classes.
+        linear_types = [nn.Linear]
+        try:
+            import bitsandbytes as bnb
+
+            for attr in ("Linear4bit", "Linear8bitLt"):
+                cls = getattr(bnb.nn, attr, None)
+                if cls is not None:
+                    linear_types.append(cls)
+            logger.info(
+                "LoRA target matcher types: %s", [t.__name__ for t in linear_types]
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bitsandbytes unavailable for LoRA matching: %s", exc)
+        linear_types = tuple(linear_types)
+
         resolved_targets = [
             name
             for name, module in transformer.named_modules()
-            if isinstance(module, nn.Linear)
+            if isinstance(module, linear_types)
             and any(target in name for target in lora_target_modules)
         ]
         if not resolved_targets:
@@ -1245,17 +1363,25 @@ def main():
             # requires_grad=False — checkpoint disengages and ALL 28 layers'
             # activations are stored (~50-60 GiB instead of ~4-5 GiB).
             #
-            # Register a forward hook on img_in and txt_in to force their
-            # outputs to require grad, re-enabling gradient checkpointing.
+            # Register a forward hook on the model's input projections to force
+            # their outputs to require grad, re-enabling gradient checkpointing.
+            # The module names are per-adapter: Flux/Flux2/Krea call them
+            # img_in/txt_in, MiniMax-H3-Image calls them proj_in/context_embedder
+            # (there is no img_in there, so the old two-name loop registered
+            # nothing and the first backward died with
+            # "element 0 of tensors does not require grad and does not have a grad_fn").
             def _force_output_grad(module, input, output):
-                output.requires_grad_(True)
-            for hook_target in ("img_in", "txt_in"):
+                if not output.requires_grad:  # already connected by a LoKR/LoRA hook
+                    output.requires_grad_(True)
+            hooked_inputs = []
+            for hook_target in ("img_in", "txt_in", "proj_in", "context_embedder"):
                 if hasattr(transformer, hook_target):
                     getattr(transformer, hook_target).register_forward_hook(
                         _force_output_grad
                     )
+                    hooked_inputs.append(hook_target)
             logger.info("Gradient checkpointing enabled (after add_adapter) "
-                        "+ img_in/txt_in output grad hooks")
+                        f"+ {hooked_inputs or 'NO'} output grad hooks")
         else:
             logger.warning("Gradient checkpointing requested but "
                            "enable_gradient_checkpointing() not available")
@@ -1292,7 +1418,10 @@ def main():
         # No offloader: move the whole quantized model to GPU. Device-only .to()
         # (no dtype cast) preserves torchao AffineQuantizedTensor params.
         transformer = transformer.to(device=device)
-    elif quantize_mode in ("nf4", "int8", "prequantized"):
+    elif quantize_mode in ("nf4", "int8", "prequantized", "fp8", "float8", "fp8_e4m3"):
+        # Device-only move. `Module.to(dtype=...)` skips uint8 (so the nf4/int8 Params are safe
+        # either way) but float8 *is* a floating dtype: casting the MiniMax-H3 `weight_fp8`
+        # buffers to bf16 doubles the model to 66 GB and destroys the quantization.
         transformer = transformer.to(device=device)
     else:
         transformer = transformer.to(device=device, dtype=weight_dtype)
@@ -1964,8 +2093,14 @@ def main():
 
                 ckpt_mgr = CheckpointManager(epoch_dir, save_name)
                 if network_type == "lokr" and lycoris_net is not None:
+                    # output.save_format = "comfyui" writes one file per checkpoint, already in
+                    # ComfyUI's key layout and named <save_name>_epochN.safetensors, instead of
+                    # the native file plus a _comfyui copy.
+                    _comfy_only = str(
+                        config.get("output", {}).get("save_format", "both")).lower() == "comfyui"
                     path = ckpt_mgr.save_lokr(
-                        lycoris_net, trainer.step, epoch, config
+                        lycoris_net, trainer.step, epoch, config,
+                        comfyui_only=_comfy_only, plain_comfy_name=_comfy_only,
                     )
                     _save_ema_lokr(ckpt_mgr, trainer, lycoris_net,
                                    trainer.step, epoch, config)

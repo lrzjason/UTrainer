@@ -474,7 +474,14 @@ class CacheBuilder:
         # ── Phase 3: Encode captions with text encoder ───────────────
         logger.info("Phase 3/3: Encoding captions with text encoder")
         if text_encoder is not None and tokenizer is not None:
-            text_encoder = text_encoder.to(device)
+            if (getattr(text_encoder, "is_quantized", False)
+                    or getattr(text_encoder, "hf_device_map", None)
+                    or getattr(self.adapter, "_te_on_cpu", False)):
+                # bnb 4-bit encoder is already on the GPU via device_map; .to() would
+                # re-quantize the packed uint8 weights and raise.
+                logger.info("Text encoder stays off the GPU (quantized / device-mapped / configured CPU)")
+            else:
+                text_encoder = text_encoder.to(device)
             text_encoder.requires_grad_(False)
 
         caption_pbar = tqdm(
@@ -1114,7 +1121,7 @@ class CacheBuilder:
                     # signal when cached embeddings go missing, which otherwise
                     # surfaces much later as "Krea2 requires encoder_hidden_states".
                     logger.warning(
-                        f"Failed to encode caption for {cap_key} "
+                        f"Failed to encode caption [{type(e).__name__}] for {cap_key} "
                         f"(image={image_path!r}, text_encoder="
                         f"{type(text_encoder).__name__}, processor="
                         f"{type(processor).__name__}): {e}",

@@ -2078,7 +2078,14 @@ class Trainer:
         ]
 
         # ── Scheduler setup (use first target for mu calculation) ──
-        sched_cfg = self.noise_scheduler.config
+        # Adapters may expose the scheduler as a plain config dict (MiniMax-H3-Image
+        # does); diffusers schedulers expose the same fields under .config.
+        sched_cfg = getattr(self.noise_scheduler, "config", self.noise_scheduler)
+        if isinstance(sched_cfg, dict):
+            class _CfgView(dict):
+                __getattr__ = dict.get
+
+            sched_cfg = _CfgView(sched_cfg)
         mu = None
         if getattr(sched_cfg, "use_dynamic_shifting", False):
             patch_size = getattr(self.adapter, "patch_size", 2)

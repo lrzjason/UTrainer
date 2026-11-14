@@ -8,6 +8,14 @@ model classes.
 
 Ported from ``diffusers/scripts/convert_minimax_h3_to_diffusers.py`` (transformer key plan,
 PDD head split, image-VAE key plan), specialized to the image partition (no audio stream).
+
+The **transformer** conversion is key-only. The vendored blocks keep the release's module
+layout (one fused ``attn.qkv_proj``, one ``attn.out_proj``, ``mlp.fc1`` holding
+``[gate; value]``), so no tensor is re-ordered and a LoKR factorised on the training side is
+the checkpoint's keys verbatim. The **image VAE** is the exception: it keeps the diffusers
+layout (``attn.to_q``/``to_k``/``to_v``, ``ff.net.0.proj``), so its conversion still splits the
+interleaved ``attn.to_qkv`` and swaps the ``ff.w1`` halves -- the VAE is inference-only and
+never carries LoKR weights.
 """
 from __future__ import annotations
 
@@ -169,7 +177,13 @@ def _load_safetensors_dir(path: str) -> dict:
 
 
 def _rename_transformer_key(key: str) -> str:
-    """Original transformer key -> vendored module path (no tensor transform)."""
+    """Original transformer key -> vendored module path (no tensor transform).
+
+    The block leaves (``attn.qkv_proj``, ``attn.out_proj``, ``mlp.fc1``, ``mlp.fc2``) keep the
+    checkpoint's own spelling because the vendored blocks use it too (see the module docstring
+    of ``transformer_minimaxh3image.py``); only the stack prefix and the top-level modules are
+    renamed. That is what makes the LoKR export a pure rename.
+    """
     target = key
     if target.startswith("token_refiner.blocks."):
         target = target.replace("token_refiner.blocks.", "token_refiner.refiner_blocks.", 1)
@@ -180,34 +194,27 @@ def _rename_transformer_key(key: str) -> str:
     target = target.replace("video_patch_proj.", "proj_in.")
     target = target.replace("condition_proj.", "context_embedder.")
     target = target.replace("final_layer.norm.", "norm_out.norm.")
+    target = target.replace("final_layer.video_out.", "proj_out.")
     target = target.replace("final_layer.adaln_proj.linear.", "norm_out.linear.")
     target = target.replace(".attn.q_norm.", ".attn.norm_q.")
     target = target.replace(".attn.k_norm.", ".attn.norm_k.")
-    target = target.replace(".attn.out_proj.", ".attn.to_out.0.")
     return target
 
 
 def map_transformer_keys(source_keys, cfg: dict) -> dict[str, list[str]]:
     """``{source_key: [target_key, ...]}`` -- pure string work (no tensors, no torch).
 
-    Dropped keys map to an empty list: ``rope.inv_freq`` (recomputed as a buffer) and the
-    checkpoint's own ``final_layer.video_out.*`` head, which the PDD heads replace.
+    Dropped keys map to an empty list: ``rope.inv_freq`` (recomputed as a buffer). Every other
+    key maps one-to-one: the fused ``attn.qkv_proj`` and the ``[gate; value]`` ``mlp.fc1`` are
+    kept as shipped, no re-ordering. The base output head ``final_layer.video_out.*`` is kept as
+    ``proj_out`` -- it is the plain flow-matching head, used when ``pdd_step_index`` is None.
     """
     out: dict[str, list[str]] = {}
     for key in source_keys:
-        if key in DROPPED_TRANSFORMER_KEYS or key.startswith("final_layer.video_out."):
+        if key in DROPPED_TRANSFORMER_KEYS:
             out[key] = []
             continue
-        target = _rename_transformer_key(key)
-        if target.endswith(".attn.qkv_proj.weight"):
-            prefix = target.removesuffix("qkv_proj.weight")
-            out[key] = [f"{prefix}to_q.weight", f"{prefix}to_k.weight", f"{prefix}to_v.weight"]
-        elif target.endswith(".mlp.fc1.weight"):
-            out[key] = [target.replace(".mlp.fc1.weight", ".ff.net.0.proj.weight")]
-        elif ".mlp.fc2." in target:
-            out[key] = [target.replace(".mlp.fc2.", ".ff.net.2.")]
-        else:
-            out[key] = [target]
+        out[key] = [_rename_transformer_key(key)]
     return out
 
 
@@ -232,39 +239,31 @@ def iter_transformer_state_dicts(checkpoint_dir: str, cfg: dict | None = None):
 
     ``load_transformer_state_dict`` materializes all 62 GB at once, which does not fit next
     to a 24 GB model on a 90 GB box. Streaming keeps the peak at model + one shard (~6 GB).
+
+    The conversion is key-only (``map_transformer_keys``): no tensor is re-ordered, so each
+    shard's tensors are handed over as they are in the release.
     """
-    import torch
     from safetensors import safe_open
 
     cfg = cfg or transformer_config(checkpoint_dir)
-    heads = cfg["num_attention_heads"]
-    head_dim = cfg["attention_head_dim"]
     directory = os.path.join(checkpoint_dir, "transformer")
 
     for name in sorted(f for f in os.listdir(directory) if f.endswith(".safetensors")):
         with safe_open(os.path.join(directory, name), framework="pt", device="cpu") as fh:
             keys = list(fh.keys())
             key_map = map_transformer_keys(keys, cfg)
-            part: dict[str, torch.Tensor] = {}
+            part: dict[str, "torch.Tensor"] = {}
             for key, targets in key_map.items():
                 if not targets:
                     continue
-                tensor = fh.get_tensor(key)
-                if key.endswith(".attn.qkv_proj.weight"):
-                    q, k, v = _split_qkv(reorder_interleaved_qkv(tensor, heads, head_dim), heads, head_dim)
-                    part[targets[0]], part[targets[1]], part[targets[2]] = q, k, v
-                elif key.endswith(".mlp.fc1.weight"):
-                    gate, value = tensor.chunk(2, dim=0)
-                    part[targets[0]] = torch.cat([value, gate], dim=0).contiguous()
-                else:
-                    part[targets[0]] = tensor
+                part[targets[0]] = fh.get_tensor(key)
         yield part
         del part
 
     pdd_meta = _read_json(os.path.join(checkpoint_dir, "model_index.json")).get("_minimax_h3", {})
     pdd_file = pdd_meta.get("pdd_fused_heads")
     if pdd_file:
-        heads_part: dict[str, torch.Tensor] = {}
+        heads_part: dict[str, "torch.Tensor"] = {}
         with safe_open(os.path.join(checkpoint_dir, pdd_file), framework="pt", device="cpu") as fh:
             for key in fh.keys():
                 tensor = fh.get_tensor(key)
@@ -277,12 +276,9 @@ def iter_transformer_state_dicts(checkpoint_dir: str, cfg: dict | None = None):
 
 def load_transformer_state_dict(checkpoint_dir: str):
     """Original ``transformer/`` + PDD heads -> vendored transformer state dict + config."""
-    import torch
     from safetensors import safe_open
 
     cfg = transformer_config(checkpoint_dir)
-    heads = cfg["num_attention_heads"]
-    head_dim = cfg["attention_head_dim"]
     state = _load_safetensors_dir(os.path.join(checkpoint_dir, "transformer"))
     key_map = map_transformer_keys(list(state), cfg)
 
@@ -290,15 +286,7 @@ def load_transformer_state_dict(checkpoint_dir: str):
     for key, targets in key_map.items():
         if not targets:
             continue
-        tensor = state[key]
-        if key.endswith(".attn.qkv_proj.weight"):
-            q, k, v = _split_qkv(reorder_interleaved_qkv(tensor, heads, head_dim), heads, head_dim)
-            out[targets[0]], out[targets[1]], out[targets[2]] = q, k, v
-        elif key.endswith(".mlp.fc1.weight"):
-            gate, value = tensor.chunk(2, dim=0)
-            out[targets[0]] = torch.cat([value, gate], dim=0).contiguous()
-        else:
-            out[targets[0]] = tensor
+        out[targets[0]] = state[key]
 
     # Per-step PDD heads (stacked in a side file) -> pdd_proj_out.{i}.{weight,bias}
     pdd_meta = _read_json(os.path.join(checkpoint_dir, "model_index.json")).get("_minimax_h3", {})

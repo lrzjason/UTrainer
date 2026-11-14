@@ -1,6 +1,5 @@
 {
-    "_comment": "MiniMax-H3-Image 24GB end-to-end test: ds_baseline, 20 epochs, adamw8bit, constant 1e-4, repeats 10. nf4 base + offload, LoRA r16 (LoKr is not supported on bnb Linear4bit here), guide_flow_matching (CFG-distilled checkpoint).",
-
+    "_comment": "MiniMax-H3-Image 24GB end-to-end test: ds_baseline, 20 epochs, adamw8bit, constant 1e-4, repeats 1. nf4 base snapshot + streaming offload-free load, LoKR full-rank factor 8 (313M params) on the checkpoint-layout block targets, guide_flow_matching (CFG-distilled checkpoint). save_format comfyui writes ONE file per epoch that both resumes training and loads in ComfyUI.",
     "model": "minimax_h3_image",
     "model_path": "/home/waas/hf_models/MiniMax-H3-Image",
     "transformer_path": "/home/waas/hf_models/MiniMax-H3-Image/transformer",
@@ -8,9 +7,8 @@
     "text_encoder_path": "/home/waas/hf_models/MiniMax-H3-Image/text_encoder",
     "tokenizer_path": "/home/waas/hf_models/MiniMax-H3-Image/tokenizer",
     "processor_path": "/home/waas/hf_models/MiniMax-H3-Image/processor",
-
     "data": {
-        "cache_dir": "/home/waas/h3i_cache_ds_baseline",
+        "cache_dir": "/home/waas/h3i_cache_v2",
         "rebuild_index": true,
         "num_workers": 2,
         "val_split_ratio": 0.05,
@@ -19,49 +17,57 @@
                 "name": "ds_baseline",
                 "train_data_dir": "/home/waas/datasets/ds_baseline",
                 "resolution": 1024,
-                "repeats": 10,
+                "repeats": 1,
                 "sample_weight": 1.0,
                 "recreate_cache": false,
                 "recreate_latents": false,
                 "recreate_embeddings": false,
                 "val_batch_config_index": 0,
-                "image_configs": {"T": {"suffix": ""}},
-                "target_configs": {"T": [{"image": "T"}]},
-                "reference_configs": {"none": []},
-                "caption_configs": {"cap_t": {"ext": ".txt", "image": "T"}},
+                "image_configs": {
+                    "T": {
+                        "suffix": ""
+                    }
+                },
+                "target_configs": {
+                    "T": [
+                        {
+                            "image": "T"
+                        }
+                    ]
+                },
+                "reference_configs": {
+                    "none": []
+                },
+                "caption_configs": {
+                    "cap_t": {
+                        "ext": ".txt",
+                        "image": "T"
+                    }
+                },
                 "batch_configs": [
-                    {"target_config": "T", "caption_config": "cap_t", "caption_dropout": 0.1}
+                    {
+                        "target_config": "T",
+                        "caption_config": "cap_t",
+                        "caption_dropout": 0.1
+                    }
                 ]
             }
         ]
     },
-
     "losses": [
         {
             "type": "guide_flow_matching",
             "weight": 1.0,
             "params": {
                 "fixed_guidance_scale": 1.5,
-                "use_weighting": true,
-                "freq_weight": 0.1,
-                "freq_alpha": 1.0,
-                "freq_sigma_max": 0.3
+                "use_weighting": false,
+                "freq_weight": 0.0
             }
         }
     ],
-
     "training": {
-        "network_type": "lora",
+        "network_type": "lokr",
         "lora_rank": 16,
-        "lora_alpha": 16,
-        "lora_target_modules": [
-            "transformer_blocks.*.attn.to_q",
-            "transformer_blocks.*.attn.to_k",
-            "transformer_blocks.*.attn.to_v",
-            "transformer_blocks.*.attn.to_out.0",
-            "transformer_blocks.*.ff.net.0.proj",
-            "transformer_blocks.*.ff.net.2"
-        ],
         "batch_size": 1,
         "learning_rate": 0.0001,
         "num_epochs": 20,
@@ -74,7 +80,8 @@
         "max_grad_norm": 1.0,
         "weight_dtype": "bf16",
         "mixed_precision": "bf16",
-        "quantize": "prequantized",
+        "quantize": "fp8",
+        "quantize_path": "/home/waas/hf_models/MiniMax-H3-Image/transformer_fp8",
         "save_prequantized": true,
         "text_encoder_quantize": "nf4",
         "offload_base_weights": true,
@@ -84,35 +91,59 @@
         "block_swap": 0,
         "vae_load_mode": "lazy",
         "vae_on_device": false,
-        "ema_decay": 0.999,
-        "pdd_sigma_mode": "grid",
-        "noise_selector": {"type": "random"}
+        "ema_decay": 0.0,
+        "noise_selector": {
+            "type": "random"
+        },
+        "pdd_head_index": "sigma",
+        "text_encoder_device": "cuda",
+        "startup_trace": "/home/waas/H3I_output/_startup_trace.log",
+        "lokr_model_type": "minimax_h3_image",
+        "lokr_full_rank": true,
+        "lokr_factor": 8,
+        "lokr_alpha": 1.0,
+        "lokr_target_modules": [
+            "attn.qkv_proj",
+            "attn.out_proj",
+            "mlp.fc1",
+            "mlp.fc2"
+        ],
+        "timestep_sampling": "pdd"
     },
-
     "validation": {
         "val_loss": true,
-        "loss_types": ["flow_matching"],
-        "loss_params": {"use_weighting": false},
+        "loss_types": [
+            "flow_matching"
+        ],
+        "loss_params": {
+            "use_weighting": false
+        },
         "use_ema": false,
         "val_every_epoch": 1,
         "val_seed": 42,
         "generate_images": true,
-        "num_val_images": 2,
-        "resolution": 1024
+        "num_val_images": 1,
+        "resolution": 1024,
+        "num_inference_steps": 6
     },
-
     "output": {
-        "dir": "/home/waas/H3I_output/ds_baseline_test",
-        "save_name": "h3i_ds_baseline_lora16",
-        "save_every_epoch": 2,
+        "dir": "/home/waas/H3I_output/h3i_v3_f8_gfm",
+        "save_name": "h3i_v3_f8_gfm",
+        "save_every_epoch": 1,
+        "save_format": "comfyui",
         "save_start_epoch": 0,
-        "save_ema": true
+        "save_ema": false,
+        "checkpoint_every": 200
     },
-
-    "reporter": {"type": "wandb", "log_every": 1},
-    "helios": {"enabled": false},
+    "reporter": {
+        "type": "none",
+        "log_every": 1
+    },
+    "helios": {
+        "enabled": false
+    },
     "wandb": {
-        "enabled": true,
+        "enabled": false,
         "project": "UnifiedTrainer",
         "run_name": "h3i_ds_baseline_lora16_24g"
     }

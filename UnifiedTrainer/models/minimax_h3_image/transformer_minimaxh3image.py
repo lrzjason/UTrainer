@@ -13,15 +13,29 @@ Differs from the upstream file only in:
   2. ``_tp_plan`` / ``_cp_plan`` removed (they need diffusers' parallel machinery);
   3. ``self._offloader = None`` plus the block-loop hooks in ``forward`` (the krea2 /
      qwen21 training convention), so UnifiedTrainer's BouncingOffloader can stream the
-     50 blocks from CPU.
+     50 blocks from CPU;
+  4. **the blocks keep the released checkpoint's own module layout**, so a LoKR file is
+     the checkpoint's keys verbatim and one file is both resumable and ComfyUI-loadable
+     (see ``convert.py`` / ``networks/lokr_convert.py``):
+
+        attn.qkv_proj  one Linear(hidden, 3 * inner), rows = [head0: q|k|v, head1: ...]
+        attn.out_proj  one Linear(inner, hidden)
+        mlp.fc1        Linear(hidden, 2 * ffn), rows = [gate; value]
+        mlp.fc2        Linear(ffn, hidden)
+
+     diffusers spells these ``to_q``/``to_k``/``to_v``, ``to_out.0`` and
+     ``ff.net.0.proj``/``ff.net.2`` with the qkv rows re-ordered to ``[q; k; v]`` and the
+     MLP halves to ``[value; gate]`` -- conversions that cannot be inverted for a
+     Kronecker-factorised LoKR, which is why the layout moved instead.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalModelMixin
-from diffusers.models.attention import AttentionMixin, AttentionModuleMixin, FeedForward
+from diffusers.models.attention import AttentionMixin, AttentionModuleMixin
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -68,10 +82,19 @@ class MiniMaxH3ImageRotaryPosEmbed(nn.Module):
     def __init__(self, rope_freq_dim: int = 16, rope_theta: float = 10000.0):
         super().__init__()
         self.rope_freq_dim = rope_freq_dim
-        inv_freq = 1.0 / (
-            rope_theta ** (torch.arange(0, 2 * rope_freq_dim, 2, dtype=torch.float32) / (2 * rope_freq_dim))
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.rope_theta = float(rope_theta)
+        # Not persistent: it is a pure function of the config, so a meta-built model
+        # (`quantize.build_meta_model_fp8`) can recompute it instead of loading it.
+        self.register_buffer("inv_freq", self.build_inv_freq(), persistent=False)
+
+    def build_inv_freq(self) -> torch.Tensor:
+        n = 2 * self.rope_freq_dim
+        return 1.0 / (self.rope_theta ** (torch.arange(0, n, 2, dtype=torch.float32) / n))
+
+    def reset_inv_freq(self, device=None) -> None:
+        """Recompute the frequency buffer on a real device (meta-built models)."""
+        self.inv_freq = self.build_inv_freq().to(device) if device is not None \
+            else self.build_inv_freq()
 
     def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # position_ids: (seq_len, 3) -> cos/sin: (seq_len, 2 * 3 * rope_freq_dim)
@@ -111,6 +134,10 @@ class MiniMaxH3ImageAdaLayerNormModulation(nn.Module):
         # the same `temb`, so a rounding applied before the activation biases every block's modulation parameters
         # identically at every sampling step, which accumulates coherently over the denoising trajectory.
         temb = self.linear(nn.functional.silu(temb).to(get_parameter_dtype(self.linear)))
+        # Row layout is (timestep, modality) with the 6 modulation parameters on the last axis, exactly as the
+        # official `diffusers/models/transformers/transformer_minimax_h3_image.py` does it. (This used to be
+        # re-ordered param-major on the strength of the pruned ComfyUI file's bias statistics; that file's adaln is a
+        # re-fit for the distilled model, so it is not a valid reference for this checkpoint -- reverting to upstream.)
         temb = temb.view(-1, 6 * self.hidden_size)
         return temb.chunk(6, dim=-1)
 
@@ -158,18 +185,12 @@ class MiniMaxH3ImageAttnProcessor:
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if attn.fused_projections:
-            query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
-        else:
-            query = attn.to_q(hidden_states)
-            key = attn.to_k(hidden_states)
-            value = attn.to_v(hidden_states)
-
-        # Reshape by a fixed `head_dim` and let `-1` absorb the head count. Under tensor parallelism each rank
-        # holds a column-sharded slice (`attn.heads // tp_degree` heads); this keeps the processor TP-agnostic.
-        query = query.unflatten(-1, (-1, attn.head_dim))
-        key = key.unflatten(-1, (-1, attn.head_dim))
-        value = value.unflatten(-1, (-1, attn.head_dim))
+        # ONE fused projection, in the released checkpoint's row order: head-major, then `q | k | v` per head.
+        # Splitting on the head axis is therefore the identity transform on the weights (see the module docstring
+        # of `MiniMaxH3ImageAttention`), which is what keeps a LoKR checkpoint renamable.
+        query, key, value = attn.qkv_proj(hidden_states).unflatten(
+            -1, (attn.heads, 3, attn.head_dim)
+        ).unbind(3)
 
         query = attn.norm_q(query)
         key = attn.norm_k(key)
@@ -192,13 +213,22 @@ class MiniMaxH3ImageAttnProcessor:
             parallel_config=self._parallel_config,
         )
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
+        hidden_states = attn.out_proj(hidden_states)
         return hidden_states
 
 
 # Copied from diffusers.models.transformers.transformer_minimax_h3.MiniMaxH3Attention with MiniMaxH3->MiniMaxH3Image
 class MiniMaxH3ImageAttention(nn.Module, AttentionModuleMixin):
+    r"""
+    Self-attention with the released checkpoint's fused QKV projection.
+
+    ``qkv_proj`` holds all three projections in one ``[3 * inner_dim, hidden_size]`` matrix, ordered
+    **head-major** (``head0: q|k|v, head1: q|k|v, ...``) exactly as MiniMax ships it. The processor can
+    therefore split the output by reshaping to ``(..., heads, 3, head_dim)``; no row permutation of the
+    weight is needed at load time, so a LoKR factorised on this module is renamed -- not re-fitted -- on
+    export (``networks/lokr_convert.py``).
+    """
+
     _default_processor_cls = MiniMaxH3ImageAttnProcessor
     _available_processors = [MiniMaxH3ImageAttnProcessor]
 
@@ -216,12 +246,10 @@ class MiniMaxH3ImageAttention(nn.Module, AttentionModuleMixin):
         self.inner_dim = heads * dim_head
         self.use_bias = False
 
-        self.to_q = nn.Linear(hidden_size, self.inner_dim, bias=False)
-        self.to_k = nn.Linear(hidden_size, self.inner_dim, bias=False)
-        self.to_v = nn.Linear(hidden_size, self.inner_dim, bias=False)
+        self.qkv_proj = nn.Linear(hidden_size, 3 * self.inner_dim, bias=False)
         self.norm_q = nn.RMSNorm(dim_head, eps=qk_norm_eps)
         self.norm_k = nn.RMSNorm(dim_head, eps=qk_norm_eps)
-        self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, hidden_size, bias=False), nn.Dropout(0.0)])
+        self.out_proj = nn.Linear(self.inner_dim, hidden_size, bias=False)
 
         if processor is None:
             processor = self._default_processor_cls()
@@ -234,6 +262,23 @@ class MiniMaxH3ImageAttention(nn.Module, AttentionModuleMixin):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.processor(self, hidden_states, rotary_emb, attention_mask)
+
+
+# Replaces diffusers' `FeedForward(..., activation_fn="swiglu")` in both block types, with the released
+# checkpoint's row order instead of diffusers' swizzled one: `mlp.fc1` is `[gate; value]` on the output axis
+# (diffusers' `ff.net.0.proj` is `[value; gate]`, which convert.py used to swap on load -- reversible for a
+# dense weight, not for a Kronecker-factorised LoKR delta).
+class MiniMaxH3ImageMLP(nn.Module):
+    r"""SwiGLU feed-forward with the checkpoint's module layout: ``fc1 = [gate; value]``, ``fc2`` down."""
+
+    def __init__(self, hidden_size: int, ffn_dim: int, bias: bool = False):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_size, 2 * ffn_dim, bias=bias)
+        self.fc2 = nn.Linear(ffn_dim, hidden_size, bias=bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate, value = self.fc1(hidden_states).chunk(2, dim=-1)
+        return self.fc2(value * F.silu(gate))
 
 
 # Copied from diffusers.models.transformers.transformer_minimax_h3.MiniMaxH3TokenRefinerBlock with MiniMaxH3->MiniMaxH3Image
@@ -260,11 +305,11 @@ class MiniMaxH3ImageTokenRefinerBlock(nn.Module):
             qk_norm_eps=qk_norm_eps,
         )
         self.norm2 = nn.RMSNorm(hidden_size, eps=norm_eps)
-        self.ff = FeedForward(hidden_size, inner_dim=ffn_dim, activation_fn="swiglu", bias=False)
+        self.mlp = MiniMaxH3ImageMLP(hidden_size, ffn_dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(self.norm1(hidden_states))
-        hidden_states = hidden_states + self.ff(self.norm2(hidden_states))
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
 
@@ -333,7 +378,7 @@ class MiniMaxH3ImageTransformerBlock(nn.Module):
             qk_norm_eps=qk_norm_eps,
         )
         self.norm2 = nn.RMSNorm(hidden_size, eps=norm_eps)
-        self.ff = FeedForward(hidden_size, inner_dim=ffn_dim, activation_fn="swiglu", bias=False)
+        self.mlp = MiniMaxH3ImageMLP(hidden_size, ffn_dim)
         self.adaln_proj = MiniMaxH3ImageAdaLayerNormModulation(time_embed_dim=time_embed_dim, hidden_size=hidden_size)
 
     def forward(
@@ -359,7 +404,7 @@ class MiniMaxH3ImageTransformerBlock(nn.Module):
         norm_hidden_states = norm_hidden_states * (
             1.0 + scale_mlp.index_select(0, adaln_indices)
         ) + shift_mlp.index_select(0, adaln_indices)
-        ff_output = self.ff(norm_hidden_states)
+        ff_output = self.mlp(norm_hidden_states)
         hidden_states = residual + gate_mlp.index_select(0, adaln_indices) * ff_output
 
         return hidden_states
@@ -511,6 +556,10 @@ class MiniMaxH3ImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin, 
             hidden_size=hidden_size, time_embed_dim=time_embed_dim, eps=final_norm_eps
         )
         self.pdd_proj_out = nn.ModuleList([nn.Linear(hidden_size, patch_dim, bias=True) for _ in range(num_pdd_heads)])
+        # The base (non-PDD) output projection of the release: `final_layer.video_out`.
+        # `pdd_step_index=None` selects it, which turns the model into a plain
+        # flow-matching DiT with a single output head.
+        self.proj_out = nn.Linear(hidden_size, patch_dim, bias=True)
 
         self.gradient_checkpointing = False
         # BouncingOffloader hook (krea2/qwen21 training convention). Stays None
@@ -530,6 +579,7 @@ class MiniMaxH3ImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin, 
         text_indices: torch.Tensor,
         pdd_step_index: int,
         return_dict: bool = True,
+        **kwargs,
     ) -> Transformer2DModelOutput | tuple[torch.Tensor]:
         r"""
         Args:
@@ -606,7 +656,10 @@ class MiniMaxH3ImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin, 
 
         # 4. The head of this step runs over every row, then the image rows are selected. The heads are float32 while
         # the block stack runs in the requested `torch_dtype`; align the activation with their parameter dtype.
-        proj_out = self.pdd_proj_out[pdd_step_index]
+        if pdd_step_index is None:
+            proj_out = self.proj_out
+        else:
+            proj_out = self.pdd_proj_out[pdd_step_index]
         hidden_states = self.norm_out(hidden_states, temb, timestep_indices).to(get_parameter_dtype(proj_out))
         output = proj_out(hidden_states).index_select(1, image_indices)
 

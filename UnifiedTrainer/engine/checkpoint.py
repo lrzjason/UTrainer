@@ -121,19 +121,14 @@ class CheckpointManager:
     _BLOCKS_PATTERN = _re.compile(
         r'(?<!refiner_)(?<!layerwise_)(?<![A-Za-z])blocks'
     )
-    # H3 comfy keys: top-level 'blocks.N.attn...' only — NOT
-    # 'token_refiner.blocks.N...' (refiner blocks keep their own name).
-    _H3_BLOCKS_PATTERN = _re.compile(
-        r'(?<!refiner\.)(?<![A-Za-z])blocks\.'
-    )
 
     @classmethod
     def _convert_comfyui_to_peft(cls, state_dict: dict) -> dict:
         """Convert ComfyUI-format LoRA keys back to PEFT format.
 
-        MiniMax-H3 comfy keys (fused 'qkv_proj' / 'mlp.fc1-fc2') are
-        converted through the H3 path (fused qkv split back into
-        to_q/to_k/to_v); everything else uses the generic reverse mapping.
+        MiniMax-H3 comfy keys are handled by the H3 path (the two block-stack prefixes
+        only -- the fused 'qkv_proj' / 'mlp.fc1-fc2' layout is the trainer's own now);
+        everything else uses the generic reverse mapping.
         """
         if cls._is_minimax_h3_comfyui(state_dict):
             return cls._convert_h3_comfyui_to_peft(state_dict)
@@ -155,16 +150,13 @@ class CheckpointManager:
         return converted
 
     # ── MiniMax-H3 ComfyUI -> PEFT conversion (LOAD side) ──────────
-    # ComfyUI's MiniMax-H3 (comfy/ldm/minimax/model.py) uses FUSED attention:
-    #   blocks.N.attn.qkv_proj  Linear(hidden, inner*3)  (split q,k,v in order)
-    #   blocks.N.attn.out_proj, blocks.N.mlp.fc1, blocks.N.mlp.fc2 (swiglu)
-    # The diffusers PEFT names (to_q/to_k/to_v, to_out.0, ff.net.0.proj,
-    # ff.net.2) must therefore be FUSED/renamed — the krea2-style wq/wk/wv
-    # mapping is wrong for H3.  ComfyUI loads `diffusion_model.<exact-key>`
-    # lora keys generically (comfy/lora.py model_lora_keys_unet), so the
-    # fused qkv_proj pair loads without any H3-specific key map.
-    _H3_QKV = ("to_q", "to_k", "to_v")
-
+    # ComfyUI's MiniMax-H3 (comfy/ldm/minimax/model.py) keeps the checkpoint's module layout:
+    #   blocks.N.attn.qkv_proj  Linear(hidden, inner*3)  (head-major q|k|v rows)
+    #   blocks.N.attn.out_proj, blocks.N.mlp.fc1, blocks.N.mlp.fc2 (swiglu, [gate; value])
+    # Our transformer now uses exactly that layout too (see
+    # models/minimax_h3_image/transformer_minimaxh3image.py), so this is a pure prefix rename
+    # -- no q/k/v split. ComfyUI loads `diffusion_model.<exact-key>` lora keys generically
+    # (comfy/lora.py model_lora_keys_unet), so a fused `qkv_proj` pair resolves on its own.
     @staticmethod
     def _is_minimax_h3_comfyui(state_dict: dict) -> bool:
         """ComfyUI H3 keys use fused qkv_proj / mlp.fc1-fc2 (krea2 comfy uses
@@ -176,8 +168,8 @@ class CheckpointManager:
         """Normalize a PEFT H3 key to (module_key, suffix).
 
         Handles both get_peft_model_state_dict output
-        (`base_model.model.transformer_blocks.0.attn.to_q.lora_A.default.weight`)
-        and the manual fallback (`transformer_blocks.0.attn.to_q.lora_A.weight`).
+        (`base_model.model.transformer_blocks.0.attn.qkv_proj.lora_A.default.weight`)
+        and the manual fallback (`transformer_blocks.0.attn.qkv_proj.lora_A.weight`).
         Returns (None, None) for non-weight keys (e.g. alpha buffers).
         """
         k = key
@@ -191,68 +183,38 @@ class CheckpointManager:
 
     @classmethod
     def _convert_h3_comfyui_to_peft(cls, state_dict: dict) -> dict:
-        """Convert ComfyUI fused-qkv H3 keys back to PEFT format.
+        """Rename ComfyUI H3 LoRA keys back to PEFT (trainer) names.
 
-        Splits qkv_proj lora_down/up back into to_q/to_k/to_v thirds
-        (down rows dim 0, up cols dim 1) and reverses all renames.
-        Alpha keys are dropped (PEFT recomputes scale from module alpha).
+        Pure prefix rewrite: the fused ``qkv_proj`` and the gate-first ``mlp.fc1`` are the
+        same modules on both sides now, so nothing is split or re-ordered. Alpha keys are
+        dropped (PEFT recomputes the scale from the module's own alpha).
         """
         converted: dict = {}
-        fused: dict = {}     # "blocks.N.attn" -> {"down": t, "up": t}
-        singles: list = []
+        dropped = 0
         for key, tensor in state_dict.items():
             k = key
             if k.startswith("diffusion_model."):
                 k = k[len("diffusion_model."):]
             if k.endswith(".alpha"):
                 continue  # PEFT derives scale from the module's own alpha
-            if k.endswith(".lora_down.weight") or k.endswith(".lora_up.weight"):
-                suffix = ".lora_down.weight" if k.endswith(".lora_down.weight") \
-                    else ".lora_up.weight"
-                mod_key = k[:-len(suffix)]
-                is_down = suffix == ".lora_down.weight"
-                if mod_key.endswith(".attn.qkv_proj"):
-                    attn_key = mod_key[:-len(".qkv_proj")]
-                    fused.setdefault(attn_key, {})["down" if is_down else "up"] = tensor
-                else:
-                    singles.append((mod_key, tensor, is_down))
-
-        for attn_key, pair in fused.items():
-            down, up = pair.get("down"), pair.get("up")
-            if (down is None or up is None or down.shape[0] % 3 != 0
-                    or up.shape[1] != down.shape[0]):
-                logger.warning(
-                    f"H3 comfy->peft: skipping malformed fused qkv {attn_key}"
-                )
+            mod_key, suffix = cls._split_h3_key(k)
+            if mod_key is None:
+                dropped += 1
                 continue
-            r = down.shape[0] // 3
-            base = cls._unrename_h3_module(attn_key)
-            for i, name in enumerate(cls._H3_QKV):
-                mod_key = f"{base}.{name}"
-                converted[f"base_model.model.{mod_key}.lora_A.default.weight"] = \
-                    down[i * r:(i + 1) * r]
-                converted[f"base_model.model.{mod_key}.lora_B.default.weight"] = \
-                    up[:, i * r:(i + 1) * r]
-
-        for mod_key, tensor, is_down in singles:
             new_key = "base_model.model." + cls._unrename_h3_module(mod_key)
-            converted[f"{new_key}.{'lora_A' if is_down else 'lora_B'}.default.weight"] = \
-                tensor
-
+            converted[f"{new_key}{suffix}"] = tensor
+        if dropped:
+            logger.info("H3 comfy->peft: %d key(s) skipped (not LoRA pairs)", dropped)
         return converted
 
     @classmethod
     def _unrename_h3_module(cls, mod_key: str) -> str:
-        """ComfyUI H3 module name -> diffusers name."""
-        k = mod_key
-        if k.endswith(".attn.out_proj"):
-            k = k[:-len(".attn.out_proj")] + ".attn.to_out.0"
-        elif k.endswith(".mlp.fc1"):
-            k = k[:-len(".mlp.fc1")] + ".ff.net.0.proj"
-        elif k.endswith(".mlp.fc2"):
-            k = k[:-len(".mlp.fc2")] + ".ff.net.2"
-        k = cls._H3_BLOCKS_PATTERN.sub("transformer_blocks.", k)
-        return k
+        """ComfyUI H3 module name -> trainer module name (two block-stack prefixes)."""
+        if mod_key.startswith("token_refiner.blocks."):
+            return "token_refiner.refiner_blocks." + mod_key[len("token_refiner.blocks."):]
+        if mod_key.startswith("blocks."):
+            return "transformer_blocks." + mod_key[len("blocks."):]
+        return mod_key
 
     @staticmethod
     def _detect_lora_format(state_dict: dict) -> str:
@@ -497,27 +459,39 @@ class CheckpointManager:
         is_final: bool = False,
         tag: str = "",
         comfyui_only: bool = False,
+        plain_comfy_name: bool = False,
     ) -> Path:
-        """Save LoKR adapter weights via LyCORIS native API.
+        """Save LoKR adapter weights via the self-contained LoKR module.
 
-        Saves in LyCORIS format (lycoris_ prefix, lokr_w1/w2 keys).
-        Also saves metadata JSON for resume.
+        Saves ``lokr_w1``/``lokr_w2``/``alpha`` per targeted module and a metadata
+        JSON for resume.
 
         ``tag`` inserts an extra segment into the file stem, e.g.
-        ``tag="ema"`` -> ``<save_name>_epoch7_ema.safetensors`` (+ the
-        ``_comfyui`` conversion). ``comfyui_only=True`` keeps only the
-        ComfyUI-converted file: the native file is written as the conversion
-        input and deleted afterwards, and no metadata JSON is emitted. That is
-        what auxiliary inference-only snapshots (EMA weights) use -- they are
-        not resume artifacts.
+        ``tag="ema"`` -> ``<save_name>_epoch7_ema.safetensors``.
+
+        MiniMax-H3 (``lycoris_net.comfy_key_style == "minimax_h3"``) is written straight
+        into the released checkpoint's module spelling (``blocks.9.attn.qkv_proj``), which
+        is also what ComfyUI's MiniMaxH3 LoRA key map registers: **one file** per snapshot
+        that resumes training and loads in ComfyUI. Nothing is converted or duplicated, so
+        ``comfyui_only`` / ``plain_comfy_name`` are no-ops there (they exist for the models
+        whose native and ComfyUI spellings differ).
+
+        For every other architecture the native ``lycoris_*`` file is written first and a
+        converted copy is placed next to it (``comfyui_only`` keeps only that copy, and
+        ``plain_comfy_name`` drops the ``_comfyui`` suffix too, so exactly one file appears).
         """
         suffix = "final" if is_final else f"epoch{epoch}"
         stem = f"{self.save_name}_{suffix}" + (f"_{tag}" if tag else "")
         filename = f"{stem}.safetensors"
         path = self.output_dir / filename
 
-        # Self-contained LoKR save — safetensors with lycoris-compatible keys
-        lycoris_net.save_weights(str(path), dtype=torch.bfloat16)
+        # MiniMax-H3 keeps the released checkpoint's module layout, so the native file IS the
+        # ComfyUI file (`blocks.N.attn.qkv_proj`, no `lora_unet_` prefix, no q/k/v re-fit).
+        # Writing it in that spelling directly makes one file serve both readers -- no
+        # `_comfyui` sibling, no 2x disk, no conversion pass over 1.8 GB of tensors.
+        h3_style = getattr(lycoris_net, "comfy_key_style", None) in ("minimax_h3", "dotted")
+        lycoris_net.save_weights(str(path), dtype=torch.bfloat16,
+                                 key_style="h3" if h3_style else None)
         logger.info(f"Saved LoKR checkpoint: {path} ({lycoris_net.num_modules} modules)")
 
         # Auto-convert to the ComfyUI/FLUX.3 key layout next to the native file.
@@ -527,49 +501,70 @@ class CheckpointManager:
         # loads as "lora key not loaded" for every key.  The extra file costs
         # disk only; the native file remains the resume/interchange format.
         comfy_path = None
-        try:
-            from UnifiedTrainer.networks.lokr_convert import (
-                comfy_filename_for, convert_file,
-            )
+        if h3_style:
+            # Already in the checkpoint/ComfyUI spelling (see above): this file IS the
+            # portable one, nothing to convert.
+            comfy_path = path
+        else:
+            try:
+                from UnifiedTrainer.networks.lokr_convert import (
+                    comfy_filename_for, convert_file,
+                )
 
-            # MOSS targets live at `layers.N.proj.q` (official names, which
-            # ComfyUI keeps verbatim); qwen-image-2.x targets live under
-            # `transformer_blocks.N.*` and ComfyUI already understands those
-            # diffusers names, so a pure prefix rename is correct there; the rest
-            # goes through the FLUX.3/Krea2 name mapping.
-            targets = list(getattr(lycoris_net, "_target_names", []) or [])
-            is_moss = any(t.startswith("layers.") for t in targets)
-            is_diffusers_native = any(t.startswith("transformer_blocks.") for t in targets)
-            if is_moss:
-                model_kind, native_mods = "moss", None
-            elif is_diffusers_native:
-                model_kind, native_mods = "rename", None
-            else:
-                model_kind, native_mods = "flux3", targets
-            comfy_path = comfy_filename_for(path)
-            convert_file(
-                path, comfy_path, to="comfyui",
-                model=model_kind,
-                native_modules=native_mods,
-                metadata={"save_name": self.save_name, "epoch": epoch, "step": step},
-            )
-            logger.info(f"Saved ComfyUI-compatible LoKR: {comfy_path}")
-        except Exception as e:  # noqa: BLE001 - never fail a checkpoint save
-            logger.warning(
-                f"Could not write the ComfyUI-converted LoKR next to {path}: {e}"
-            )
-            comfy_path = None
+                # MOSS targets live at `layers.N.proj.q` (official names, which
+                # ComfyUI keeps verbatim); qwen-image-2.x targets live under
+                # `transformer_blocks.N.*` and ComfyUI already understands those
+                # diffusers names, so a pure prefix rename is correct there; the rest
+                # goes through the FLUX.3/Krea2 name mapping.
+                targets = list(getattr(lycoris_net, "_target_names", []) or [])
+                is_moss = any(t.startswith("layers.") for t in targets)
+                is_diffusers_native = any(t.startswith("transformer_blocks.") for t in targets)
+                if is_moss:
+                    model_kind, native_mods = "moss", None
+                elif is_diffusers_native:
+                    model_kind, native_mods = "rename", None
+                else:
+                    model_kind, native_mods = "flux3", targets
+                # With plain_comfy_name the checkpoint is written as ONE converted file: the
+                # native file is only the conversion input, so no `_comfyui` sibling and no
+                # duplicated weights remain on disk.
+                extra_meta = {"save_name": self.save_name, "epoch": epoch, "step": step}
+                comfy_path = comfy_filename_for(path)
+                convert_file(
+                    path, comfy_path, to="comfyui",
+                    model=model_kind,
+                    native_modules=native_mods,
+                    metadata=extra_meta,
+                )
+                if plain_comfy_name:
+                    final = self.output_dir / filename
+                    path.unlink(missing_ok=True)        # the native conversion input
+                    os.replace(comfy_path, final)
+                    comfy_path = final
+                logger.info(f"Saved ComfyUI-compatible LoKR: {comfy_path}")
+            except Exception as e:  # noqa: BLE001 - never fail a checkpoint save
+                logger.warning(
+                    f"Could not write the ComfyUI-converted LoKR next to {path}: {e}"
+                )
+                comfy_path = None
 
         # Metadata
-        if comfyui_only:
-            # Inference-only snapshot (e.g. EMA): the native file was just the
-            # conversion input and no JSON is written, so nothing on disk can be
-            # mistaken for a resume checkpoint or picked up by list_checkpoints.
+        # MiniMax-H3 writes ONE file that is both the resume checkpoint and the ComfyUI LoRA, so
+        # it gets a JSON sidecar (step/epoch) unless it is an auxiliary snapshot -- the EMA
+        # weights carry a `tag` and are never resumed.
+        # The other architectures keep the old rule: `comfyui_only` marks an inference-only
+        # snapshot whose native file was merely the conversion input, so it must not look like a
+        # resume checkpoint.
+        if h3_style:
+            if tag:
+                return path
+        elif comfyui_only:
             if comfy_path is not None:
-                try:
-                    path.unlink()
-                except OSError as e:  # noqa: BLE001
-                    logger.warning(f"Could not remove the temporary native LoKR {path}: {e}")
+                if not plain_comfy_name:  # plain mode already consumed the native file
+                    try:
+                        path.unlink()
+                    except OSError as e:  # noqa: BLE001
+                        logger.warning(f"Could not remove the temporary native LoKR {path}: {e}")
             else:
                 # Conversion failed: keep the native file rather than losing the
                 # snapshot entirely.
@@ -583,7 +578,7 @@ class CheckpointManager:
                 "num_modules": lycoris_net.num_modules}
         if tag:
             meta["tag"] = tag
-        if comfy_path is not None:
+        if comfy_path is not None and comfy_path != path:
             meta["comfyui_path"] = str(comfy_path)
         if config:
             meta["config"] = config

@@ -96,17 +96,31 @@ class EmbeddingCache:
                 arr = val
             else:
                 arr = np.array(val)
-            # Quantize float32/float64 -> int8 directly (per-tensor absmax scale)
-            # for a ~4x disk reduction vs float32.
+            # Quantize float32/float64 -> int8 (per-tensor absmax scale) for a ~4x disk
+            # reduction, but ONLY when that is lossless enough to be worth it.
+            #
+            # The per-tensor scale is the whole tensor's absmax, so a tensor with extreme
+            # outliers loses everything else: MiniMax-H3-Image conditions on the *pre-norm*
+            # Qwen3-VL hidden state, whose mandatory garbage channels reach ~1.5e5 while
+            # ordinary values are O(1-10). With amax = 1.5e5 the step is ~1200 and 100% of
+            # the values snap to zero -- the whole caption is erased (measured: 1366 of 1378
+            # tokens entirely zero, 0.00% of 7M values non-zero). Such tensors are stored as
+            # fp16 instead, which keeps every value the model can see.
             if arr.dtype in (np.float32, np.float64) and arr.size:
                 f = arr.astype(np.float32)
                 amax = float(np.max(np.abs(f)))
-                if amax == 0.0:
-                    amax = 1.0
-                scale = amax / 127.0
-                q = np.clip(np.round(f / scale), -127, 127).astype(np.int8)
-                save_dict[key] = q
-                save_dict[key + "_scale"] = np.float32(scale)
+                nonzero = np.abs(f[f != 0.0])
+                typical = float(np.median(nonzero)) if nonzero.size else 0.0
+                safe = amax > 0.0 and typical > 0.0 and (amax / typical) <= 1e3
+                if safe:
+                    scale = amax / 127.0
+                    q = np.clip(np.round(f / scale), -127, 127).astype(np.int8)
+                    save_dict[key] = q
+                    save_dict[key + "_scale"] = np.float32(scale)
+                else:
+                    # fp32, not fp16: the outliers reach ~1.5e5, past fp16's 65504 limit,
+                    # and an inf there poisons the whole conditioning vector.
+                    save_dict[key] = f
             else:
                 save_dict[key] = arr
 

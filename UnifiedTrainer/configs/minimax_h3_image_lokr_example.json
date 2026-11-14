@@ -74,7 +74,12 @@
         "lokr_alpha": 1.0,
         "lokr_factor": 4,
         "lokr_model_type": "minimax_h3_image",
-        "lokr_target_modules": null,
+        "lokr_target_modules": [
+            "attn.qkv_proj",
+            "attn.out_proj",
+            "mlp.fc1",
+            "mlp.fc2"
+        ],
         "lokr_full_rank": false,
         "batch_size": 1,
         "learning_rate": 0.0001,
@@ -88,8 +93,8 @@
         "max_grad_norm": 1.0,
         "weight_dtype": "bf16",
         "mixed_precision": "bf16",
-        "quantize": "torchao_float8",
-        "text_encoder_quantize": "none",
+        "quantize": "prequantized",
+        "text_encoder_quantize": "nf4",
         "offload_base_weights": true,
         "offload_percent": 1.0,
         "offload_vae": true,
@@ -98,11 +103,13 @@
         "vae_load_mode": "lazy",
         "vae_on_device": false,
         "ema_decay": 0.999,
-        "pdd_sigma_mode": "grid",
         "noise_selector": {
             "type": "random"
         },
-        "_training_note": "pdd_sigma_mode: 'grid' samples sigma from the checkpoint's distilled steps (1.0, 0.9675, 0.8875, 0.75, 0.5328, 0.232) -- the heads were trained on exactly those levels; 'uniform' draws uniform sigma in between. The DiT is ~12B params in bf16 (~24 GB), so the offload trio stays on for 24-32 GB cards; raise block_swap if sampling/forward still OOMs. lokr_model_type 'minimax_h3_image' selects the block + token-refiner pattern preset."
+        "_training_note": "timestep_sampling 'pdd' samples sigma from the checkpoint's distilled steps (1.0, 0.9675, 0.8875, 0.75, 0.5328, 0.232) -- the heads were trained on exactly those levels; 'uniform' draws uniform sigma in between. quantize: 'prequantized' loads the nf4 snapshot (16 GB), 'fp8' streams/loads an fp8 snapshot (33 GB, 1024² only), 'nf4' quantizes from the bf16 shards. lokr_model_type 'minimax_h3_image' selects the block + token-refiner pattern preset and the checkpoint-layout LoKR export (one file, resumable + ComfyUI).",
+        "pdd_head_index": "sigma",
+        "text_encoder_device": "cuda",
+        "startup_trace": "/home/waas/H3I_output/_startup_trace.log"
     },
     "validation": {
         "val_loss": true,
