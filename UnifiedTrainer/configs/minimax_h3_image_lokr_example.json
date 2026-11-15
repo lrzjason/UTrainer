@@ -1,21 +1,21 @@
 {
     "_comment": "MiniMax-H3-Image LoRA/LoKr training (text-to-image). The adapter (models/minimax_h3_image) loads MiniMax's ORIGINAL checkpoint layout directly and converts it in memory: transformer/ + pdd_fused_heads.safetensors + vae/, with the Qwen3-VL text encoder read from text_encoder/. No diffusers model classes are involved -- the DiT and the VAE are vendored inside UTrainer. The model is a guidance-distilled, 6-step PDD checkpoint: one output head per sampling step, and training picks the head whose sigma band contains the sampled sigma.",
     "model": "minimax_h3_image",
-    "model_path": "/home/waas/hf_models/MiniMax-H3-Image",
-    "transformer_path": "/home/waas/hf_models/MiniMax-H3-Image/transformer",
-    "vae_path": "/home/waas/hf_models/MiniMax-H3-Image/vae",
-    "text_encoder_path": "/home/waas/hf_models/MiniMax-H3-Image/text_encoder",
-    "tokenizer_path": "/home/waas/hf_models/MiniMax-H3-Image/tokenizer",
-    "processor_path": "/home/waas/hf_models/MiniMax-H3-Image/processor",
+    "model_path": "/shared/hf_models/MiniMax-H3-Image",
+    "transformer_path": "/shared/hf_models/MiniMax-H3-Image/transformer",
+    "vae_path": "/shared/hf_models/MiniMax-H3-Image/vae",
+    "text_encoder_path": "/shared/hf_models/MiniMax-H3-Image/text_encoder",
+    "tokenizer_path": "/shared/hf_models/MiniMax-H3-Image/tokenizer",
+    "processor_path": "/shared/hf_models/MiniMax-H3-Image/processor",
     "data": {
-        "cache_dir": "/home/waas/minimax_h3_image_cache",
+        "cache_dir": "/shared/minimax_h3_image_cache",
         "rebuild_index": true,
         "num_workers": 4,
         "val_split_ratio": 0.05,
         "dataset_configs": [
             {
                 "name": "h3i_t2i",
-                "train_data_dir": "/home/waas/datasets/h3i_train",
+                "train_data_dir": "/shared/datasets/h3i_train",
                 "resolution": 1024,
                 "repeats": 1,
                 "sample_weight": 1.0,
@@ -109,7 +109,7 @@
         "_training_note": "timestep_sampling 'pdd' samples sigma from the checkpoint's distilled steps (1.0, 0.9675, 0.8875, 0.75, 0.5328, 0.232) -- the heads were trained on exactly those levels; 'uniform' draws uniform sigma in between. quantize: 'prequantized' loads the nf4 snapshot (16 GB), 'fp8' streams/loads an fp8 snapshot (33 GB, 1024² only), 'nf4' quantizes from the bf16 shards. lokr_model_type 'minimax_h3_image' selects the block + token-refiner pattern preset and the checkpoint-layout LoKR export (one file, resumable + ComfyUI).",
         "pdd_head_index": "sigma",
         "text_encoder_device": "cuda",
-        "startup_trace": "/home/waas/H3I_output/_startup_trace.log"
+        "startup_trace": "/shared/H3I_output/_startup_trace.log"
     },
     "validation": {
         "val_loss": true,
@@ -130,7 +130,7 @@
         "use_ema": false
     },
     "output": {
-        "dir": "/home/waas/minimax_h3_image_output/example",
+        "dir": "/shared/minimax_h3_image_output/example",
         "save_name": "minimax_h3_image_lokr",
         "save_every_epoch": 1,
         "save_start_epoch": 0,

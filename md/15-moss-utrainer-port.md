@@ -3,7 +3,7 @@
 > 状态：计划（2026-10-19）。目标：`python -m UnifiedTrainer.train --model moss ...` 能跑通一次
 > **完整的测试训练**（1 图过拟合 → 小数据集短跑），并支持**参考图训练**（参考图缩放后送
 > Qwen3.5 的 vision tower，行为对齐 krea2）。
-> 参考源：`E:\UnifiedTrainer\ref\KohakuMossTrainer`（作者 **Kohaku-Blueleaf**，只读、运行时不 import）。
+> 参考源：`<repo>/ref\KohakuMossTrainer`（作者 **Kohaku-Blueleaf**，只读、运行时不 import）。
 > 搬过来的每个文件首行标注原作者；`UnifiedTrainer/vendor/kohakumoss/ATTRIBUTION.md` 记逐文件出处。
 
 ---

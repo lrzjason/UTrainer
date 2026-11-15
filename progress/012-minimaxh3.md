@@ -166,7 +166,7 @@
 - [x] **P3 审查 NOTE ③ 顺带修正**：`.tmp/p3_verify_noweight.py` 2.6 注释
       "frozen fp32-contract heads" → "frozen heads / AdaLN-modulation heads excluded"
       （断言不变，28/28 复跑全绿）
-- [x] **最终全量回归**（e:\UnifiedTrainer，全部无权重脚本）：
+- [x] **最终全量回归**（<repo>，全部无权重脚本）：
       | 脚本 | 计数 | 退出 |
       |------|------|------|
       | `.tmp/p1_3_verify_media_pipeline.py` | 28/28 | 0 |

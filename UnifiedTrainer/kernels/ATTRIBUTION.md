@@ -9,7 +9,7 @@ Every file in this package is either an **independent re-expression** of, or
 | Upstream repository | <https://github.com/KohakuBlueleaf/KohakuMossTrainer> |
 | Upstream version | `kohakumoss` 0.1.0 (repository `CLAUDE.md`, `pyproject.toml`) |
 | Licence | **KohakuMoss License 1.0** — Apache-2.0 plus one additional term (a derivative work must carry "Kohaku" in its name; this directory keeps the attribution and is not redistributed as a separate product) |
-| Local reference clone | `E:\UnifiedTrainer\ref\KohakuMossTrainer` (read-only, never imported) |
+| Local reference clone | `<repo>/ref\KohakuMossTrainer` (read-only, never imported) |
 | Ported on | 2026-10-19, into `UnifiedTrainer/kernels/` |
 | Why | KohakuMoss is the reference for a *measured* kernel-selection stack for diffusion transformers: one normative eager implementation, per-arch kernels, and a per-(op, arch, dtype, shape) tuning table. UnifiedTrainer's adapters had no such layer; on this project's target (Windows + sm120, torch built without flash attention) their attention-path finding applies directly. |
 

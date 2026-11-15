@@ -1,23 +1,23 @@
 {
     "model": "qwen_image21",
-    "model_path": "/home/waas/hf_models/Qwen-Image-2.1",
-    "transformer_path": "/home/waas/hf_models/Qwen-Image-2.1/transformer",
-    "vae_path": "/home/waas/hf_models/Qwen-Image-2.1/vae",
-    "text_encoder_path": "/home/waas/hf_models/Qwen-Image-2.1/text_encoder",
-    "tokenizer_path": "/home/waas/hf_models/Qwen-Image-2.1/processor",
-    "processor_path": "/home/waas/hf_models/Qwen-Image-2.1/processor",
-    "scheduler_path": "/home/waas/hf_models/Qwen-Image-2.1/scheduler",
+    "model_path": "/shared/hf_models/Qwen-Image-2.1",
+    "transformer_path": "/shared/hf_models/Qwen-Image-2.1/transformer",
+    "vae_path": "/shared/hf_models/Qwen-Image-2.1/vae",
+    "text_encoder_path": "/shared/hf_models/Qwen-Image-2.1/text_encoder",
+    "tokenizer_path": "/shared/hf_models/Qwen-Image-2.1/processor",
+    "processor_path": "/shared/hf_models/Qwen-Image-2.1/processor",
+    "scheduler_path": "/shared/hf_models/Qwen-Image-2.1/scheduler",
     "timestep_shift_mode": "dynamic_shift",
 
     "data": {
-        "cache_dir": "/home/waas/qwen21_cache_transparent_edit",
+        "cache_dir": "/shared/qwen21_cache_transparent_edit",
         "rebuild_index": true,
         "num_workers": 4,
         "val_split_ratio": 0.05,
         "dataset_configs": [
             {
                 "name": "transparent_edit",
-                "train_data_dir": "/home/waas/qwen21_consist_dataset",
+                "train_data_dir": "/shared/qwen21_consist_dataset",
                 "resolution": 1024,
                 "repeats": 1,
                 "sample_weight": 1.0,
@@ -139,7 +139,7 @@
     },
 
     "output": {
-        "dir": "/home/waas/qwen21_transparent_edit_output",
+        "dir": "/shared/qwen21_transparent_edit_output",
         "save_name": "qwen21_transparent_edit",
         "save_every_epoch": 1,
         "save_start_epoch": 0

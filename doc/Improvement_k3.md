@@ -54,11 +54,11 @@
 
 ## 2. 目录结构
 
-代码与文档均在 `E:\UnifiedTrainer\ScheduledTrainer\` 内（agent 交互区，
+代码与文档均在 `<repo>/ScheduledTrainer\` 内（agent 交互区，
 与外部源代码隔离，详见 `doc/REQUIREMENTS.md`）：
 
 ```
-E:\UnifiedTrainer\ScheduledTrainer\
+<repo>/ScheduledTrainer\
 ├── UnifiedTrainer/                # 训练器源码副本（自外部复制，独立演进）
 │   ├── train.py  engine/  models/  losses/  data/  registry.py ...
 │

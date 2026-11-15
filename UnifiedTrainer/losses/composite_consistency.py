@@ -2,7 +2,7 @@
 with PixPerfect-style discriminative pixel space (A), gradient-domain seam loss
 (B) and MaskFlow-style area-normalized matte terms.
 
-Reference: UTrainer/tmp/mask_training_improvement.md (design doc), and papers:
+Reference: the mask-training design doc (local, kept out of the repo), and papers:
  - PixPerfect (arXiv:2512.03247): discriminative pixel space amplifies subtle
    color mismatch between the composited prediction and GT.
  - MaskFlow (arXiv:2608.06929): mask-adaptive loss weighting + gradient-domain

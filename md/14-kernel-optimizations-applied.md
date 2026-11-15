@@ -1,7 +1,7 @@
 # 从 KohakuMoss 学到的 kernel 优化，落到 UnifiedTrainer 的模型上
 
 > 状态：as-built（2026-10-19）。
-> 参考源：`E:\UnifiedTrainer\ref\KohakuMossTrainer`（作者 **Kohaku-Blueleaf**，`kohakumoss`
+> 参考源：`<repo>/ref\KohakuMossTrainer`（作者 **Kohaku-Blueleaf**，`kohakumoss`
 > 0.1.0，KohakuMoss License 1.0 / Apache-2.0 + 命名条款）。只读阅读，**运行时不 import**。
 > 技术萃取（逐项 + `path:line`）：`md/13-kohakumoss-kernels.md`。
 > 代码落点：`UnifiedTrainer/kernels/`，逐文件出处见 `kernels/ATTRIBUTION.md`。
@@ -328,7 +328,7 @@ KohakuMoss 的 `tuning/` 要解决的问题。本包取了它的最小形式：
 ## 8. 复现
 
 ```bash
-cd E:\UnifiedTrainer\UTrainer
+cd <repo>/UTrainer
 set UTR_KERNELS=auto            # off | auto | triton
 
 # attention：跨模型真实头配置，三列候选

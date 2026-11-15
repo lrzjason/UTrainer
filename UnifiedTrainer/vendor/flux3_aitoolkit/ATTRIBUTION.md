@@ -9,7 +9,7 @@ code from **AI Toolkit** by **Ostris, LLC**:
 | Upstream repository | <https://github.com/ostris/ai-toolkit> |
 | Upstream commit | `12395a103fd0ca499c631dc6f460a8778e11490d` (2026-10-15, *"Load comfy files if they exist in flux.3 image"*) |
 | Licence | **MIT** — Copyright (c) 2024 Ostris, LLC |
-| Local reference clone | `E:\UnifiedTrainer\ref\ai-toolkit` (read-only) |
+| Local reference clone | `<repo>/ref\ai-toolkit` (read-only) |
 | Vendored on | 2026-10-16, into `UnifiedTrainer/vendor/flux3_aitoolkit/` |
 | Why | UnifiedTrainer's `flux3_klein` adapter and ai-toolkit's `flux3` extension both implement FLUX.3 Image Klein; the upstream code is the second independent implementation and the reference for the shipped checkpoint's native (BFL/ComfyUI) weight layout. Nothing is imported from ai-toolkit at runtime. |
 

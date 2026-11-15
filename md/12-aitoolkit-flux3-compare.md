@@ -1,7 +1,7 @@
 # FLUX.3 klein：ai-toolkit 对照与本仓库落地（2026-10-16）
 
 > 状态：comparison（2026-10-16）。对照对象：**AI Toolkit**（Ostris, LLC）
-> `E:\UnifiedTrainer\ref\ai-toolkit` @ `12395a103fd0ca499c631dc6f460a8778e11490d`
+> `<repo>/ref\ai-toolkit` @ `12395a103fd0ca499c631dc6f460a8778e11490d`
 > （2026-10-15，"Load comfy files if they exist in flux.3 image"），MIT。
 > 本文档回答两个问题：(1) ai-toolkit 的 flux3 实现与本仓库
 > `models/flux3_klein/` 有何异同；(2) 其中值得借鉴的部分以**复制 + 抬头署名**的方式
@@ -265,7 +265,7 @@ Flux3AdaLayerNorm expects [scale, shift]" → `swap_scale_shift(value, dim=0)`�
 **验证**
 
 ```bash
-cd E:\UnifiedTrainer
+cd <repo>
 python -m pytest tests/test_flux3_klein_adapter.py \
                  tests/test_flux3_aitoolkit_keymap.py \
                  tests/test_flux3_aitoolkit_vendor.py -q      # 64 passed

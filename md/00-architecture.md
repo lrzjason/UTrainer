@@ -22,5 +22,5 @@
    （0=done，42=suspend 挂起，其他=failed）。
 3. 前端、CLI、inbox 文件三条操作路径平级，底层共用 db.py/hooks.py 同一套函数。
 4. 层级模型：Project → Task（链/定时/独立）→ Hook 指令。
-5. 所有代码在 `E:\UnifiedTrainer\ScheduledTrainer\` 内自包含，不引用外部代码；
+5. 所有代码在 `<repo>/ScheduledTrainer\` 内自包含，不引用外部代码；
    不创建虚拟环境（见 `doc/REQUIREMENTS.md`）。

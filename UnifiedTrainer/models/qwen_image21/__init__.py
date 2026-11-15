@@ -123,7 +123,7 @@ RESOLUTION_CONFIG = {
 #
 # Values below are verbatim from Qwen/Qwen-Image-2.1
 # scheduler/scheduler_config.json (verified byte-identical in both the local
-# E:\hf_models and remote /home/waas/hf_models copies):
+# local and remote checkpoint copies):
 #   base_image_seq_len=256, max_image_seq_len=8192,
 #   base_shift=0.5,         max_shift=0.9
 # The scheduler instance itself is built in load_scheduler and ignores the

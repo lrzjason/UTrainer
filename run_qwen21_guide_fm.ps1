@@ -17,7 +17,7 @@
 # gradient checkpointing on the 16 GB 5060 Ti this still fits (measured peak
 # 5.59 GB, ~6 s/step); watch peak.
 #
-# Usage (from E:\UnifiedTrainer\UTrainer):
+# Usage (from the repo root):
 #   .\run_qwen21_guide_fm.ps1
 #   .\run_qwen21_guide_fm.ps1 -ResumeFull <...>_epoch4.safetensors
 param(
@@ -26,7 +26,7 @@ param(
 )
 Set-Location $PSScriptRoot
 
-$cfgPath = "E:\UnifiedTrainer\UTrainer\UnifiedTrainer\configs\qwen_image21_guide_fm_lokr.json"
+$cfgPath = Join-Path $PSScriptRoot "UnifiedTrainer\configs\qwen_image21_guide_fm_lokr.json"
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $log = Join-Path $PSScriptRoot ".tmp\qwen21_guide_fm_$stamp.log"
 Write-Host "[qwen21-guide-fm] config=$cfgPath log=$log"

@@ -401,7 +401,7 @@ collate（统一管线已就位）；**音频不碰**。
 | `md/07-minimaxh3-training.md`（新建） | 本功能的 as-built 设计文档：统一媒体数据管线（图像/视频共用、一次建成）、MiniMaxH3Adapter 钩子、data-ward 速度约定、t=1−σ 时间约定、关键帧条件行（PR noise_aug=0.999 → 引擎 σ_cond=0.001、t_cond=0.999）、音频行省略依据、验证循环调度器语义、LoRA 目标模块清单、配置模板 |
 | `md/minimaxh3_implementation.md`（本文档） | 实施完成后状态改为"已完成"，或归档为 plan 历史 |
 | `requirements.txt`（UTrainer 根）+ `UnifiedTrainer/requirements.txt` | diffusers 注释追加：训练 MiniMax-H3 需 PR #14355 分支（`refs/pull/14355/head`）；新增 `av`（PyAV）依赖行 |
-| `AGENTS.md`（仓库根 e:\UnifiedTrainer） | "Available Models" 表加 `minimax_h3`（架构 MiniMax-H3 33B joint video+audio，latent 通道 24，VAE scale 8；当前支持图像对与视频训练） |
+| `AGENTS.md`（仓库根 <repo>） | "Available Models" 表加 `minimax_h3`（架构 MiniMax-H3 33B joint video+audio，latent 通道 24，VAE scale 8；当前支持图像对与视频训练） |
 | `UnifiedTrainer/data/cache_system.md` | 图像对 5D 缓存格式（(C,1,H,W)）+ 视频媒体缓存（(C,T,H,W)、media 字段、17n+5 帧对齐规则）；音频缓存标注"延后" |
 | `UnifiedTrainer/models/base.py` | 文档化新可选钩子：`encode_video/decode_validation_video/velocity_sign`（默认实现保持现有行为） |
 | `doc/Improvement_k3.md` | 追加 MiniMax-H3 训练接入章节（决策 D1–D10 摘要 + 图像对/视频数据改动点 + 音频延后原因） |

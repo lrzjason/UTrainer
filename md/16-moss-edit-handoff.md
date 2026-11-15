@@ -19,7 +19,7 @@
 
 ## 2. 数据集审计（最重要，接手请先看这个）
 
-### 2.1 分类规则（脚本 `E:\UnifiedTrainer\.tmp\audit_full.py`）
+### 2.1 分类规则（脚本 `<repo>/.tmp\audit_full.py`）
 
 对每组取 `|T − R| > 12` 的差异掩码，与标注框（`_T.json.backup` 里 `operation ∈ {add,change,delete,move}` 的 bbox，外扩 8px）比较：
 
@@ -50,7 +50,7 @@ huge_edit     10  ( 3.1%)
 分布：框外平均差异 median **20.8 px**（p90 26.3，远超压缩噪声 <8）；框外最大块 median **2494 px**、p90 **25830 px**。
 明细 CSV：`E:\images\MOSS_edit_filter\_audit_full.csv`
 
-### 2.3 直观例子（可视化脚本 `E:\UnifiedTrainer\.tmp\vis3.py`，输出 `.tmp\audit_vis\`）
+### 2.3 直观例子（可视化脚本 `<repo>/.tmp\vis3.py`，输出 `.tmp\audit_vis\`）
 
 - **DRIFT**：`ad-creative/change_1b769b1e_0001`（BOLT→VOLT）
   意图只改顶部 wordmark，标注框也只圈了 VOLT（**框是对的**），但 T 是整张重绘：
@@ -102,7 +102,7 @@ huge_edit     10  ( 3.1%)
 | `moss_edit_r2t_instr`（5090 32G） | + 指令文本 `_T.edit.txt`，flow_shift 0.5？→ 实为 1.0 | **progress 0.52**（epoch5 0.45 → epoch9 0.52），locality 0.44 |
 | `moss_edit_r2t_min`（4090D 24G） | `_T.edit.min.txt` + `masked_flow_matching`(edit 10/base 1) + `flow_shift 0.35` + 从 base 直训（无 resume） | epoch 0：`avg_loss 0.465`，val `progress 0.10 / PSNR keep 24.5 / locality 0.30`；**该机已关闭，训练中断**（后续 epoch 可能已在共享盘） |
 
-checkpoint 位置：`/home/waas/MOSS_output/<run>/`（含 `-<epoch>/` 验证图与 `*_epochN.safetensors`）。
+checkpoint 位置：`$SHARED_ROOT/MOSS_output/<run>/`（含 `-<epoch>/` 验证图与 `*_epochN.safetensors`）。
 
 ### 已验证“无效/有副作用”的尝试（别再重复）
 
@@ -197,21 +197,21 @@ P2 配置改法：`image_configs` 的 `T` suffix 改 `"_T.Composed"`，`K1` 仍 
 
 | 内容 | 路径 |
 |---|---|
-| 代码 | `E:\UnifiedTrainer\UTrainer\UnifiedTrainer\` |
+| 代码 | `<repo>/UTrainer\UnifiedTrainer\` |
 | 配置 | `...\configs\moss_edit_r2t_{full,instr,min}.json`、`moss_identity20.json`、`moss_identity_full.json` |
 | 数据 | `E:\images\MOSS_edit_filter\<8 类>\<stem>_{T,R,Diff}.webp`、`_T.json(.backup)`、`_T.prompt.txt`、`_T.edit.txt`、`_T.edit.min.txt`、`_k1..k3.png`、`_m1..m3.webp` |
 | 权重 | `C:\hf_models\MOSS-Image-Base`、`E:\hf_models\Qwen3.5-9B`（processor） |
 | 生成脚本 | `.tmp\reprocess_v4.py`、`.tmp\audit_full.py`、`.tmp\eval_instr_run.py`、`.tmp\launch_edit_min.py` |
 | 审计产物 | `E:\images\MOSS_edit_filter\_audit_full.csv`、`.tmp\audit_vis\*.jpg` |
 
-### 远端（共享盘 `/home/waas`，CephFS 42T）
+### 远端（共享盘 `$SHARED_ROOT`，CephFS 42T）
 
 | 内容 | 路径 |
 |---|---|
-| 权重 | `/home/waas/hf_models/MOSS-Image-Base`（27G）、`/home/waas/hf_models/Qwen3.5-9B` |
-| 数据 | `/home/waas/MOSS_Training/datasets/MOSS_edit_filter/<8 类>/` |
-| 配置 | `/home/waas/MOSS_Training/configs/` |
-| 输出 | `/home/waas/MOSS_output/<run>/` |
+| 权重 | `$SHARED_ROOT/hf_models/MOSS-Image-Base`（27G）、`$SHARED_ROOT/hf_models/Qwen3.5-9B` |
+| 数据 | `$SHARED_ROOT/MOSS_Training/datasets/MOSS_edit_filter/<8 类>/` |
+| 配置 | `$SHARED_ROOT/MOSS_Training/configs/` |
+| 输出 | `$SHARED_ROOT/MOSS_output/<run>/` |
 | 代码 | `/root/UTrainer`（**不共享**，换机必须重新同步） |
 
 ### 启动模板（`/root/UTrainer/start_<run>.sh`）
@@ -222,7 +222,7 @@ cd /root/UTrainer
 PY=/root/miniconda3/bin/python
 NVIDIA_LIBS="$($PY -c 'import nvidia.cuda_nvrtc,os,glob; root=os.path.dirname(os.path.dirname(nvidia.cuda_nvrtc.__file__)); print(":".join(sorted(glob.glob(os.path.join(root,"*","lib")))))' 2>/dev/null)"
 [ -n "$NVIDIA_LIBS" ] && export LD_LIBRARY_PATH="$NVIDIA_LIBS:$LD_LIBRARY_PATH"
-export WANDB_BASE_URL=https://api.bandw.top/
+export WANDB_BASE_URL=$WANDB_BASE_URL
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
@@ -236,12 +236,7 @@ exec $PY -u UnifiedTrainer/train.py --model moss \
 
 ### 已知机器
 
-| 机器 | 地址 | 状态 |
-|---|---|---|
-| 4090D 24G（跑过 `moss_edit_r2t_min`） | `e98ca191b2d841b8bc05b7bf9aa40bc2.region1.waas.aigate.cc:41446` | **已关机（端口不通）** |
-| 5090 32G（跑过 `_full`/`_instr`） | `2f99feaa18b042eb882b2b1ac1993dc9.region1.waas.aigate.cc:43597` | 已关 |
-| 无卡（看数据/审计） | `e8365ce4b5e845b88293aebb5e193e95.region1.waas.aigate.cc:49097` | 最近给的，密码见会话 |
-| 无卡（旧） | `70b5e489d1ad42caa439ce5d1ef33551.region1.waas.aigate.cc:43364`、`d613408176e643cd87cdf310fa3850b2.region1.waas.aigate.cc:45378` | 已关 |
+机器地址/端口/口令随租用变化，**不入库**：清单见本机 `.tmp/waas-notes.md`（gitignored）。
 
 > 密码请从会话记录中取，**不要写进 repo**。本地同步脚本：`.tmp\launch_edit_min.py`（含 302 文件 hash 校验 + 启动 + 验证）。
 
@@ -255,5 +250,5 @@ exec $PY -u UnifiedTrainer/train.py --model moss \
 4. **ComfyUI 生成的 LoRA 必须 `ref_kv_cache=false`**，且工作流要有 `MossImageEditApply` 节点，否则参考帧根本没进序列（已验证：缺该节点时跑的是纯 T2I）。
 5. **val loss 不可比**：它随 `flow_shift`、`edit_weight` 变；要横比请用 `validation.loss_types: ["flow_matching"]` + `loss_params: {use_weighting: false}`。
 6. 掩码缓存是 VAE latent 网格，patchified 模型需要 2× 下采样（已修）。
-7. wandb 用 `WANDB_BASE_URL=https://api.bandw.top/`，凭据从 `C:\Users\lrzja\_netrc` 读；`save_code=False`。
+7. wandb 用 `WANDB_BASE_URL=$WANDB_BASE_URL`，凭据从 `$NETRC` 读；`save_code=False`。
 8. 数据里 `_T.json.backup` 是**唯一真源**（含 `operation/color/ref_index/z_index/string`），`_T.json` 是可重建的派生文件。

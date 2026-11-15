@@ -40,7 +40,7 @@
 | `python -m orchestrator.cli --workspace tmp/smoke_ws list` | 0（输出见下） |
 | `python -m orchestrator.cli --workspace tmp/smoke_ws project create/list` | 0 |
 | `python UnifiedTrainer/train.py --list-models` | 0 |
-| 外部原版 `python E:\UnifiedTrainer\UnifiedTrainer\train.py --model dummy --config dummy --list-models` | 0（行为与副本逐字节一致：managed Python 无 torch，适配器扫描失败为空列表，属环境问题非回归） |
+| 外部原版 `python <repo>/UnifiedTrainer\train.py --model dummy --config dummy --list-models` | 0（行为与副本逐字节一致：managed Python 无 torch，适配器扫描失败为空列表，属环境问题非回归） |
 | `python -m orchestrator.cli ... gpu status` | 1（`nvidia-smi` 在本环境 NVML 初始化失败，CLI 正确报错） |
 
 ## 冒烟测试输出摘录（`python tmp/smoke_test.py`）
@@ -52,7 +52,7 @@ id=1 name=t1 status=done  started=12:53:17 finished=12:53:20
 id=2 name=t2 status=done  resume_from=E:\...\out1\t1_dryrun.safetensors
             started=12:53:20 finished=12:53:22
 === smoke test PASSED ===
-archived -> E:\UnifiedTrainer\ScheduledTrainer\tmp\smoke_ws\done\project_smoke.json
+archived -> <repo>/ScheduledTrainer\tmp\smoke_ws\done\project_smoke.json
 ```
 
 orchestrator 日志关键行：

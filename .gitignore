@@ -224,3 +224,6 @@ wandb
 
 cache
 output
+# Local backups / runtime logs (never commit)
+*.bak*
+nohup.out

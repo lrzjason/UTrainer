@@ -1,6 +1,6 @@
 ---
 name: unified-trainer-orchestrator
-description: 操作 ScheduledTrainer 任务编排器（E:\UnifiedTrainer\ScheduledTrainer）创建/调度/监控扩散模型训练任务。当用户要求提交训练任务、搭串行任务链、设 cron 定时训练、训练中采样/保存/挂起/恢复、查 GPU 排队原因时使用。
+description: 操作 ScheduledTrainer 任务编排器（<repo>/ScheduledTrainer）创建/调度/监控扩散模型训练任务。当用户要求提交训练任务、搭串行任务链、设 cron 定时训练、训练中采样/保存/挂起/恢复、查 GPU 排队原因时使用。
 ---
 
 # UnifiedTrainer Orchestrator 操作手册（Agent 用）
@@ -34,7 +34,7 @@ orchestrator/
 ## 启动
 
 ```bash
-cd E:\UnifiedTrainer\ScheduledTrainer
+cd <repo>/ScheduledTrainer
 python -m orchestrator.main --workspace workspace --api --port 7860 --max-parallel 2
 ```
 

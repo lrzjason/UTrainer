@@ -52,7 +52,7 @@ a group file, causing `AttributeError: 'list' object has no attribute 'get'`.
 **group_id** is derived from the dataset image path via `_make_group_id()`:
 
 ```python
-# Input:  "/home/waas/krea2_dataset/anime/real_001_t"
+# Input:  "$SHARED_ROOT/krea2_dataset/anime/real_001_t"
 # Output: "_home_waas_krea2_dataset_anime_real_001_t"
 ```
 
@@ -60,7 +60,7 @@ Schema (always a **dict**):
 
 ```json
 {
-    "mapping_key": "/home/waas/krea2_dataset/anime/real_001_t",
+    "mapping_key": "$SHARED_ROOT/krea2_dataset/anime/real_001_t",
     "bucket": "768x1024",
     "targets": {
         "target": [
@@ -132,7 +132,7 @@ Model-specific (e.g. `empty_embedding.npkrea2.npz`). Used as replacement when
 
 ```json
 {
-    "dataset_dir": "/home/waas/krea2_dataset",
+    "dataset_dir": "$SHARED_ROOT/krea2_dataset",
     "resolution": 1024,
     "num_pairs": 613,
     "num_batch_configs": 1

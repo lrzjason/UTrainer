@@ -5,11 +5,11 @@
 
 ## 目录结构与职责
 
-`E:\UnifiedTrainer\ScheduledTrainer\` 是 **agent 交互区**，与外部源代码严格区分：
+`<repo>/ScheduledTrainer\` 是 **agent 交互区**，与外部源代码严格区分：
 
 | 目录 | 用途 |
 |------|------|
-| `UnifiedTrainer/` | 训练器源码副本（由 `E:\UnifiedTrainer\UnifiedTrainer` 复制而来，可按需改名/修改） |
+| `UnifiedTrainer/` | 训练器源码副本（由 `<repo>/UnifiedTrainer` 复制而来，可按需改名/修改） |
 | `orchestrator/` （待建） | 任务编排器代码 |
 | `web/` （待建） | Vue 3 前端 |
 | `doc/` | 要求文档与总体设计文档（本目录），供后续更新和阅读 |
@@ -21,7 +21,7 @@
 
 ## 硬性规则
 
-1. **代码隔离**：不引用 `E:\UnifiedTrainer\ScheduledTrainer` 以外的代码；
+1. **代码隔离**：不引用 `<repo>/ScheduledTrainer` 以外的代码；
    需要外部代码时**复制进来**再改。
 2. **决策留痕**：开发过程中的所有技术决定记录到 `agent/`。
 3. **进度总结**：每个 subagent 完成任务后总结写入 `progress/`；

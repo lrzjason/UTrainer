@@ -102,8 +102,8 @@ Config example — pfm REPLACING the MSE (paper-faithful PFM run):
     "losses": [
         {"type": "pfm", "weight": 1.0, "params": {
             "encoder": "eupe_vits16",
-            "hub_repo_dir": "/home/waas/EUPE",
-            "weights_path": "/home/waas/models/EUPE-ViT-S/EUPE-ViT-S.pt",
+            "hub_repo_dir": "$SHARED_ROOT/EUPE",
+            "weights_path": "$SHARED_ROOT/models/EUPE-ViT-S/EUPE-ViT-S.pt",
             "layers": [6]
         }}
     ]

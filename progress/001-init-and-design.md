@@ -5,7 +5,7 @@
 
 ## 已完成
 
-1. **工作区结构确认**：`E:\UnifiedTrainer\ScheduledTrainer\` 已存在，
+1. **工作区结构确认**：`<repo>/ScheduledTrainer\` 已存在，
    含 `UnifiedTrainer/`（训练器源码副本，已就位）、`agent/ doc/ md/ progress/ skills/ tmp/`。
 2. **`doc/REQUIREMENTS.md`**：固化 owner 的工作约定——代码隔离、决策留痕（agent/）、
    subagent 总结与 section 总结（progress/）、每大功能一份设计文档（md/）、

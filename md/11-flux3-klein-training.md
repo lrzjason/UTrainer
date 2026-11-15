@@ -167,7 +167,7 @@ offload 顺序（`_flat_swap_blocks()`，与 forward 循环一致）：
 ## 7. 验收
 
 ```bash
-cd E:\UnifiedTrainer
+cd <repo>
 python -m pytest tests/test_flux3_klein_adapter.py -q     # 38 passed
 ```
 
